@@ -146,8 +146,10 @@ class ResNet:
         print("skipping fully connected layer")
         continue # Skip FC if transfer learning
 
-      # TODO: remove or when #777 is merged
-      assert obj.shape == dat.shape or (obj.shape == (1,) and dat.shape == ()), (k, obj.shape, dat.shape)
+      if obj.shape == (1,) and v.shape == (): # bn.num_batches_tracked is zero dim in torch
+        dat = Tensor([dat.item()], device=obj.device, dtype=obj.dtype)
+
+      assert obj.shape == dat.shape, (k, obj.shape, dat.shape)
       obj.assign(dat)
 
 ResNet18 = lambda num_classes=1000: ResNet(18, num_classes=num_classes)
