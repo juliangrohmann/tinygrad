@@ -35,6 +35,33 @@ class Linear(nn.Linear):
   def __call__(self, x:Tensor):
     return x.linear(self.weight.cast(dtypes.default_float).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
 
+class Conv2dRetina(nn.Conv2d):
+  def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+    super().__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+    self.weight = Tensor.normal(out_channels, in_channels//groups, *self.kernel_size, std=0.01)
+    self.bias = Tensor.zeros(out_channels) if bias else None
+  def __call__(self, x: Tensor):
+    return x.conv2d(self.weight.cast(dtypes.default_float), self.bias.cast(dtypes.default_float) if self.bias is not None else None,
+                    padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
+
+class Conv2dClsRetina(nn.Conv2d):
+  def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+    super().__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+    self.weight = Tensor.normal(out_channels, in_channels//groups, *self.kernel_size, std=0.01)
+    self.bias = Tensor.full(out_channels, -math.log((1 - 0.01) / 0.01)) if bias else None
+  def __call__(self, x: Tensor):
+    return x.conv2d(self.weight.cast(dtypes.default_float), self.bias.cast(dtypes.default_float) if self.bias is not None else None,
+                    padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
+
+class Conv2dFPN(nn.Conv2d):
+  def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+    super().__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+    self.weight = Tensor.kaiming_uniform(out_channels, in_channels//groups, *self.kernel_size, a=1)
+    self.bias = Tensor.zeros(out_channels) if bias else None
+  def __call__(self, x: Tensor):
+    return x.conv2d(self.weight.cast(dtypes.default_float), self.bias.cast(dtypes.default_float) if self.bias is not None else None,
+                    padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
+
 class LinearBert(nn.Linear):
   def __init__(self, in_features, out_features, bias=True, std=0.02):
     self.weight = std * rand_truncn(out_features, in_features, dtype=dtypes.float32)
