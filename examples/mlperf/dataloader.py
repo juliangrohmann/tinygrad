@@ -305,7 +305,7 @@ def shuffle_parts(file_paths: List[str]) -> List[str]:
     part = Path(f).stem.split('_')[0]
     if part not in parts: parts[part] = []
     parts[part].append(f)
-  
+
   part_ids = list(parts.keys())
   random.shuffle(part_ids)
 
@@ -332,9 +332,9 @@ def batch_load_train_bert(BS:int, start_step:int = 0):
   for f in tqdm(files, desc="Building dataset"):
     lists = [(f, o) for o in range(int(Path(f).stem.split("_")[3].split(".")[0]))]
     dataset.extend(lists)
-  
+
   dataset = dataset[start_step:]
-  
+
   active_set = deque(dataset[:1000])
   remaining_set = deque(dataset[1000:])
 
@@ -347,7 +347,7 @@ def batch_load_train_bert(BS:int, start_step:int = 0):
         active_set.remove(sample)
         blob.append(sample)
         if remaining_set:
-            active_set.append(remaining_set.popleft())
+          active_set.append(remaining_set.popleft())
     yield process_batch_bert([load_datasample(sample) for sample in blob])
 
 # Reference: https://github.com/mlcommons/training/blob/1c8a098ae3e70962a4f7422c0b0bd35ae639e357/language_model/tensorflow/bert/run_pretraining.py, Line 416
@@ -360,9 +360,9 @@ def batch_load_val_bert(BS:int):
     start_idx = (idx * BS) % len(dataset)
     end_idx = ((idx + 1) * BS) % len(dataset)
     if start_idx < end_idx:
-        yield process_batch_bert(dataset[start_idx:end_idx])
+      yield process_batch_bert(dataset[start_idx:end_idx])
     else:  # wrap around the end to the beginning of the dataset
-        yield process_batch_bert(dataset[start_idx:] + dataset[:end_idx])
+      yield process_batch_bert(dataset[start_idx:] + dataset[:end_idx])
     idx += 1
 
 def load_unet3d_data(preprocessed_dataset_dir, seed, queue_in, queue_out, X:Tensor, Y:Tensor):
@@ -433,7 +433,7 @@ def batch_load_unet3d(preprocessed_dataset_dir:Path, batch_size:int=6, val:bool=
       proc = Process(target=load_unet3d_data, args=(preprocessed_dataset_dir, seed, queue_in, queue_out, X, Y))
       proc.daemon = True
       proc.start()
-      
+
       procs.append(proc)
 
     for bc in range(batch_count):
