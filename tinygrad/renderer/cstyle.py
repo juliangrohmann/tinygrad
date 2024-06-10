@@ -28,7 +28,7 @@ class CStyleLanguage(Renderer):
     UnaryOps.EXP2: lambda x,dtype: f"exp2({x})", UnaryOps.LOG2: lambda x,dtype: f"log2({x})", UnaryOps.SIN: lambda x,dtype: f"sin({x})",
     BinaryOps.ADD: lambda a,b,dtype: f"({a}+{b})", BinaryOps.SUB: lambda a,b,dtype: f"({a}-{b})", BinaryOps.MUL: lambda a,b,dtype: f"({a}*{b})",
     BinaryOps.DIV: lambda a,b,dtype: f"({a}/{b})", BinaryOps.MAX: lambda a,b,dtype: f"max({a},{b})", BinaryOps.MOD: lambda a,b,dtype: f"({a}%{b})",
-    BinaryOps.CMPLT: lambda a,b,dtype: f"({a}<{b})", BinaryOps.CMPEQ: lambda a,b,dtype: f"({a}=={b})", BinaryOps.XOR: lambda a,b,dtype: f"({a}^{b})",
+    BinaryOps.CMPLT: lambda a,b,dtype: f"({a}<{b})", BinaryOps.CMPNE: lambda a,b,dtype: f"({a}!={b})", BinaryOps.XOR: lambda a,b,dtype: f"({a}^{b})",
     TernaryOps.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})"}
 
   # returns a str expression of the casted xs with the given type
@@ -112,7 +112,7 @@ class CStyleLanguage(Renderer):
         kk(f"if ({r[vin[0]]}) {{")
         depth += 1
       elif uop is UOps.BARRIER: kk(self.barrier)
-      elif uop in {UOps.ENDLOOP, UOps.ENDIF}:
+      elif uop in {UOps.ENDRANGE, UOps.ENDIF}:
         depth -= 1
         kk("}")
       elif uop is UOps.STORE:
@@ -121,7 +121,7 @@ class CStyleLanguage(Renderer):
         kk(f"if ({r[vin[3]]}) {{ {rendered_store} }}" if len(vin) > 3 else rendered_store)
       else:
         assert dtype is not None, f"None dtype for uop {uop}"
-        if uop is UOps.LOOP:
+        if uop is UOps.RANGE:
           kk(f"for (int {(expr := ssa('ridx',u))} = {r[vin[0]]}; {expr} < {r[vin[1]]}; {expr}++) {{")
           depth += 1
         elif uop is UOps.ALU:
@@ -312,8 +312,8 @@ def _make_hip_dtype(base_type, name, cnt):
   return f"typedef {base_type} {name}{cnt} __attribute__((ext_vector_type({cnt})));\n" + \
          f"static inline __attribute__((device)) {name}{cnt} make_{name}{cnt}({header}) {{ return {{{elems}}}; }}"
 
-class HIPRenderer(CStyleLanguage):
-  device = "HSA"
+class AMDRenderer(CStyleLanguage):
+  device = "AMD"
   shared_max = 65536
   tensor_cores = [TensorCore(dims=(16,16,16), threads=[(0,8),(0,2),(1,2)], thread_local_sizes=[[16],[16],[4,2]], thread_local_aliases=[ [[0],[0],[2],[-1],[1]], [[1],[2],[0],[-1],[0]], [[1],[2],[-2],[0],[3,-1]] ], dtype_in=di, dtype_out=do) for (di, do) in [(dtypes.half, dtypes.float), (dtypes.half, dtypes.half)]] # noqa: E501
 
@@ -381,4 +381,3 @@ static __attribute__((device)) bool operator==(hip_bfloat16 a, hip_bfloat16 b) {
     return f"__attribute__((amdgpu_flat_work_group_size(1, {requiredMaxThreadsPerBlock})))"
 
 class NVRenderer(CUDARenderer): device = "NV"
-class AMDRenderer(HIPRenderer): device = "AMD"

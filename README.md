@@ -9,7 +9,7 @@ tinygrad: For something between [PyTorch](https://github.com/pytorch/pytorch) an
 
 <h3>
 
-[Homepage](https://github.com/tinygrad/tinygrad) | [Documentation](/docs) | [Examples](/examples) | [Showcase](/docs/showcase.md) | [Discord](https://discord.gg/ZjZadyC7PK)
+[Homepage](https://github.com/tinygrad/tinygrad) | [Documentation](https://docs.tinygrad.org/) | [Examples](/examples) | [Showcase](/docs/showcase.md) | [Discord](https://discord.gg/ZjZadyC7PK)
 
 </h3>
 
@@ -80,14 +80,14 @@ See [examples/beautiful_mnist.py](examples/beautiful_mnist.py) for the full vers
 tinygrad already supports numerous accelerators, including:
 
 - [x] [GPU (OpenCL)](tinygrad/runtime/ops_gpu.py)
-- [x] [C Code (Clang)](tinygrad/runtime/ops_clang.py)
+- [x] [CLANG (C Code)](tinygrad/runtime/ops_clang.py)
 - [x] [LLVM](tinygrad/runtime/ops_llvm.py)
 - [x] [METAL](tinygrad/runtime/ops_metal.py)
 - [x] [CUDA](tinygrad/runtime/ops_cuda.py)
-- [x] [HSA](tinygrad/runtime/ops_hsa.py)
+- [x] [AMD](tinygrad/runtime/ops_amd.py)
+- [x] [NV](tinygrad/runtime/ops_nv.py)
 
 And it is easy to add more! Your accelerator of choice only needs to support a total of ~25 low level ops.
-More information can be found in the [documentation for adding new accelerators](/docs/adding_new_accelerators.md).
 
 ## Installation
 

@@ -1,8 +1,8 @@
 import unittest, functools, random
 from typing import List
 from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes
-from tinygrad.ops import LoadOps, ReduceOps
-from tinygrad.helpers import CI, prod, Context
+from tinygrad.ops import LoadOps, ReduceOps, BufferOps, BinaryOps
+from tinygrad.helpers import CI, getenv, prod, Context
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.engine.schedule import create_schedule
 from tinygrad.engine.realize import lower_schedule, BufferCopy, CompiledRunner
@@ -12,7 +12,7 @@ import numpy as np
 from hypothesis import given, strategies as strat, settings
 from test.helpers import is_dtype_supported
 
-settings.register_profile("my_profile", max_examples=200, deadline=None)
+settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
 
 d_zero = f"{Device.DEFAULT}:0"
@@ -148,7 +148,7 @@ class TestMultiTensor(unittest.TestCase):
       a,b = _test_allreduce(Tensor.rand(256, 256))
       np.testing.assert_almost_equal(a.numpy(), b.numpy(), decimal=5)
 
-  @unittest.skipIf(Device.DEFAULT in {"NV", "AMD"}, "not supported in HCQ")
+  @unittest.skipIf(Device.DEFAULT in {"NV", "AMD"}, "not supported in HCQ #4817")
   def test_copy_jit(self):
     @TinyJit
     def copy_tensor(x:Tensor): return (x.to(f"{x.device.split(':')[0]}:1") + 1)
@@ -157,6 +157,7 @@ class TestMultiTensor(unittest.TestCase):
       x = copy_tensor(t)
       np.testing.assert_equal((t+1).numpy(), x.numpy())
 
+  @unittest.skipIf(Device.DEFAULT in {"NV", "AMD"}, "not supported in HCQ #4817")
   def test_allreduce_naive_jit(self):
     with Context(RING=0):
       jit_allreduce = TinyJit(_test_allreduce)
@@ -164,6 +165,7 @@ class TestMultiTensor(unittest.TestCase):
         a,b = jit_allreduce(Tensor.rand(256, 256))
         np.testing.assert_almost_equal(a.numpy(), b.numpy(), decimal=5)
 
+  @unittest.skipIf(Device.DEFAULT in {"NV", "AMD"}, "not supported in HCQ #4817")
   def test_allreduce_ring_jit(self):
     with Context(RING=2):
       jit_allreduce = TinyJit(_test_allreduce)
@@ -503,6 +505,32 @@ class TestMultiTensor(unittest.TestCase):
     output.numpy()
     Tensor.training = False
 
+  def test_broadcast_const(self):
+    devices = (d0, d1, d2, d3)
+    for axis in (None, 0, 1):
+      t = Tensor.zeros(16, 16).contiguous().shard(devices, axis).realize()
+      t = t + 1
+      for si in t.schedule():
+        ast = si.ast[0]
+        assert ast.op is BufferOps.STORE
+        assert ast.src[0].op is BinaryOps.ADD
+        assert ast.src[0].src[0].op is BufferOps.LOAD and ast.src[0].src[0]
+        assert ast.src[0].src[1].op is BufferOps.CONST and ast.src[0].src[1].arg.val == 1
+      t = 2 * t
+      for si in t.schedule():
+        ast = si.ast[0]
+        assert ast.op is BufferOps.STORE
+        assert ast.src[0].op is BinaryOps.MUL
+        assert ast.src[0].src[0].op is BufferOps.CONST and ast.src[0].src[0].arg.val == 2
+        assert ast.src[0].src[1].op is BufferOps.LOAD
+      t = t + t.full_like(3)
+      for si in t.schedule():
+        ast = si.ast[0]
+        assert ast.op is BufferOps.STORE
+        assert ast.src[0].op is BinaryOps.ADD
+        assert ast.src[0].src[0].op is BufferOps.LOAD
+        assert ast.src[0].src[1].op is BufferOps.CONST and ast.src[0].src[1].arg.val == 3
+
 @unittest.skipIf(CI and Device.DEFAULT in {"GPU", "CUDA", "METAL"}, "no GPU CI")
 class TestShrinkMultiTensorShardedAxis(unittest.TestCase):
   # shrink a multitensor on sharded axis
@@ -631,6 +659,8 @@ class TestShrinkMultiTensorShardedAxis(unittest.TestCase):
     expected = np.arange(64).reshape((8,8)) + np.array([[0,0,1,1,2,2,3,3] for _ in range(8)]).T
     np.testing.assert_allclose(output.numpy(), expected)
 
+@unittest.skipIf(CI and Device.DEFAULT in {"GPU", "CUDA", "METAL"}, "no GPU CI")
+class TestBatchNorm(unittest.TestCase):
   def test_unsynced_backprop_conv_bn(self):
     with Tensor.train():
       from extra.lr_scheduler import OneCycleLR
