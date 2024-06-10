@@ -1,11 +1,12 @@
 import os, time, math, functools
+import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import multiprocessing
 
 from tinygrad import Device, GlobalCounters, Tensor, TinyJit, dtypes
 from tinygrad.helpers import getenv, BEAM, WINO, round_up, diskcache_clear
-from tinygrad.nn.state import get_parameters, get_state_dict, safe_load, safe_save
+from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict, safe_load, safe_save
 from tinygrad.nn.optim import LAMB, LARS, SGD, OptimizerGroup
 
 from extra.lr_scheduler import LRSchedulerGroup
