@@ -1,8 +1,50 @@
+import copy
 import math
+import numpy as np
+from itertools import product
+from typing import List, Dict
+from tinygrad import Tensor
+from tinygrad.dtype import dtypes
+from tinygrad.engine.jit import TinyJit
 from tinygrad.helpers import flatten, get_child
 import tinygrad.nn as nn
 from extra.models.resnet import ResNet
-import numpy as np
+from extra.datasets.preprocess_openimages import preprocess_image, preprocess_target
+from tqdm import tqdm
+
+# allow monkeypatching in layer implementations
+Conv2d = nn.Conv2d
+Conv2dCls = nn.Conv2d
+Conv2dFPN = nn.Conv2d
+
+def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2, reduction="none"):
+  p = inputs.sigmoid()
+  ce_loss = binary_crossentropy_logits(inputs, targets)
+  p_t = p * targets + (1 - p) * (1 - targets)
+  loss = ce_loss * ((1 - p_t) ** gamma)
+
+  if alpha >= 0:
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    loss = alpha_t * loss
+
+  if reduction == "mean":
+    loss = loss.mean()
+  elif reduction == "sum":
+    loss = loss.sum()
+  elif reduction is not None:
+    raise NotImplementedError
+  return loss
+
+def binary_crossentropy_logits(x, y):
+  return x.maximum(0) - y * x + (1 + x.abs().neg().exp()).log()
+
+def l1_loss(inputs, targets, reduction="sum"):
+  loss = (inputs - targets).abs()
+  if reduction == "sum":
+    loss = loss.sum()
+  elif reduction is not None:
+    raise NotImplementedError
+  return loss
 
 def nms(boxes, scores, thresh=0.5):
   x1, y1, x2, y2 = np.rollaxis(boxes, 1)
@@ -19,6 +61,17 @@ def nms(boxes, scores, thresh=0.5):
     iou = inter_area / (areas[cur] + areas[to_process] - inter_area)
     to_process = to_process[np.where(iou <= thresh)[0]]
   return keep
+
+def encode_boxes(ref_boxes: Tensor, gt_boxes: Tensor, weights: Tensor) -> Tensor:
+  gt_lengths = ref_boxes[:, 2:] - ref_boxes[:, :2]
+  gt_centers = ref_boxes[:, :2] + 0.5 * gt_lengths
+  pred_lengths = gt_boxes[:, 2:] - gt_boxes[:, :2]
+  pred_centers = gt_boxes[:, :2] + 0.5 * pred_lengths
+  mask = gt_lengths != 0
+  targets_centers = mask.where(weights[:2] * (gt_centers - pred_centers) / pred_lengths, 0)
+  targets_lengths = mask.where(weights[2:] * (gt_lengths / pred_lengths).log(), 0)
+  ret = targets_centers.cat(targets_lengths, dim=1)
+  return ret
 
 def decode_bbox(offsets, anchors):
   dx, dy, dw, dh = np.rollaxis(offsets, 1)
@@ -48,6 +101,63 @@ def generate_anchors(input_size, grid_sizes, scales, aspect_ratios):
     anchors.append((shifts[:, None] + base_anchors[None, :]).reshape(-1, 4))
   return anchors
 
+def match(match_quality_matrix, high=0.5, low=0.5, allow_low_quality_matches=False):
+  assert match_quality_matrix.numel() > 0, "empty targets or proposals not supported during training"
+  matched_vals, matches = match_quality_matrix.max(axis=0), match_quality_matrix.argmax(axis=0)
+  all_matches = copy.copy(matches) if allow_low_quality_matches else None
+  below_low_threshold = matched_vals < low
+  matches = below_low_threshold.where(-1, matches)
+
+  if allow_low_quality_matches:
+    between_thresholds = (matched_vals >= low) * (matched_vals < high)
+    matches = between_thresholds.where(-2, matches)
+    pred_inds_to_update = match_quality_matrix.argmax(axis=1).tolist()
+    for i in pred_inds_to_update:
+      matches[i] = all_matches[i]
+
+  return matches
+
+def box_area(x: Tensor) -> Tensor:
+  x = _upcast(x)
+  return (x[:, 2] - x[:, 0]) * (x[:, 3] - x[:, 1])
+
+def _torch_max(x: Tensor, y: Tensor):
+  return _torch_binary_map(x, y, "max")
+
+def _torch_min(x: Tensor, y: Tensor):
+  return _torch_binary_map(x, y, "min")
+
+def _torch_binary_map(x: Tensor, y: Tensor, op): # (3, 1, 2), (3, 2)
+  x = x.expand((x.shape[0], y.shape[0], x.shape[2]))
+  y = y.unsqueeze(0).expand(x.shape)
+
+  if op == "max":
+    return (x > y).where(x, y)
+  elif op == "min":
+    return (x < y).where(x, y)
+  raise NotImplementedError
+
+def _clamp(x: Tensor, x_min, x_max) -> Tensor:
+  return Tensor(np.clip(x.numpy(), x_min, x_max), device=x.device, dtype=x.dtype)
+
+def _pad_dims(dims, n):
+  if len(dims) >= n: return dims
+  return (1,) * (n - len(dims)) + dims
+
+def _upcast(t: Tensor) -> Tensor:
+  return t
+#   # protects from numerical overflows in multiplications by upcasting to the equivalent higher type
+#   if dtypes.is_float(t.dtype):
+#     return t if t.dtype in (dtypes.float32, dtypes.float64) else t.float()
+#   else:
+#     return t if t.dtype in (dtypes.int32, dtypes.int64) else t.int()
+
+def _sum(x: List[Tensor]) -> Tensor:
+  res = x[0]
+  for i in x[1:]:
+    res = res + i
+  return res
+
 class RetinaNet:
   def __init__(self, backbone: ResNet, num_classes=264, num_anchors=9, scales=None, aspect_ratios=None):
     assert isinstance(backbone, ResNet)
@@ -65,6 +175,16 @@ class RetinaNet:
   def forward(self, x):
     return self.head(self.backbone(x))
 
+  def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor=None, input_size=(800, 800)) -> Dict[str, Tensor]:
+    if prep_dat is None:
+      dat = []
+      anchors = np.concatenate(self.anchor_gen(input_size))
+      for t in targets:
+        dat.append(preprocess_target(t, anchors)[None, ...])
+      prep_dat = Tensor(np.concatenate(dat, axis=0), head_outputs['cls_logits'].device, head_outputs['cls_logits'].dtype)
+    losses = self.head.compute_loss(targets, head_outputs, prep_dat)
+    return losses['classification'] + losses['bbox_regression']
+
   def load_from_pretrained(self):
     model_urls = {
       (50, 1, 64): "https://download.pytorch.org/models/retinanet_resnet50_fpn_coco-eeacb38b.pth",
@@ -81,7 +201,8 @@ class RetinaNet:
       obj.assign(dat)
 
   # predictions: (BS, (H1W1+...+HmWm)A, 4 + K)
-  def postprocess_detections(self, predictions, input_size=(800, 800), image_sizes=None, orig_image_sizes=None, score_thresh=0.05, topk_candidates=1000, nms_thresh=0.5):
+  def postprocess_detections(self, head_outputs, input_size=(800, 800), image_sizes=None, orig_image_sizes=None, score_thresh=0.05, topk_candidates=1000, nms_thresh=0.5):
+    predictions = head_outputs['bbox_regression'].cat(head_outputs['cls_logits'].sigmoid(), dim=-1).numpy()
     anchors = self.anchor_gen(input_size)
     grid_sizes = self.backbone.compute_grid_sizes(input_size)
     split_idx = np.cumsum([int(self.num_anchors * sz[0] * sz[1]) for sz in grid_sizes[:-1]])
@@ -147,28 +268,46 @@ class RetinaNet:
 class ClassificationHead:
   def __init__(self, in_channels, num_anchors, num_classes):
     self.num_classes = num_classes
-    self.conv = flatten([(nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1), lambda x: x.relu()) for _ in range(4)])
-    self.cls_logits = nn.Conv2d(in_channels, num_anchors * num_classes, kernel_size=3, padding=1)
+    self.conv = flatten([(Conv2d(in_channels, in_channels, kernel_size=3, padding=1), lambda x: x.relu()) for _ in range(4)])
+    self.cls_logits = Conv2dCls(in_channels, num_anchors * num_classes, kernel_size=3, padding=1)
   def __call__(self, x):
     out = [self.cls_logits(feat.sequential(self.conv)).permute(0, 2, 3, 1).reshape(feat.shape[0], -1, self.num_classes) for feat in x]
-    return out[0].cat(*out[1:], dim=1).sigmoid()
+    return out[0].cat(*out[1:], dim=1)
+  def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor) -> Dict[str, Tensor]:
+    cls_logits = head_outputs['cls_logits']
+    gt_classes, fg_mask = prep_dat[:, :, :cls_logits.shape[2]], prep_dat[:, :, -1:]
+    diff = sigmoid_focal_loss(cls_logits, gt_classes, reduction=None).sum(axis=(1, 2))
+    losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
+    return losses.sum() / max(1, len(targets))
 
 class RegressionHead:
   def __init__(self, in_channels, num_anchors):
-    self.conv = flatten([(nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1), lambda x: x.relu()) for _ in range(4)])
-    self.bbox_reg = nn.Conv2d(in_channels, num_anchors * 4, kernel_size=3, padding=1)
+    self.conv = flatten([(Conv2d(in_channels, in_channels, kernel_size=3, padding=1), lambda x: x.relu()) for _ in range(4)])
+    self.bbox_reg = Conv2d(in_channels, num_anchors * 4, kernel_size=3, padding=1)
   def __call__(self, x):
     out = [self.bbox_reg(feat.sequential(self.conv)).permute(0, 2, 3, 1).reshape(feat.shape[0], -1, 4) for feat in x]
     return out[0].cat(*out[1:], dim=1)
+  def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor):
+    target_regr, fg_mask = prep_dat[:, :, -5:-1], prep_dat[:, :, -1:]
+    out_regr = head_outputs['bbox_regression'] * fg_mask
+    diff = l1_loss(out_regr, target_regr, reduction=None).sum(axis=(1, 2))
+    losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
+    return losses.sum() / max(1, len(targets))
 
 class RetinaHead:
   def __init__(self, in_channels, num_anchors, num_classes):
     self.classification_head = ClassificationHead(in_channels, num_anchors, num_classes)
     self.regression_head = RegressionHead(in_channels, num_anchors)
   def __call__(self, x):
-    pred_bbox, pred_class = self.regression_head(x), self.classification_head(x)
-    out = pred_bbox.cat(pred_class, dim=-1)
-    return out
+    return {
+      'cls_logits': self.classification_head(x),
+      'bbox_regression': self.regression_head(x)
+    }
+  def compute_loss(self, targets, head_outputs, prep_dat):
+    return {
+      'classification': self.classification_head.compute_loss(targets, head_outputs, prep_dat),
+      'bbox_regression': self.regression_head.compute_loss(targets, head_outputs, prep_dat),
+    }
 
 class ResNetFPN:
   def __init__(self, resnet, out_channels=256, returned_layers=[2, 3, 4]):
@@ -192,8 +331,8 @@ class ResNetFPN:
 
 class ExtraFPNBlock:
   def __init__(self, in_channels, out_channels):
-    self.p6 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
-    self.p7 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+    self.p6 = Conv2dFPN(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+    self.p7 = Conv2dFPN(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
     self.use_P5 = in_channels == out_channels
 
   def __call__(self, p, c):
@@ -208,8 +347,8 @@ class FPN:
   def __init__(self, in_channels_list, out_channels, extra_blocks=None):
     self.inner_blocks, self.layer_blocks = [], []
     for in_channels in in_channels_list:
-      self.inner_blocks.append(nn.Conv2d(in_channels, out_channels, kernel_size=1))
-      self.layer_blocks.append(nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1))
+      self.inner_blocks.append(Conv2dFPN(in_channels, out_channels, kernel_size=1))
+      self.layer_blocks.append(Conv2dFPN(out_channels, out_channels, kernel_size=3, padding=1))
     self.extra_blocks = ExtraFPNBlock(256, 256) if extra_blocks is None else extra_blocks
 
   def __call__(self, x):
@@ -228,9 +367,3 @@ class FPN:
     if self.extra_blocks is not None:
       results = self.extra_blocks(results, x)
     return results
-
-if __name__ == "__main__":
-  from extra.models.resnet import ResNeXt50_32X4D
-  backbone = ResNeXt50_32X4D()
-  retina = RetinaNet(backbone)
-  retina.load_from_pretrained()
