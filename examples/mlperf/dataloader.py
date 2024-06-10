@@ -7,7 +7,7 @@ from tqdm import tqdm
 from tinygrad import dtypes, Tensor
 from tinygrad.helpers import getenv, prod, Context, round_up
 from collections import deque
-from multiprocessing import Queue, Process, shared_memory, connection, Lock, cpu_count, Pool
+from multiprocessing import Queue, Process, shared_memory, connection, Lock, cpu_count, Pool, Manager
 
 class MyQueue:
   def __init__(self, multiple_readers=True, multiple_writers=True):
@@ -246,7 +246,7 @@ def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(1
   shm = shared_memory.SharedMemory(create=True, size=anchors.nbytes)
   shm_anchors = np.ndarray(anchors.shape, dtype=np.float32, buffer=shm.buf)
   shm_anchors[:] = anchors[:]
-  man = multiprocessing.Manager()
+  man = Manager()
   sh_targets = man.list(targets)
 
   procs = []
