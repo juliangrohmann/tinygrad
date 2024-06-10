@@ -342,8 +342,239 @@ def train_resnet():
         safe_save(get_training_state(model, optimizer_group, scheduler_group), fn)
 
 def train_retinanet():
-  # TODO: Retinanet
-  pass
+  config = {}
+  GPUS = config["GPUS"] = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
+  seed = config["seed"] = getenv("SEED", 42)
+  Tensor.manual_seed(seed)  # seed for weight initialization
+  print(f"training on {GPUS}")
+
+  import extra.models.resnet as resnet
+  import extra.models.retinanet as retinanet
+  from examples.hlb_cifar10 import UnsyncedBatchNorm
+  from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, Conv2dHeNormal, Linear
+
+  # ** model definition and initializers **
+  if not getenv("SYNCBN") and len(GPUS) > 1: resnet.BatchNorm = functools.partial(UnsyncedBatchNorm, num_devices=len(GPUS))
+  resnet.Conv2d = Conv2dHeNormal
+  resnet.Linear = Linear
+  retinanet.Conv2d = Conv2dRetina
+  retinanet.Conv2dCls = Conv2dClsRetina
+  retinanet.Conv2dFPN = Conv2dFPN
+  backbone = resnet.ResNeXt50_32X4D()
+  backbone.load_from_pretrained()
+  model = retinanet.RetinaNet(backbone)
+
+  # shard weights and initialize in order
+  for k, x in get_state_dict(model).items():
+    if not getenv("SYNCBN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
+      x.realize().shard_(GPUS, axis=0)
+    else:
+      x.realize().to_(GPUS)
+
+  # ** train parameters **
+  epochs            = config["epochs"]        = getenv("EPOCHS", 10)
+  target_map        = getenv("TARGET", 1.01)
+  eval_start_epoch  = getenv("EVAL_START_EPOCH", 0)
+  eval_freq         = getenv("EVAL_FREQ", 1)
+  # ** hyperparameters **
+  BS                = config["BS"]            = getenv("BS", 8 * len(GPUS))
+  EVAL_BS           = config["EVAL_BS"]       = getenv("EVAL_BS", BS)
+  base_lr           = config["base_lr"]       = getenv("LR", 0.0001)
+  # ** other parameters **
+  config["DEFAULT_FLOAT"] = dtypes.default_float.name
+  config["TRAIN_BEAM"]    = getenv("TRAIN_BEAM", BEAM.value)
+  config["EVAL_BEAM"]     = getenv("EVAL_BEAM", BEAM.value)
+  config["WINO"]          = WINO.value
+  config["SYNCBN"]        = getenv("SYNCBN")
+
+  # ** download dataset **
+  from extra.datasets.openimages import openimages, get_targets
+  from pycocotools.coco import COCO
+  from pycocotools.cocoeval import COCOeval
+  dataset_dir = getenv("DATASET_DIR", "")
+  coco_val = COCO(openimages("validation", dataset_dir=dataset_dir))
+  openimages("train", dataset_dir=dataset_dir)
+  targets_val = get_targets("validation", dataset_dir=dataset_dir, cache=getenv("CACHE", True))
+  targets_train = get_targets("train", dataset_dir=dataset_dir, cache=getenv("CACHE", True))
+  steps_in_train_epoch  = config["steps_in_train_epoch"]  = round_up(len(targets_train), BS) // BS
+  steps_in_val_epoch    = config["steps_in_val_epoch"]    = round_up(len(targets_val), EVAL_BS) // EVAL_BS
+
+  # ** optimizer **
+  from tinygrad.nn.optim import Adam
+  skip_list = [v for k, v in get_state_dict(model).items() if '.fc.' in k or '.bn' in k or 'downsample' in k or '.layer1.' in k]
+  parameters = [x for x in get_parameters(model) if x not in set(skip_list)]
+  optimizer = Adam(parameters, lr=base_lr )
+
+  # ** resume from checkpointing **
+  if ckpt := getenv("RESUME", ""):
+    load_state_dict({'model': model, 'optimizer': optimizer}, safe_load(ckpt))
+    print(f"resuming from {ckpt}")
+
+  # ** init wandb **
+  WANDB = getenv("WANDB")
+  if WANDB:
+    import wandb
+    wandb_args = {"id": wandb_id, "resume": "must"} if (wandb_id := getenv("WANDB_RESUME", "")) else {}
+    wandb.init(config=config, **wandb_args)
+
+  def fake_loss(out):
+    return (out["cls_logits"].mean() + out["bbox_regression"].mean()).sigmoid()
+
+  input_mean = Tensor([0.485, 0.456, 0.406], device=GPUS, dtype=dtypes.float32).reshape(1, -1, 1, 1)
+  input_std = Tensor([0.229, 0.224, 0.225], device=GPUS, dtype=dtypes.float32).reshape(1, -1, 1, 1)
+
+  def normalize(x):
+    return ((x.permute([0, 3, 1, 2]) / 255.0 - input_mean) / input_std).cast(dtypes.default_float)
+
+  @TinyJit
+  def train_step(X, Y, Y_dat):
+    optimizer.zero_grad()
+    out = model(normalize(X))
+    loss = model.compute_loss(Y, out, prep_dat=Y_dat)
+    loss.backward()
+    # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
+    reshard_params()
+    optimizer.step()
+    return loss.realize()
+
+  def fake_train_step(X, Y, Y_dat):
+    return 1
+
+  @TinyJit
+  def eval_step(X):
+    out = model(normalize(X))
+    for v in out.values():
+      v.realize()
+    return out
+
+  def reshard_params():
+    # some param grads become sharded during backprop if inp is sharded
+    # this causes Tensor.assign to fail in optimizer step.
+    # reshard all params to fix for now (~1 ms)
+    for p in optimizer.params:
+      if p.lazydata.axis is not None:
+        p.to_(GPUS[0])
+        p.shard_(GPUS)
+      if p.grad.lazydata.axis is not None:
+        p.grad.to_(GPUS[0])
+        p.grad.shard_(GPUS)
+
+  def data_get(it):
+    x, y, y_dat, cookie = next(it)
+    axis = 0 if BS >= 2 else None # MLB reshape misaligns axis if x.shape[axis] == 1, don't shard single batch
+    return x.shard(GPUS, axis=axis).realize(), y, y_dat.shard(GPUS, axis=axis).realize(), cookie
+
+  from examples.mlperf.dataloader import batch_load_retinanet
+  from contextlib import redirect_stdout
+
+  print(f"training with batch size {BS} for {epochs} epochs")
+  anchors = np.concatenate(model.anchor_gen((800, 800)))
+  # ** epoch loop **
+  for epoch in range(getenv("START_EPOCH", 0), epochs):
+    # ** train loop **
+    Tensor.training = True
+    BEAM.value = config["TRAIN_BEAM"]
+
+    batch_loader = batch_load_retinanet(targets_train, anchors, batch_size=BS, val=False, seed=seed*epochs + epoch, dataset_dir=dataset_dir)
+    it = iter(tqdm(batch_loader, total=steps_in_train_epoch, desc=f"epoch {epoch} (train)"))
+    i, proc = 0, data_get(it)
+
+    prev_cookies = []
+    st = time.perf_counter()
+    while proc is not None:
+      tt = time.perf_counter()
+      loss, proc = train_step(proc[0], proc[1], proc[2]).item(), proc[3]
+      # loss, proc = fake_train_step(proc[0], proc[1], proc[2]), proc[3]
+      if len(prev_cookies) == getenv("STORE_COOKIES", 1):
+        prev_cookies = []  # free previous cookies after gpu work has been enqueued
+
+      pt = time.perf_counter()
+      try:
+        next_proc = data_get(it)
+      except StopIteration:
+        next_proc = None
+      dt = time.perf_counter()
+
+      prev_cookies.append(proc)
+      proc, next_proc = next_proc, None  # return old cookie
+      i += 1
+
+      cl = time.perf_counter()
+      tqdm.write(
+        f"{i:5} {cl - st:7.2f} s run, {(pt - tt) * 1000:6.2f} ms step, {(dt - pt) * 1000.0:6.2f} ms fetch data, {loss:5.2f} loss, "
+        f"{GlobalCounters.mem_used / 1e9:.2f} GB used, {GlobalCounters.global_ops * 1e-9 / (cl - st):9.2f} GFLOPS")
+      if WANDB:
+        wandb.log({"train/loss": loss, "epoch": epoch + (i + 1) / steps_in_train_epoch})
+
+    # ** eval loop **
+    if steps_in_val_epoch > 0:
+      if getenv("RESET_STEP", 1):
+        train_step.reset()
+
+      coco_eval = COCOeval(coco_val, iouType="bbox")
+      coco_evalimgs, evaluated_imgs, ncats, narea = [], [], len(coco_eval.params.catIds), len(coco_eval.params.areaRng)
+      Tensor.training = False
+      BEAM.value = config["EVAL_BEAM"]
+
+      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, seed=seed*epochs + epoch)
+      it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
+      i, proc = 0, data_get(it)
+
+      prev_cookies = []
+      while proc is not None:
+        out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
+
+        if len(prev_cookies) == getenv("STORE_COOKIES", 1): prev_cookies = []  # free previous cookies after gpu work has been enqueued
+        try:
+          next_proc = data_get(it)
+        except StopIteration:
+          next_proc = None
+        prev_cookies.append(proc)
+        proc, next_proc = next_proc, None
+        i += 1
+
+        predictions = model.postprocess_detections(out, orig_image_sizes=[t["image_size"] for t in targets])
+        img_ids = [t["image_id"] for t in targets]
+        coco_results  = [{"image_id": targets[i]["image_id"], "category_id": label, "bbox": box.tolist(), "score": score}
+                         for i, prediction in enumerate(predictions) for box, score, label in zip(*prediction.values())]
+        with redirect_stdout(None):
+          coco_eval.cocoDt = coco_val.loadRes(coco_results) if coco_results else COCO()
+          coco_eval.params.imgIds = img_ids
+          coco_eval.evaluate()
+        evaluated_imgs.extend(img_ids)
+        coco_evalimgs.append(np.array(coco_eval.evalImgs).reshape(ncats, narea, len(img_ids)))
+
+      if getenv("RESET_STEP", 1): eval_step.reset()
+      coco_eval.params.imgIds = evaluated_imgs
+      coco_eval._paramsEval.imgIds = evaluated_imgs
+      coco_eval.evalImgs = list(np.concatenate(coco_evalimgs, -1).flatten())
+      coco_eval.accumulate()
+      coco_eval.summarize()
+      mean_ap = coco_eval.stats[0]
+      tqdm.write(f"mean_ap: {mean_ap:.4f}")
+      if WANDB:
+        wandb.log({"eval/mAP": mean_ap, "epoch": epoch + 1})
+
+      ckpt_dir = Path(dataset_dir) / ".ckpts" if dataset_dir else Path(__file__).parent / ".ckpts"
+      # save model if achieved target
+      if mean_ap >= target_map:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # stop once achieve the target
+        if not (Path(dataset_dir) / ".ckpts").is_dir(): os.mkdir("./ckpts")
+        fn = ckpt_dir / f"retinanet_{seed}.safe"
+        safe_save(get_state_dict(model), fn)
+        print(f" *** Model saved to {fn} ***")
+        break
+
+      # checkpoint every time we eval
+      if getenv("CKPT"):
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if WANDB and wandb.run is not None:
+          fn = ckpt_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_{wandb.run.id}_e{epoch}.safe"
+        else:
+          fn = ckpt_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_e{epoch}.safe"
+        print(f"saving ckpt to {fn}")
+        safe_save(get_state_dict({'model': model, 'optimizer': optimizer}), fn)
 
 def train_unet3d():
   # TODO: Unet3d
