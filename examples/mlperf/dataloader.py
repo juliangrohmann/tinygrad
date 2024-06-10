@@ -165,6 +165,124 @@ def batch_load_resnet(batch_size=64, val=False, shuffle=True, seed=None, pad_fir
       # happens with BENCHMARK set
       pass
 
+def loader_process_retinanet(q_in, q_out, X, Y_dat, targets, shm_name, seed):
+  from extra.datasets.preprocess_openimages import preprocess_target, preprocess_image
+  import signal
+  signal.signal(signal.SIGINT, lambda _, __: exit(0))
+
+  shm = shared_memory.SharedMemory(name=shm_name)
+  anchors = np.ndarray((Y_dat[0].shape[0], 4), dtype=np.float32, buffer=shm.buf)
+  with Context(DEBUG=0):
+    while (_recv := q_in.get()) is not None:
+      idx, tidx, fn, val = _recv
+
+      if seed is not None:
+        np.random.seed(new_seed := seed * 2 ** 10 + idx)
+        random.seed(new_seed)
+
+      img = preprocess_image(fn, val)
+      dat = preprocess_target(targets[tidx], anchors)
+
+      # faster than X[idx].assign(img.tobytes())
+      X[idx].contiguous().realize().lazydata.realized.as_buffer(force_zero_copy=True)[:] = img.tobytes()
+      Y_dat[idx].contiguous().realize().lazydata.realized.as_buffer(force_zero_copy=True)[:] = dat.tobytes()
+      q_out.put(idx)
+    q_out.put(None)
+
+def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(120087, 269), model="retinanet", batch_size=64,
+                         val=False, shuffle=True, seed=None, pad_first_batch=False, dataset_dir=None):
+  from extra.datasets.openimages import BASEDIR
+  if dataset_dir is None:
+    dataset_dir = BASEDIR
+
+  if pad_first_batch:
+    FIRST_BATCH_PAD = round_up(len(targets), batch_size) - len(targets)
+  else:
+    FIRST_BATCH_PAD = 0
+  file_count = FIRST_BATCH_PAD + len(targets)
+  BATCH_COUNT = min(32, file_count // batch_size)
+
+  def _gen():
+    for _ in range(FIRST_BATCH_PAD): yield -1
+    yield from shuffled_indices(len(targets), seed=seed) if shuffle else iter(range(len(targets)))
+  gen = iter(_gen())
+
+  def enqueue_batch(num):
+    for idx in range(num*batch_size, (num+1)*batch_size):
+      tidx = next(gen)
+      if tidx != -1:
+        fn = str(Path(dataset_dir) / targets[tidx]['file_name'])
+        q_in.put((idx, tidx, fn, val))
+        Y[idx] = targets[tidx]
+      else:
+        # padding
+        q_in.put((idx, tidx, None, val))
+        Y[idx] = -1
+
+  shutdown = False
+  class Cookie:
+    def __init__(self, num): self.num = num
+    def __del__(self):
+      if not shutdown:
+        try: enqueue_batch(self.num)
+        except StopIteration: pass
+
+  gotten = [0]*BATCH_COUNT
+  def receive_batch():
+    while 1:
+      num = q_out.get()//batch_size
+      gotten[num] += 1
+      if gotten[num] == batch_size: break
+    gotten[num] = 0
+    slc = slice(num*batch_size, (num+1)*batch_size)
+    return X[slc], Y[slc], Y_dat[slc], Cookie(num)
+
+  q_in, q_out = Queue(), Queue()
+
+  sz_x = (batch_size*BATCH_COUNT, *img_shape)
+  sz_y = (batch_size*BATCH_COUNT, *dat_shape)
+  if os.path.exists(x_buf_fn := f"/dev/shm/{model}_X"): os.unlink(x_buf_fn)
+  if os.path.exists(y_buf_fn := f"/dev/shm/{model}_Y"): os.unlink(y_buf_fn)
+  shm = shared_memory.SharedMemory(create=True, size=anchors.nbytes)
+  shm_anchors = np.ndarray(anchors.shape, dtype=np.float32, buffer=shm.buf)
+  shm_anchors[:] = anchors[:]
+  man = multiprocessing.Manager()
+  sh_targets = man.list(targets)
+
+  procs = []
+  try:
+    X = Tensor.empty(*sz_x, dtype=dtypes.uint8, device=f"disk:{x_buf_fn}")
+    Y_dat = Tensor.empty(*sz_y, dtype=dtypes.float32, device=f"disk:{y_buf_fn}")
+    Y = [None] * (batch_size*BATCH_COUNT)
+
+    for _ in range(cpu_count()):
+      p = Process(target=loader_process_retinanet, args=(q_in, q_out, X, Y_dat, sh_targets, shm.name, seed))
+      p.daemon = True
+      p.start()
+      procs.append(p)
+    for bn in range(BATCH_COUNT): enqueue_batch(bn)
+
+    # NOTE: this is batch aligned, last ones are ignored unless pad_first_batch is True
+    for _ in range(0, file_count//batch_size):
+      yield receive_batch()
+  finally:
+    shutdown = True
+    # empty queues
+    for _ in procs: q_in.put(None)
+    q_in.close()
+    for _ in procs:
+      while q_out.get() is not None: pass
+    q_out.close()
+    # shutdown processes
+    for p in procs: p.join()
+    shm.close()
+    try:
+      shm.unlink()
+    except FileNotFoundError:
+      # happens with BENCHMARK set
+      pass
+    man.shutdown()
+
 @functools.lru_cache(maxsize=128)
 def load_bert_file(fn:str) -> List[dict]:
   with open(fn, "rb") as f: data = pickle.load(f)
