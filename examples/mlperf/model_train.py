@@ -444,9 +444,7 @@ def train_retinanet():
   @TinyJit
   def eval_step(X):
     out = model(normalize(X))
-    for v in out.values():
-      v.realize()
-    return out
+    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).realize()
 
   def reshard_params():
     # some param grads become sharded during backprop if inp is sharded
