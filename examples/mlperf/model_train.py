@@ -483,6 +483,7 @@ def train_retinanet():
     prev_cookies = []
     st = time.perf_counter()
     while proc is not None:
+      break
       tt = time.perf_counter()
       loss, proc = train_step(proc[0], proc[1], proc[2]).item(), proc[3]
       # loss, proc = fake_train_step(proc[0], proc[1], proc[2]), proc[3]
