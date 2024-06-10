@@ -182,14 +182,13 @@ def loader_process_retinanet(q_in, q_out, X, Y_dat, targets, shm_name, seed):
 
       img = preprocess_image(fn, val)
       dat = preprocess_target(targets[tidx], anchors)
-
       # faster than X[idx].assign(img.tobytes())
       X[idx].contiguous().realize().lazydata.realized.as_buffer(force_zero_copy=True)[:] = img.tobytes()
       Y_dat[idx].contiguous().realize().lazydata.realized.as_buffer(force_zero_copy=True)[:] = dat.tobytes()
       q_out.put(idx)
     q_out.put(None)
 
-def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(120087, 269), model="retinanet", batch_size=64,
+def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(120087, 6), model="retinanet", batch_size=64,
                          val=False, shuffle=True, seed=None, pad_first_batch=False, dataset_dir=None):
   from extra.datasets.openimages import BASEDIR
   if dataset_dir is None:

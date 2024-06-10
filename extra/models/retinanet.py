@@ -182,6 +182,7 @@ class RetinaNet:
       for t in targets:
         dat.append(preprocess_target(t, anchors)[None, ...])
       prep_dat = Tensor(np.concatenate(dat, axis=0), head_outputs['cls_logits'].device, head_outputs['cls_logits'].dtype)
+
     losses = self.head.compute_loss(targets, head_outputs, prep_dat)
     return losses['classification'] + losses['bbox_regression']
 
@@ -275,7 +276,7 @@ class ClassificationHead:
     return out[0].cat(*out[1:], dim=1)
   def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor) -> Dict[str, Tensor]:
     cls_logits = head_outputs['cls_logits']
-    gt_classes, fg_mask = prep_dat[:, :, :cls_logits.shape[2]], prep_dat[:, :, -1:]
+    gt_classes, fg_mask = prep_dat[:, :, 0].one_hot(self.num_classes), prep_dat[:, :, -1:]
     diff = sigmoid_focal_loss(cls_logits, gt_classes, reduction=None).sum(axis=(1, 2))
     losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
     return losses.sum() / max(1, len(targets))
