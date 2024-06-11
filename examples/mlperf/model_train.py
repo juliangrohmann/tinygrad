@@ -365,6 +365,7 @@ def train_retinanet():
   backbone = resnet.ResNeXt50_32X4D()
   backbone.load_from_pretrained()
   model = retinanet.RetinaNet(backbone)
+  model.load_from_pretrained()
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
