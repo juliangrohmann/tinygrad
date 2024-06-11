@@ -40,7 +40,7 @@ class Postprocessor:
       self.procs = []
       proc_count = cpu_count() if not self.max_procs else min(cpu_count(), self.max_procs)
       for _ in range(proc_count):
-        args = (self.q_in, self.q_out, self.detections, self.shared_anchors, self.shm_pred.name, self.num_classes, self.max_size)
+        args = (self.q_in, self.q_out, self.detections, self.shared_anchors, self.shm_pred.name, self.num_classes, num_anchors, self.max_size)
         p = Process(target=pp_process, args=args)
         p.daemon = True
         p.start()
@@ -85,12 +85,12 @@ class Cookie:
       self.post_proc._enqueue(self.idx)
 
 
-def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, max_size):
+def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, num_anchors, max_size):
   import signal
   signal.signal(signal.SIGINT, lambda _, __: exit(0))
 
   shm_pred = shared_memory.SharedMemory(name=shm_pred_name)
-  predictions = np.ndarray((max_size, num_classes + 4, 4), dtype=np.float32, buffer=shm_pred.buf)
+  predictions = np.ndarray((max_size, num_anchors, num_classes + 4), dtype=np.float32, buffer=shm_pred.buf)
   while (_recv := q_in.get()) is not None:
     idx, orig_size = _recv
     detections[idx] = postprocess_detection(predictions[idx], anchors, orig_size=orig_size)
