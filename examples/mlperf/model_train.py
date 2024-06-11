@@ -533,7 +533,7 @@ def train_retinanet():
 
       dl_cookies, post_cookies = [], []
       while proc is not None:
-        out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
+        out, targets, proc = eval_step(proc[0]).numpy(), proc[1], proc[3]  # drop inputs, keep cookie
 
         if len(dl_cookies) == getenv("STORE_COOKIES", 1): dl_cookies = []  # free previous cookies after gpu work has been enqueued
         try:
@@ -545,7 +545,7 @@ def train_retinanet():
         i += 1
 
         for i, t in enumerate(targets):
-          post_proc.add(out[i].numpy(), t['image_size'])
+          post_proc.add(out[i], t['image_size'])
         predictions = []
         for _ in enumerate(targets):
           pred, cookie = post_proc.receive()
