@@ -20,7 +20,11 @@ class Postprocessor:
   def add(self, prediction, orig_size):
     self.pred_queue.append((prediction, orig_size))
     if self.buf_pred is not None and self.idle:
-      self.enqueue(self.idle[0])
+      self._enqueue(self.idle[0])
+
+  def receive(self):
+    idx = self.q_out.get()
+    return (self.detections[idx], Cookie(idx, self)) if idx is not None else None
 
   def start(self):
     try:
@@ -42,26 +46,10 @@ class Postprocessor:
         p.start()
         self.procs.append(p)
       while self.idle and self.pred_queue:
-        self.enqueue(self.idle[0])
+        self._enqueue(self.idle[0])
     except Exception as e:
       self.shutdown()
       raise e
-
-  def enqueue(self, idx):
-    if self.shutdown_:
-      pass
-    elif self.pred_queue:
-      prediction, orig_size = self.pred_queue.pop(0)
-      self.buf_pred[idx][:] = prediction[:]
-      self.q_in.put((idx, orig_size))
-      if idx in self.idle:
-        self.idle.remove(idx)
-    elif not idx in self.idle:
-      self.idle.append(idx)
-
-  def receive(self):
-    idx = self.q_out.get()
-    return (self.detections[idx], Cookie(idx, self)) if idx is not None else None
 
   def shutdown(self):
     self.shutdown_ = True
@@ -77,12 +65,24 @@ class Postprocessor:
     if self.manager is not None:
       self.manager.shutdown()
 
+  def _enqueue(self, idx):
+    if self.shutdown_:
+      pass
+    elif self.pred_queue:
+      prediction, orig_size = self.pred_queue.pop(0)
+      self.buf_pred[idx][:] = prediction[:]
+      self.q_in.put((idx, orig_size))
+      if idx in self.idle:
+        self.idle.remove(idx)
+    elif not idx in self.idle:
+      self.idle.append(idx)
+
 class Cookie:
   def __init__(self, idx, post_proc):
     self.idx, self.post_proc = idx, post_proc
   def __del__(self):
     if not self.post_proc.shutdown_:
-      self.post_proc.enqueue(self.idx)
+      self.post_proc._enqueue(self.idx)
 
 
 def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, max_size):

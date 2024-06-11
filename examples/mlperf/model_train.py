@@ -445,7 +445,7 @@ def train_retinanet():
   @TinyJit
   def eval_step(X):
     out = model(normalize(X))
-    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).cast(dtypes.float32).realize()
+    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).cast(dtypes.float32).realize().numpy()
 
   def reshard_params():
     # some param grads become sharded during backprop if inp is sharded
@@ -534,7 +534,7 @@ def train_retinanet():
       dl_cookies, post_cookies = [], []
       while proc is not None:
         t0 = time.perf_counter()
-        out, targets, proc = eval_step(proc[0]).numpy(), proc[1], proc[3]  # drop inputs, keep cookie
+        out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
         t1 = time.perf_counter()
 
         if len(dl_cookies) == getenv("STORE_COOKIES", 1): dl_cookies = []  # free previous cookies after gpu work has been enqueued
@@ -551,11 +551,13 @@ def train_retinanet():
           post_proc.add(out[i], t['image_size'])
         predictions = []
         t3 = time.perf_counter()
+
         for _ in enumerate(targets):
           pred, cookie = post_proc.receive()
           predictions.append(pred)
           post_cookies.append(cookie)
         t4 = time.perf_counter()
+
         img_ids = [t["image_id"] for t in targets]
         coco_results  = [{"image_id": targets[i]["image_id"], "category_id": label, "bbox": box.tolist(), "score": score}
                          for i, prediction in enumerate(predictions) for box, score, label in zip(*prediction.values())]
@@ -567,8 +569,10 @@ def train_retinanet():
         evaluated_imgs.extend(img_ids)
         coco_evalimgs.append(np.array(coco_eval.evalImgs).reshape(ncats, narea, len(img_ids)))
         t5 = time.perf_counter()
-        tqdm.write(f"step: {(t1 - t0) * 1000:.2f}, submit: {(t3 - t2) * 1000:.2f}, receive: {(t4 - t3) * 1000:.2f}, coco: {(t5 - t4) * 1000:.2f}, ")
         post_cookies = []
+
+        tqdm.write(f"{(t1 - t0) * 1000:6.2f} ms step, {(t2 -  t1) * 1000:6.2f} ms fetch data, {(t3 - t2) * 1000:6.2f} ms queue post, "
+                   f"{(t4 - t3) * 1000:6.2f} ms receive post, {(t5 - t4) * 1000:6.2f} ms coco")
 
       if getenv("RESET_STEP", 1): eval_step.reset()
       coco_eval.params.imgIds = evaluated_imgs
