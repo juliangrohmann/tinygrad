@@ -5,21 +5,22 @@ import warnings
 from PIL import Image, ImageOps
 from typing import Tuple, Dict, Any
 from extra.datasets.openimages import MLPERF_CLASSES
+from tinygrad import Tensor
 
-def preprocess_target(target:Dict[str, Any], anchors:np.ndarray, classes:int=len(MLPERF_CLASSES)):
+def preprocess_target(target:Dict[str, Any], anchors:np.ndarray):
   matched_idxs = compute_matched_idxs(target, anchors)
-  is_foreground = matched_idxs >= 0
+  is_fg = matched_idxs >= 0
 
-  gt_classes_target = np.zeros((anchors.shape[0], classes), dtype=np.float32)
-  foreground_idxs = matched_idxs[is_foreground]
-  gt_classes_target[is_foreground, target['labels'][foreground_idxs]] = 1.0
+  fg_idxs = matched_idxs[is_fg]
+  gt_classes = np.full(matched_idxs.shape, -1, dtype=np.float32)
+  gt_classes[is_fg] = target['labels'][fg_idxs]
 
-  masked_anchors = anchors * is_foreground[:, None]
+  masked_anchors = anchors * is_fg[:, None]
   matched_gt_boxes = np.zeros(anchors.shape, dtype=np.float32)
-  matched_gt_boxes[is_foreground] = target['boxes'][foreground_idxs]
+  matched_gt_boxes[is_fg] = target['boxes'][fg_idxs]
   weights = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-  target_regression = encode_boxes(matched_gt_boxes, masked_anchors, weights)
-  return np.concatenate([gt_classes_target, target_regression, is_foreground.astype(np.float32)[:, None]], axis=1)
+  bbox_regr = encode_boxes(matched_gt_boxes, masked_anchors, weights)
+  return np.concatenate([gt_classes[:, None], bbox_regr, is_fg.astype(np.float32)[:, None]], axis=1)
 
 def preprocess_image(fn:str, val:bool, img_size:Tuple[int, int]=(800, 800)):
   if fn:

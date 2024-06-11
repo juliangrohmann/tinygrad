@@ -26,9 +26,8 @@ def assert_jit_cache_len(fxn, expected_len):
 def is_dtype_supported(dtype: DType, device: str = Device.DEFAULT):
   if dtype == dtypes.bfloat16:
     # NOTE: this requires bf16 buffer support
-    return device in {"HSA", "AMD"} or (device in {"CUDA", "NV"} and not CI and not getenv("PTX"))
+    return device in {"AMD"} or (device in {"CUDA", "NV"} and not CI and not getenv("PTX"))
   if device in ["WEBGPU", "WEBGL"]: return dtype in [dtypes.float, dtypes.int32, dtypes.uint32]
-  if device == "CUDA" and getenv("PTX") and dtype in (dtypes.int8, dtypes.uint8): return False
   # for CI GPU and OSX, cl_khr_fp16 isn't supported
   # for CI LLVM, it segfaults because it can't link to the casting function
   # CUDACPU architecture is sm_35 but we need at least sm_70 to run fp16 ALUs

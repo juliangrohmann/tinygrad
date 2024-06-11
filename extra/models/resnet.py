@@ -1,3 +1,5 @@
+import numpy as np
+
 import tinygrad.nn as nn
 from tinygrad import Tensor, dtypes
 from tinygrad.nn.state import torch_load
@@ -145,8 +147,7 @@ class ResNet:
       if 'fc.' in k and obj.shape != dat.shape:
         print("skipping fully connected layer")
         continue # Skip FC if transfer learning
-
-      if obj.shape == (1,) and v.shape == (): # bn.num_batches_tracked is zero dim in torch
+      if '.num_batches_tracked' in k and obj.shape == (1,) and v.shape == (): # bn.num_batches_tracked is zero dim in torch
         dat = Tensor([dat.item()], device=obj.device, dtype=obj.dtype)
 
       assert obj.shape == dat.shape, (k, obj.shape, dat.shape)

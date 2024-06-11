@@ -2,7 +2,7 @@ import math
 from typing import Union, Tuple
 
 from tinygrad import Tensor, nn, dtypes
-from tinygrad.helpers import prod, argfix
+from tinygrad.helpers import prod, argfix, getenv
 
 # rejection sampling truncated randn
 def rand_truncn(*shape, dtype=None, truncstds=2, **kwargs) -> Tensor:
@@ -62,13 +62,34 @@ class Conv2dFPN(nn.Conv2d):
     return x.conv2d(self.weight.cast(dtypes.default_float), self.bias.cast(dtypes.default_float) if self.bias is not None else None,
                     padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
 
+class FrozenBatchNorm(nn.BatchNorm2d):
+  def __init__(self, sz:int, eps=0, affine=True, track_running_stats=True, momentum=0.1):
+    super().__init__(sz, eps=eps, affine=affine, track_running_stats=track_running_stats, momentum=momentum)
+  def __call__(self, x:Tensor):
+    batch_invstd = self.running_var.reshape(1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
+    return x.batchnorm(self.weight, self.bias, self.running_mean, batch_invstd)
+
 class LinearBert(nn.Linear):
   def __init__(self, in_features, out_features, bias=True, std=0.02):
     self.weight = std * rand_truncn(out_features, in_features, dtype=dtypes.float32)
     self.bias = Tensor.zeros(out_features, dtype=dtypes.float32) if bias else None
   
   def __call__(self, x:Tensor):
-    return x.linear(self.weight.cast(dtypes.default_float).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
+    matmul_dtype = dtypes.half if getenv("HALF_LINEAR", 0) else dtypes.default_float
+    # TODO: Remove contiguous once slow kernel compile without this contiguous is fixed
+    return x.contiguous().cast(matmul_dtype).linear(self.weight.contiguous().cast(matmul_dtype).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
+
+def __call__(self, x:Tensor):
+  if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
+
+  xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
+  batch_mean = self.running_mean
+  batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
+  ret = xr.batchnorm(
+    self.weight.reshape(1, -1).expand((self.num_devices, -1)),
+    self.bias.reshape(1, -1).expand((self.num_devices, -1)),
+    batch_mean, batch_invstd, axis=(0, 2))
+  return ret.reshape(x.shape).cast(x.dtype)
 
 class EmbeddingBert(nn.Embedding):
   def __init__(self, vocab_size:int, embed_size:int, std=0.02):
