@@ -90,7 +90,7 @@ def get_targets(split, dataset_dir=None, cache=False):
   dataset = json.load(open(openimages(split, dataset_dir=dataset_dir)))
   images, annotations = dataset['images'], dataset['annotations']
   entries, targets = [], []
-  prev_id = -1
+  prev_id = annotations[0]['image_id']
 
   def process_img(idx):
     file_name = str(pathlib.Path(split) / "data" / images[idx - 1]['file_name'])
