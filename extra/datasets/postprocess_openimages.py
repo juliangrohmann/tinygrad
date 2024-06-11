@@ -8,9 +8,9 @@ class Postprocessor:
   def __init__(self, anchors_by_lvl, num_classes=None, max_size=128, max_procs=None):
     self.anchors_by_lvl, self.max_size, self.max_procs = anchors_by_lvl, max_size, max_procs
     self.num_classes = num_classes if num_classes else len(MLPERF_CLASSES)
-    self.q_in, self.q_out = Queue(maxsize=max_size), Queue()
+    self.q_in, self.q_out = Queue(maxsize=max_size), Queue(maxsize=max_size)
     self.pred_queue = []
-    self.counter = 0
+    self.idle = list(range(max_size))
     self.shutdown_ = False
     self.buf_pred, self.shared_anchors, self.shm_pred, self.detections, self.procs, self.manager = None, None, None, None, None, None
 
@@ -19,8 +19,8 @@ class Postprocessor:
 
   def add(self, prediction, orig_size):
     self.pred_queue.append((prediction, orig_size))
-    if self.buf_pred is not None and self.counter < self.max_size:
-      self.enqueue(self.counter)
+    if self.buf_pred is not None and self.idle:
+      self.enqueue(self.idle[0])
 
   def start(self):
     try:
@@ -41,27 +41,27 @@ class Postprocessor:
         p.daemon = True
         p.start()
         self.procs.append(p)
-      for _ in self.pred_queue:
-        if self.counter >= self.max_size:
-          break
-        self.enqueue(self.counter)
+      while self.idle and self.pred_queue:
+        self.enqueue(self.idle[0])
     except Exception as e:
       self.shutdown()
       raise e
 
   def enqueue(self, idx):
-    if not self.shutdown_:
-      # faster than X[idx].assign(img.tobytes())
+    if self.shutdown_:
+      pass
+    elif self.pred_queue:
       prediction, orig_size = self.pred_queue.pop(0)
       self.buf_pred[idx][:] = prediction[:]
       self.q_in.put((idx, orig_size))
-      self.counter += 1
+      if idx in self.idle:
+        self.idle.remove(idx)
+    elif not idx in self.idle:
+      self.idle.append(idx)
 
   def receive(self):
     idx = self.q_out.get()
-    if idx is None:
-      return None
-    return self.detections[idx], Cookie(idx, self)
+    return (self.detections[idx], Cookie(idx, self)) if idx is not None else None
 
   def shutdown(self):
     self.shutdown_ = True
@@ -83,6 +83,7 @@ class Cookie:
   def __del__(self):
     if not self.post_proc.shutdown_:
       self.post_proc.enqueue(self.idx)
+
 
 def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, max_size):
   import signal
