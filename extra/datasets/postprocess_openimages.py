@@ -11,7 +11,7 @@ class Postprocessor:
     self.q_in, self.q_out = Queue(maxsize=max_size), Queue()
     self.pred_queue = []
     self.counter = 0
-    self._shutdown = False
+    self.shutdown_ = False
     self.buf_pred, self.shared_anchors, self.shm_pred, self.detections, self.procs, self.manager = None, None, None, None, None, None
 
   def __del__(self):
@@ -50,7 +50,7 @@ class Postprocessor:
       raise e
 
   def enqueue(self, idx):
-    if not self._shutdown:
+    if not self.shutdown_:
       # faster than X[idx].assign(img.tobytes())
       prediction, orig_size = self.pred_queue.pop(0)
       self.buf_pred[idx][:] = prediction[:]
@@ -64,7 +64,7 @@ class Postprocessor:
     return self.detections[idx], Cookie(idx, self)
 
   def shutdown(self):
-    self._shutdown = True
+    self.shutdown_ = True
     if self.procs is not None:
       for _ in self.procs: self.q_in.put(None)
     if self.q_in is not None:
@@ -81,7 +81,7 @@ class Cookie:
   def __init__(self, idx, post_proc):
     self.idx, self.post_proc = idx, post_proc
   def __del__(self):
-    if not self._shutdown:
+    if not self.post_proc.shutdown_:
       self.post_proc.enqueue(self.idx)
 
 def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, max_size):
