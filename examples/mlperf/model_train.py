@@ -524,7 +524,7 @@ def train_retinanet():
       dl_cpus, post_cpus = cpus // 2, cpus - cpus // 2
       print(f"{dl_cpus=}, {post_cpus=}")
 
-      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, seed=seed*epochs + epoch, max_procs=dl_cpus)
+      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, shuffle=False, seed=seed*epochs + epoch, max_procs=dl_cpus)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
       i, proc = 0, data_get(it)
 
@@ -533,6 +533,8 @@ def train_retinanet():
 
       dl_cookies, post_cookies = [], []
       while proc is not None:
+        if i >= 100:
+          break
         t0 = time.perf_counter()
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
         t1 = time.perf_counter()
