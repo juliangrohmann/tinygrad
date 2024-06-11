@@ -551,8 +551,8 @@ def train_retinanet():
         i += 1
 
         t2 = time.perf_counter()
-        for i, t in enumerate(targets):
-          post_proc.add(out[i], t['image_size'])
+        for idx, t in enumerate(targets):
+          post_proc.add(out[idx], t['image_size'])
         predictions = []
         t3 = time.perf_counter()
 
