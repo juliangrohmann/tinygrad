@@ -551,7 +551,6 @@ def train_retinanet():
           pred, cookie = post_proc.receive()
           predictions.append(pred)
           post_cookies.append(cookie)
-        print(f"{predictions=}")
         img_ids = [t["image_id"] for t in targets]
         coco_results  = [{"image_id": targets[i]["image_id"], "category_id": label, "bbox": box.tolist(), "score": score}
                          for i, prediction in enumerate(predictions) for box, score, label in zip(*prediction.values())]
