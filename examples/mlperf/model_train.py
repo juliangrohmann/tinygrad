@@ -534,7 +534,7 @@ def train_retinanet():
 
       dl_cookies, post_cookies = [], []
       while proc is not None:
-        if i >= 100:
+        if i >= 10:
           break
         t0 = time.perf_counter()
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
