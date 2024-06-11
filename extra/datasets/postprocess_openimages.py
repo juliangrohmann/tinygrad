@@ -1,100 +1,105 @@
-from multiprocessing import Process, Queue, shared_memory, cpu_count
+from multiprocessing import Process, Queue, Manager, shared_memory, cpu_count
 import numpy as np
 
-from tinygrad import  Tensor
-from tinygrad.dtype import dtypes
 from extra.datasets.openimages import MLPERF_CLASSES
 from extra.models.retinanet import compute_grid_sizes
 
 class Postprocessor:
-  def __init__(self, anchors, num_classes=None, max_size=128, buf_name="retina_post"):
-    self.anchors, self.max_size, self.buf_name = anchors, max_size, buf_name
+  def __init__(self, anchors_by_lvl, num_classes=None, max_size=128, max_procs=None):
+    self.anchors_by_lvl, self.max_size, self.max_procs = anchors_by_lvl, max_size, max_procs
     self.num_classes = num_classes if num_classes else len(MLPERF_CLASSES)
     self.q_in, self.q_out = Queue(maxsize=max_size), Queue()
-    self.pred_buffer, self.predictions, self.shm_anchors, self.shm_detections, self.procs = [], None, None, None, None
+    self.pred_queue = []
     self.counter = 0
     self._shutdown = False
+    self.buf_pred, self.shared_anchors, self.shm_pred, self.detections, self.procs, self.manager = None, None, None, None, None, None
 
   def __del__(self):
     self.shutdown()
 
   def add(self, prediction, orig_size):
-    if self.predictions is not None and self.counter < self.max_size:
-      self.enqueue(prediction, orig_size)
-    else:
-      self.pred_buffer.append((prediction, orig_size))
+    self.pred_queue.append((prediction, orig_size))
+    if self.buf_pred is not None and self.counter < self.max_size:
+      self.enqueue(self.counter)
 
-  def launch(self):
+  def start(self):
     try:
-      self.predictions = Tensor.empty((self.max_size, self.anchors.shape[0], self.num_classes + 4),
-                                      dtype=dtypes.float32, device=f"disk:{self.buf_name}_in")
-      det_shp = (self.max_size, -1) # TODO: Shape
-      self.shm_detections = shared_memory.SharedMemory(create=True, size=np.empty(det_shp).nbytes)
-      self.shm_anchors = shared_memory.SharedMemory(create=True, size=self.anchors.nbytes)
-      self.buf_detections = np.ndarray(det_shp, dtype=np.float32, buffer=self.shm_anchors.buf)
-      buf_anchors = np.ndarray(self.anchors.shape, dtype=np.float32, buffer=self.shm_anchors.buf)
-      buf_anchors[:] = self.anchors[:]
+      self.manager = Manager()
+      self.detections = self.manager.list([None] * self.max_size)
+      num_anchors = sum(anchors.shape[0] for anchors in self.anchors_by_lvl)
+      pred_buf_shp = (self.max_size, num_anchors, self.num_classes + 4)
+      pred_bytes = np.empty(pred_buf_shp, dtype=np.float32).nbytes
+      self.shm_pred = shared_memory.SharedMemory(create=True, size=pred_bytes)
+      self.buf_pred = np.ndarray(pred_buf_shp, dtype=np.float32, buffer=self.shm_pred.buf)
+      self.shared_anchors = self.manager.list(self.anchors_by_lvl)
 
       self.procs = []
-      for _ in range(cpu_count()):
-        p = Process(target=pp_process,
-                    args=(self.q_in, self.q_out, self.predictions, self.shm_anchors, self.shm_detections, self.max_size))
+      proc_count = cpu_count() if not self.max_procs else min(cpu_count(), self.max_procs)
+      for _ in range(proc_count):
+        args = (self.q_in, self.q_out, self.detections, self.shared_anchors, self.shm_pred.name, self.num_classes, self.max_size)
+        p = Process(target=pp_process, args=args)
         p.daemon = True
         p.start()
         self.procs.append(p)
-      for pred, orig_size in self.pred_buffer:
-        self.enqueue(pred, orig_size)
-        if self.counter == self.max_size:
+      for _ in self.pred_queue:
+        if self.counter >= self.max_size:
           break
-    except:
+        self.enqueue(self.counter)
+    except Exception as e:
       self.shutdown()
-      # TODO
+      raise e
 
-  def enqueue(self, prediction, orig_size):
+  def enqueue(self, idx):
     if not self._shutdown:
       # faster than X[idx].assign(img.tobytes())
-      self.predictions[self.idx].contiguous().realize().lazydata.realized.as_buffer(force_zero_copy=True)[:] = prediction.cast(dtypes.float32).tobytes()
-      self.q_in.put((self.idx, orig_size))
+      prediction, orig_size = self.pred_queue.pop(0)
+      self.buf_pred[idx][:] = prediction[:]
+      self.q_in.put((idx, orig_size))
       self.counter += 1
 
   def receive(self):
     idx = self.q_out.get()
     if idx is None:
       return None
-    ret = {"boxes": np.empty(), "scores": np.empty(), "labels": np.empty()} # TODO shapes
-    ret['boxes'][:] = self.buf_detections[idx, :, :4] # TODO shapes
-    ret['scores'][:] = self.buf_detections[idx, :, 4:5] # TODO shapes
-    ret['labels'][:] = self.buf_detections[idx, :, 5:] # TODO shapes
-    return ret, self.Cookie(idx, self)
+    return self.detections[idx], Cookie(idx, self)
 
   def shutdown(self):
-    pass # TODO
+    self._shutdown = True
+    if self.procs is not None:
+      for _ in self.procs: self.q_in.put(None)
+    if self.q_in is not None:
+      self.q_in.close()
+    if self.procs is not None and self.q_out is not None:
+      for _ in self.procs:
+        while self.q_out.get() is not None: pass
+      self.q_out.close()
+      for p in self.procs: p.join()
+    if self.manager is not None:
+      self.manager.shutdown()
 
-  class Cookie:
-    def __init__(self, idx, post_proc):
-      self.idx, self.post_proc = idx, post_proc
-    def __del__(self):
-      if not self._shutdown:
-        self.post_proc.enqueue(self.idx)
+class Cookie:
+  def __init__(self, idx, post_proc):
+    self.idx, self.post_proc = idx, post_proc
+  def __del__(self):
+    if not self._shutdown:
+      self.post_proc.enqueue(self.idx)
 
-def pp_process(q_in, q_out, predictions, shm_anch_id, shm_det_id, max_size):
+def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, max_size):
   import signal
   signal.signal(signal.SIGINT, lambda _, __: exit(0))
 
-  shm_anchors = shared_memory.SharedMemory(name=shm_anch_id)
-  anchors = np.ndarray((predictions.shape[1], 4), dtype=np.float32, buffer=shm_anchors.buf)
-  shm_det = shared_memory.SharedMemory(name=shm_det_id)
-  detections = np.ndarray((max_size, 4), dtype=np.float32, buffer=shm_det.buf) # TODO shape
+  shm_pred = shared_memory.SharedMemory(name=shm_pred_name)
+  predictions = np.ndarray((max_size, num_classes + 4, 4), dtype=np.float32, buffer=shm_pred.buf)
   while (_recv := q_in.get()) is not None:
     idx, orig_size = _recv
-    detections[idx] = postprocess_detection(predictions[idx].numpy(), anchors, orig_size=orig_size)
+    detections[idx] = postprocess_detection(predictions[idx], anchors, orig_size=orig_size)
     q_out.put(idx)
   q_out.put(None)
 
-def postprocess_detection(prediction, anchors, input_size=(800, 800), orig_size=None, score_thresh=0.05, topk_candidates=1000, nms_thresh=0.5, num_classes=None):
+def postprocess_detection(prediction, anchors, input_size=(800, 800), orig_size=None, score_thresh=0.05, topk_candidates=1000, nms_thresh=0.5, num_anchors=9, num_classes=None):
   num_classes = num_classes if num_classes else len(MLPERF_CLASSES)
   grid_sizes = compute_grid_sizes(input_size)
-  split_idx = np.cumsum([int(anchors.shape[0] * sz[0] * sz[1]) for sz in grid_sizes[:-1]])
+  split_idx = np.cumsum([int(num_anchors * sz[0] * sz[1]) for sz in grid_sizes[:-1]])
   h, w = input_size
   prediction = np.split(prediction, split_idx)
   offsets_per_image = [br[:, :4] for br in prediction]

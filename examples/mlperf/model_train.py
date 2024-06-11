@@ -275,6 +275,7 @@ def train_resnet():
         i, proc = 0, data_get(it)
         
       prev_cookies = []
+      post_cookies = []
       while proc is not None:
         GlobalCounters.reset()
         st = time.time()
@@ -444,7 +445,7 @@ def train_retinanet():
   @TinyJit
   def eval_step(X):
     out = model(normalize(X))
-    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).realize()
+    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).cast(dtypes.float32).realize()
 
   def reshard_params():
     # some param grads become sharded during backprop if inp is sharded
@@ -464,10 +465,14 @@ def train_retinanet():
     return x.shard(GPUS, axis=axis).realize(), y, y_dat.shard(GPUS, axis=axis).realize(), cookie
 
   from examples.mlperf.dataloader import batch_load_retinanet
+  from extra.datasets.postprocess_openimages import Postprocessor
   from contextlib import redirect_stdout
 
   print(f"training with batch size {BS} for {epochs} epochs")
-  anchors = np.concatenate(model.anchor_gen((800, 800)))
+  anchors_by_lvl = model.anchor_gen((800, 800))
+  anchors = np.concatenate(anchors_by_lvl)
+
+  from extra.models.retinanet import compute_grid_sizes
   # ** epoch loop **
   for epoch in range(getenv("START_EPOCH", 0), epochs):
     # ** train loop **
@@ -515,25 +520,38 @@ def train_retinanet():
       coco_evalimgs, evaluated_imgs, ncats, narea = [], [], len(coco_eval.params.catIds), len(coco_eval.params.areaRng)
       Tensor.training = False
       BEAM.value = config["EVAL_BEAM"]
+      cpus = multiprocessing.cpu_count()
+      dl_cpus, post_cpus = cpus // 2, cpus - cpus // 2
+      print(f"{dl_cpus=}, {post_cpus=}")
 
-      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, seed=seed*epochs + epoch)
+      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, seed=seed*epochs + epoch, max_procs=dl_cpus)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
       i, proc = 0, data_get(it)
 
-      prev_cookies = []
+      post_proc = Postprocessor(anchors_by_lvl, max_procs=post_cpus)
+      post_proc.start()
+
+      dl_cookies, post_cookies = [], []
       while proc is not None:
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
 
-        if len(prev_cookies) == getenv("STORE_COOKIES", 1): prev_cookies = []  # free previous cookies after gpu work has been enqueued
+        if len(dl_cookies) == getenv("STORE_COOKIES", 1): dl_cookies = []  # free previous cookies after gpu work has been enqueued
         try:
           next_proc = data_get(it)
         except StopIteration:
           next_proc = None
-        prev_cookies.append(proc)
+        dl_cookies.append(proc)
         proc, next_proc = next_proc, None
         i += 1
 
-        predictions = model.postprocess_detections(out, orig_image_sizes=[t["image_size"] for t in targets])
+        for i, t in enumerate(targets):
+          post_proc.add(out[i].numpy(), t['image_size'])
+        predictions = []
+        for _ in enumerate(targets):
+          pred, cookie = post_proc.receive()
+          predictions.append(pred)
+          post_cookies.append(cookie)
+        print(f"{predictions=}")
         img_ids = [t["image_id"] for t in targets]
         coco_results  = [{"image_id": targets[i]["image_id"], "category_id": label, "bbox": box.tolist(), "score": score}
                          for i, prediction in enumerate(predictions) for box, score, label in zip(*prediction.values())]
