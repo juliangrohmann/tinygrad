@@ -356,13 +356,23 @@ def train_retinanet():
   from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, Conv2dHeNormal, FrozenBatchNorm
 
   # ** model definition and initializers **
-  resnet.BatchNorm = FrozenBatchNorm if getenv("SYNCBN") else functools.partial(UnsyncedBatchNorm, num_devices=len(GPUS))
+  if getenv("SYNCBN"):
+    print("using synced bn.")
+    resnet.BatchNorm = BatchNorm2d
+  elif getenv("FROZENBN"):
+    print("using frozen bn.")
+    resnet.BatchNorm = FrozenBatchNorm
+  else:
+    print("using unsynced bn.")
+    functools.partial(UnsyncedBatchNorm, num_devices=len(GPUS))
   retinanet.Conv2d = Conv2dRetina
   retinanet.Conv2dCls = Conv2dClsRetina
   retinanet.Conv2dFPN = Conv2dFPN
   backbone = resnet.ResNeXt50_32X4D()
   backbone.load_from_pretrained()
   model = retinanet.RetinaNet(backbone)
+  if getenv("PRETRAINED"):
+    model.load_from_pretrained()
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
@@ -386,6 +396,9 @@ def train_retinanet():
   config["EVAL_BEAM"]     = getenv("EVAL_BEAM", BEAM.value)
   config["WINO"]          = WINO.value
   config["SYNCBN"]        = getenv("SYNCBN")
+  # ** debug parameters **
+  skip_train = getenv("SKIP_TRAIN", -1)
+  skip_eval = getenv("SKIP_EVAL", -1)
 
   # ** download dataset **
   from extra.datasets.openimages import openimages, get_targets
@@ -476,6 +489,10 @@ def train_retinanet():
     prev_cookies = []
     st = time.perf_counter()
     while proc is not None:
+      if i >= skip_train >= 0:
+        print(f"skipped training at step {i}.")
+        break
+
       tt = time.perf_counter()
       loss, proc = train_step(proc[0], proc[1], proc[2]).item(), proc[3]
       if len(prev_cookies) == getenv("STORE_COOKIES", 1):
@@ -526,6 +543,10 @@ def train_retinanet():
 
       prev_cookies = []
       while proc is not None:
+        if i >= skip_eval >= 0:
+          print(f"skipped eval at step {i}.")
+          break
+
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
 
         if len(prev_cookies) == getenv("STORE_COOKIES", 1): prev_cookies = []  # free previous cookies after gpu work has been enqueued
