@@ -500,6 +500,7 @@ def train_retinanet():
         wandb.log({"train/loss": loss, "epoch": epoch + (i + 1) / steps_in_train_epoch})
 
     # before eval checkpoint TODO: remove
+    ckpt_dir = Path(dataset_dir) / ".ckpts" if dataset_dir else Path(__file__).parent / ".ckpts"
     if getenv("CKPT"):
       ckpt_dir.mkdir(parents=True, exist_ok=True)
       if WANDB and wandb.run is not None:
