@@ -483,7 +483,9 @@ def train_retinanet():
     Tensor.training = True
     BEAM.value = config["TRAIN_BEAM"]
 
-    batch_loader = batch_load_retinanet(targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", True), seed=seed*epochs + epoch, dataset_dir=dataset_dir)
+    batch_loader = batch_load_retinanet(
+      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", True), max_procs=getenv("MAX_PROCS", 0),
+      seed=seed*epochs + epoch, dataset_dir=dataset_dir)
     it = iter(tqdm(batch_loader, total=steps_in_train_epoch, desc=f"epoch {epoch} (train)"))
     i, proc = 0, data_get(it)
 
