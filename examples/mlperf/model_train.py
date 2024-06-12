@@ -551,7 +551,9 @@ def train_retinanet():
           break
 
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
-
+        for t in targets:
+          print(f"processing {t['image_id']}")
+          
         if len(prev_cookies) == getenv("STORE_COOKIES", 1): prev_cookies = []  # free previous cookies after gpu work has been enqueued
         try:
           next_proc = data_get(it)
