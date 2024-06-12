@@ -254,7 +254,7 @@ def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(1
     Y_dat = Tensor.empty(*sz_y, dtype=dtypes.float32, device=f"disk:{y_buf_fn}")
     Y = [None] * (batch_size*BATCH_COUNT)
 
-    for _ in range(min(cpu_count(), max_procs) if max_procs else cpu_count):
+    for _ in range(min(cpu_count(), max_procs) if max_procs else cpu_count()):
       p = Process(target=loader_process_retinanet, args=(q_in, q_out, X, Y_dat, sh_targets, shm.name, seed))
       p.daemon = True
       p.start()
