@@ -198,6 +198,8 @@ class RetinaNet:
     for k, v in state_dict.items():
       obj = get_child(self, k)
       dat = v.detach().numpy()
+      if ('.running_mean' in k or '.running_var' in k) and obj.shape != dat.shape: # shape mismatch when using unsynced batchnorm
+        dat = np.tile(dat, (obj.shape[0], 1))
       assert obj.shape == dat.shape, (k, obj.shape, dat.shape)
       obj.assign(dat)
 
