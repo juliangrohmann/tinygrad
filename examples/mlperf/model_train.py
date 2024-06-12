@@ -408,8 +408,8 @@ def train_retinanet():
   dataset_dir = getenv("DATASET_DIR", "")
   coco_val = COCO(openimages("validation", dataset_dir=dataset_dir))
   openimages("train", dataset_dir=dataset_dir)
-  targets_val = get_targets("validation", dataset_dir=dataset_dir, cache=getenv("CACHE", True))
-  targets_train = get_targets("train", dataset_dir=dataset_dir, cache=getenv("CACHE", True))
+  targets_val = get_targets("validation", dataset_dir=dataset_dir, cache=getenv("CACHE", 1))
+  targets_train = get_targets("train", dataset_dir=dataset_dir, cache=getenv("CACHE", 1))
   steps_in_train_epoch  = config["steps_in_train_epoch"]  = round_up(len(targets_train), BS) // BS
   steps_in_val_epoch    = config["steps_in_val_epoch"]    = round_up(len(targets_val), EVAL_BS) // EVAL_BS
 
@@ -484,7 +484,7 @@ def train_retinanet():
     BEAM.value = config["TRAIN_BEAM"]
 
     batch_loader = batch_load_retinanet(
-      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", True), max_procs=getenv("MAX_PROCS", 0),
+      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", 1), max_procs=getenv("MAX_PROCS", 0),
       seed=seed*epochs + epoch, dataset_dir=dataset_dir)
     it = iter(tqdm(batch_loader, total=steps_in_train_epoch, desc=f"epoch {epoch} (train)"))
     i, proc = 0, data_get(it)
@@ -540,7 +540,7 @@ def train_retinanet():
       Tensor.training = False
       BEAM.value = config["EVAL_BEAM"]
 
-      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", True), seed=seed*epochs+epoch)
+      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), seed=seed*epochs+epoch)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
       i, proc = 0, data_get(it)
 
