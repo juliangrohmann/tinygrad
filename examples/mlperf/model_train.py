@@ -347,6 +347,7 @@ def train_retinanet():
   GPUS = config["GPUS"] = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
   seed = config["seed"] = getenv("SEED", 42)
   Tensor.manual_seed(seed)  # seed for weight initialization
+  np.random.seed(seed)
   print(f"training on {GPUS}")
 
   from tinygrad.nn import BatchNorm2d
