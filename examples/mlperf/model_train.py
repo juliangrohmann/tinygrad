@@ -540,7 +540,8 @@ def train_retinanet():
       Tensor.training = False
       BEAM.value = config["EVAL_BEAM"]
 
-      batch_loader = batch_load_retinanet(targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), seed=seed*epochs+epoch)
+      batch_loader = batch_load_retinanet(
+        targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), max_procs=getenv("MAX_PROCS", 0), seed=seed*epochs+epoch)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
       i, proc = 0, data_get(it)
 
@@ -551,9 +552,6 @@ def train_retinanet():
           break
 
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
-        for t in targets:
-          print(f"processing {t['image_id']}")
-
         if len(prev_cookies) == getenv("STORE_COOKIES", 1): prev_cookies = []  # free previous cookies after gpu work has been enqueued
         try:
           next_proc = data_get(it)
