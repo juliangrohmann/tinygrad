@@ -372,6 +372,7 @@ def train_retinanet():
   backbone.load_from_pretrained()
   model = retinanet.RetinaNet(backbone)
   if getenv("PRETRAINED"):
+    print("loading retinanet from pretrained.")
     model.load_from_pretrained()
 
   # shard weights and initialize in order
