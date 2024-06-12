@@ -378,7 +378,7 @@ def train_retinanet():
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
-    if not getenv("SYNCBN") and not getenv("FROZENBN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
+    if not getenv("SYNCBN") and not getenv("FROZENBN") and not getenv("UNSHARDED_BN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
       x.realize().shard_(GPUS, axis=0)
     else:
       x.realize().to_(GPUS)
