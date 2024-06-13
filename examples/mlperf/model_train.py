@@ -376,7 +376,6 @@ def train_retinanet():
   trainable = ['layer2', 'layer3', 'layer4']
   for k, v in get_state_dict(backbone).items():
     v.requires_grad = any(name in k for name in trainable)
-    print(f"{k}: {v.requires_grad}")
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
