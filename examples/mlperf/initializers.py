@@ -78,19 +78,7 @@ class LinearBert(nn.Linear):
     matmul_dtype = dtypes.half if getenv("HALF_LINEAR", 0) else dtypes.default_float
     # TODO: Remove contiguous once slow kernel compile without this contiguous is fixed
     return x.contiguous().cast(matmul_dtype).linear(self.weight.contiguous().cast(matmul_dtype).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
-
-def __call__(self, x:Tensor):
-  if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
-
-  xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
-  batch_mean = self.running_mean
-  batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
-  ret = xr.batchnorm(
-    self.weight.reshape(1, -1).expand((self.num_devices, -1)),
-    self.bias.reshape(1, -1).expand((self.num_devices, -1)),
-    batch_mean, batch_invstd, axis=(0, 2))
-  return ret.reshape(x.shape).cast(x.dtype)
-
+  
 class EmbeddingBert(nn.Embedding):
   def __init__(self, vocab_size:int, embed_size:int, std=0.02):
     self.vocab_sz, self.embed_sz = vocab_size, embed_size
