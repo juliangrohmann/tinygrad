@@ -489,7 +489,7 @@ def train_retinanet():
     BEAM.value = config["TRAIN_BEAM"]
 
     batch_loader = batch_load_retinanet(
-      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", 1), max_procs=getenv("MAX_PROCS", 0),
+      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", 1), max_procs=getenv("DL_PROCS", 0),
       seed=seed*epochs + epoch, dataset_dir=dataset_dir)
     it = iter(tqdm(batch_loader, total=steps_in_train_epoch, desc=f"epoch {epoch} (train)"))
     i, proc = 0, data_get(it)
@@ -544,12 +544,12 @@ def train_retinanet():
       coco_evalimgs, evaluated_imgs, ncats, narea = [], [], len(coco_eval.params.catIds), len(coco_eval.params.areaRng)
       Tensor.training = False
       BEAM.value = config["EVAL_BEAM"]
-      cpus = multiprocessing.cpu_count()
-      dl_cpus, post_cpus = cpus // 2, cpus - cpus // 2
-      print(f"{dl_cpus=}, {post_cpus=}")
+      total_cpus = multiprocessing.cpu_count()
+      dl_cpus = getenv("DL_PROCS", total_cpus // 2)
+      post_cpus = total_cpus - dl_cpus
 
       batch_loader = batch_load_retinanet(
-        targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), max_procs=getenv("MAX_PROCS", 0), seed=seed*epochs+epoch)
+        targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), max_procs=dl_cpus, seed=seed*epochs+epoch)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
       i, proc = 0, data_get(it)
 
@@ -558,8 +558,10 @@ def train_retinanet():
 
       dl_cookies, post_cookies = [], []
       while proc is not None:
-        if i >= 10:
-          break
+        if i >= skip_eval >= 0:
+          print(f"skipped eval at step {i}.")
+        break
+
         t0 = time.perf_counter()
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
         t1 = time.perf_counter()
