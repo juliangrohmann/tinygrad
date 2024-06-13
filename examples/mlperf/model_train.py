@@ -379,7 +379,7 @@ def train_retinanet():
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
-    if not getenv("SYNCBN") and not getenv("FROZENBN") and not getenv("UNSHARDED_BN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
+    if not getenv("SYNCBN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
       x.realize().shard_(GPUS, axis=0)
     else:
       x.realize().to_(GPUS)
@@ -488,7 +488,7 @@ def train_retinanet():
     BEAM.value = config["TRAIN_BEAM"]
 
     batch_loader = batch_load_retinanet(
-      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", 1), max_procs=getenv("DL_PROCS", 0),
+      targets_train, anchors, batch_size=BS, val=False, shuffle=getenv("SHUFFLE", 1), max_procs=getenv("DL_PROCS", 512),
       seed=seed*epochs + epoch, dataset_dir=dataset_dir)
     it = iter(tqdm(batch_loader, total=steps_in_train_epoch, desc=f"epoch {epoch} (train)"))
     i, proc = 0, data_get(it)
@@ -559,7 +559,7 @@ def train_retinanet():
       while proc is not None:
         if i >= skip_eval >= 0:
           print(f"skipped eval at step {i}.")
-        break
+          break
 
         t0 = time.perf_counter()
         out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
