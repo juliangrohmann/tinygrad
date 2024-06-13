@@ -141,6 +141,9 @@ class ResNet:
 
     self.url = model_urls[(self.num, self.groups, self.base_width)]
     for k, v in torch_load(fetch(self.url)).items():
+      if 'fc.' in k and self.fc is None:
+        continue
+
       obj: Tensor = get_child(self, k)
       dat = v.detach().numpy()
 

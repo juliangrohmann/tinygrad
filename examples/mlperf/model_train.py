@@ -358,23 +358,25 @@ def train_retinanet():
 
   # ** model definition and initializers **
   if getenv("SYNCBN"):
-    print("using synced bn.")
-    resnet.BatchNorm = BatchNorm2d
-  elif getenv("FROZENBN"):
-    print("using frozen bn.")
+    print("using sync bn.")
     resnet.BatchNorm = FrozenBatchNorm
   else:
     print("using unsynced bn.")
-    resnet.BatchNorm = functools.partial(UnsyncedBatchNorm, num_devices=len(GPUS))
+    resnet.BatchNorm = functools.partial(UnsyncedBatchNorm, num_devices=len(GPUS)) # TODO: freeze unsynced batchnorm
   retinanet.Conv2d = Conv2dRetina
   retinanet.Conv2dCls = Conv2dClsRetina
   retinanet.Conv2dFPN = Conv2dFPN
-  backbone = resnet.ResNeXt50_32X4D()
+  backbone = resnet.ResNeXt50_32X4D(num_classes=None)
   backbone.load_from_pretrained()
   model = retinanet.RetinaNet(backbone)
   if getenv("PRETRAINED"):
     print("loading retinanet from pretrained.")
     model.load_from_pretrained()
+
+  trainable = ['layer2', 'layer3', 'layer4']
+  for k, v in get_state_dict(backbone).items():
+    v.requires_grad = any(name in k for name in trainable)
+    print(f"{k}: {v.requires_grad}")
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
