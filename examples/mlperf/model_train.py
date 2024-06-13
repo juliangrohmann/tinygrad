@@ -453,7 +453,7 @@ def train_retinanet():
   @TinyJit
   def eval_step(X):
     out = model(normalize(X))
-    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).cast(dtypes.float32).realize().numpy()
+    return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).cast(dtypes.float32).realize()
 
   def reshard_params():
     # some param grads become sharded during backprop if inp is sharded
@@ -562,7 +562,7 @@ def train_retinanet():
           break
 
         t0 = time.perf_counter()
-        out, targets, proc = eval_step(proc[0]), proc[1], proc[3]  # drop inputs, keep cookie
+        out, targets, proc = eval_step(proc[0]).numpy(), proc[1], proc[3]  # drop inputs, keep cookie
         t1 = time.perf_counter()
 
         if len(dl_cookies) == getenv("STORE_COOKIES", 1): dl_cookies = []  # free previous cookies after gpu work has been enqueued
@@ -576,19 +576,37 @@ def train_retinanet():
 
         t2 = time.perf_counter()
         for idx, t in enumerate(targets):
-          post_proc.add(out[idx], t['image_size'])
-        predictions = []
+          post_proc.add(out[idx], t['image_size'], t['image_id'])
         t3 = time.perf_counter()
 
-        for _ in enumerate(targets):
-          pred, cookie = post_proc.receive()
-          predictions.append(pred)
+        predictions = []
+        for _ in range(len(targets)):
+          img_id, pred, cookie = post_proc.receive()
+          predictions.append((img_id, pred))
           post_cookies.append(cookie)
         t4 = time.perf_counter()
 
-        img_ids = [t["image_id"] for t in targets]
-        coco_results  = [{"image_id": targets[i]["image_id"], "category_id": label, "bbox": box.tolist(), "score": score}
-                         for i, prediction in enumerate(predictions) for box, score, label in zip(*prediction.values())]
+        if getenv("TEST_EVAL"):
+          for i in range(len(predictions)):
+            img_id, p = predictions[i]
+            cmp_fn = Path(__file__).parent / "retinanet" / "cmp" / f"{img_id}.npy"
+            cmp = np.load(cmp_fn)
+            stacked = np.concatenate([p['boxes'], p['scores'][:, None], p['labels'][:, None]], axis=1)
+            try:
+              assert cmp.shape == stacked.shape and np.isclose(cmp, stacked, atol=0.001).all(), f"img {img_id} failed eval test."
+            except AssertionError as e:
+              print(f"computed: {stacked}")
+              print(f"correct: {cmp=}")
+              if cmp.shape == stacked.shape:
+                print(f"max diff: {np.max(np.abs(stacked - cmp))}")
+              else:
+                print(f"shape diff: computed shape = {stacked.shape}, correct shape = {cmp.shape}")
+              raise e
+          tqdm.write(f"img set {i} passed eval test.")
+
+        img_ids = [img_id for img_id, _ in predictions]
+        coco_results = [{"image_id": img_id, "category_id": label, "bbox": box.tolist(), "score": score}
+                        for img_id, prediction in predictions for box, score, label in zip(*prediction.values())]
 
         with redirect_stdout(None):
           coco_eval.cocoDt = coco_val.loadRes(coco_results) if coco_results else COCO()

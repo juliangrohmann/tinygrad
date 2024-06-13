@@ -63,7 +63,7 @@ class Conv2dFPN(nn.Conv2d):
                     padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
 
 class FrozenBatchNorm(nn.BatchNorm2d):
-  def __init__(self, sz:int, eps=0, affine=True, track_running_stats=True, momentum=0.1):
+  def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1):
     super().__init__(sz, eps=eps, affine=affine, track_running_stats=track_running_stats, momentum=momentum)
   def __call__(self, x:Tensor):
     batch_invstd = self.running_var.reshape(1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()

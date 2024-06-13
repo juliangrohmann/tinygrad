@@ -6,9 +6,10 @@ from extra.models.retinanet import compute_grid_sizes
 
 class Postprocessor:
   def __init__(self, anchors_by_lvl, num_classes=None, max_size=128, max_procs=None):
-    self.anchors_by_lvl, self.max_size, self.max_procs = anchors_by_lvl, max_size, max_procs
+    self.anchors_by_lvl, self.max_size = anchors_by_lvl, max_size,
+    self.max_procs = max_procs if max_procs else max_size
     self.num_classes = num_classes if num_classes else len(MLPERF_CLASSES)
-    self.q_in, self.q_out = Queue(maxsize=max_size), Queue(maxsize=max_size)
+    self.q_in, self.q_out = Queue(), Queue()
     self.pred_queue = []
     self.idle = list(range(max_size))
     self.shutdown_ = False
@@ -17,14 +18,14 @@ class Postprocessor:
   def __del__(self):
     self.shutdown()
 
-  def add(self, prediction, orig_size):
-    self.pred_queue.append((prediction, orig_size))
+  def add(self, prediction, orig_size, img_id):
+    self.pred_queue.append((prediction, orig_size, img_id))
     if self.buf_pred is not None and self.idle:
       self._enqueue(self.idle[0])
 
   def receive(self):
-    idx = self.q_out.get()
-    return (self.detections[idx], Cookie(idx, self)) if idx is not None else None
+    img_id, idx = self.q_out.get()
+    return (img_id, self.detections[idx], Cookie(idx, self)) if idx is not None else None
 
   def start(self):
     try:
@@ -69,9 +70,9 @@ class Postprocessor:
     if self.shutdown_:
       pass
     elif self.pred_queue:
-      prediction, orig_size = self.pred_queue.pop(0)
+      prediction, orig_size, img_id = self.pred_queue.pop(0)
       self.buf_pred[idx][:] = prediction[:]
-      self.q_in.put((idx, orig_size))
+      self.q_in.put((idx, orig_size, img_id))
       if idx in self.idle:
         self.idle.remove(idx)
     elif not idx in self.idle:
@@ -92,9 +93,9 @@ def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, num
   shm_pred = shared_memory.SharedMemory(name=shm_pred_name)
   predictions = np.ndarray((max_size, num_anchors, num_classes + 4), dtype=np.float32, buffer=shm_pred.buf)
   while (_recv := q_in.get()) is not None:
-    idx, orig_size = _recv
+    idx, orig_size, img_id = _recv
     detections[idx] = postprocess_detection(predictions[idx], anchors, orig_size=orig_size)
-    q_out.put(idx)
+    q_out.put((img_id, idx))
   q_out.put(None)
 
 def postprocess_detection(prediction, anchors, input_size=(800, 800), orig_size=None, score_thresh=0.05, topk_candidates=1000, nms_thresh=0.5, num_anchors=9, num_classes=None):
