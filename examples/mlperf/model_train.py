@@ -781,6 +781,7 @@ def train_bert():
   i, train_data = start_step, get_data_bert(GPUS, train_it)
   while train_data is not None and i < train_steps and not achieved:
     Tensor.training = True
+    Tensor.no_grad = False
     BEAM.value = TRAIN_BEAM
     st = time.perf_counter()
     GlobalCounters.reset()
@@ -832,6 +833,7 @@ def train_bert():
       eval_clsf_accs = []
       eval_times = []
       Tensor.training = False
+      Tensor.no_grad = True
       BEAM.value = EVAL_BEAM
 
       for j in tqdm(range(max_eval_steps), desc="Evaluating", total=max_eval_steps, disable=BENCHMARK):
