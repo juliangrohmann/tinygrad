@@ -95,7 +95,7 @@ def get_targets(split, dataset_dir=None, cache=False):
   def process_img(idx):
     file_name = str(pathlib.Path(split) / "data" / images[idx - 1]['file_name'])
     img_size = extract_dims(dataset_dir / file_name)
-    target = prepare_target(entries, prev_id, img_size, (800, 800))
+    target = prepare_target(entries, prev_id, img_size, new_size=(800, 800))
     target['file_name'] = file_name
     targets.append(target)
 
@@ -215,25 +215,25 @@ def iterate(coco, split, bs=8, dataset_dir=BASEDIR, progress=False):
       targets.append(prepare_target(annotations, img_id, original_size))
     yield np.array(X), targets
 
-def prepare_target(annotations, img_id, img_size, new_size=None):
+def prepare_target(annotations, img_id, orig_size, new_size=None):
   boxes = [annot["bbox"] for annot in annotations]
   boxes = np.array(boxes, dtype=np.float32).reshape(-1, 4)
   boxes[:, 2:] += boxes[:, :2]
-  boxes[:, 0::2] = boxes[:, 0::2].clip(0, img_size[1])
-  boxes[:, 1::2] = boxes[:, 1::2].clip(0, img_size[0])
+  boxes[:, 0::2] = boxes[:, 0::2].clip(0, orig_size[1])
+  boxes[:, 1::2] = boxes[:, 1::2].clip(0, orig_size[0])
   keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
   boxes = boxes[keep]
   if new_size:
-    h, w = img_size
+    h, w = orig_size
     boxes = resize_boxes(boxes, (h, w), new_size)
 
   classes = [annot["category_id"] for annot in annotations]
   classes = np.array(classes, dtype=np.int64)
   classes = classes[keep]
-  return {"boxes": boxes, "labels": classes, "image_id": img_id, "image_size": img_size}
+  return {"boxes": boxes, "labels": classes, "image_id": img_id, "image_size": orig_size}
 
-def resize_boxes(boxes, original_size, new_size) -> Tensor:
-  ratios = [s / s_orig for s, s_orig in zip(new_size, original_size)]
+def resize_boxes(boxes, orig_size, new_size):
+  ratios = [s / s_orig for s, s_orig in zip(new_size, orig_size)]
   ratio_height, ratio_width = ratios
   xmin, ymin, xmax, ymax = boxes.transpose()
   xmin = xmin * ratio_width
