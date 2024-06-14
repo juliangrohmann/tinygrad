@@ -31,8 +31,8 @@ def preprocess_image(fn:str, val:bool, img_size:Tuple[int, int]=(800, 800)):
 
   if img:
     img = img.resize(img_size, Image.BILINEAR)
-    if not val:
-      img = ImageOps.mirror(img) if random.random() < 0.5 else img
+    # if not val:
+    #   img = ImageOps.mirror(img) if random.random() < 0.5 else img
   else:
     img = np.tile(np.array([[[123.68, 116.78, 103.94]]], dtype=np.uint8), (*img_size, 1)) # pad data with training mean
   return img
