@@ -7,8 +7,9 @@ from typing import Tuple, Dict, Any
 from extra.datasets.openimages import MLPERF_CLASSES
 from tinygrad import Tensor
 
-def preprocess_target(target:Dict[str, Any], anchors:np.ndarray):
-  matched_idxs = compute_matched_idxs(target, anchors)
+def preprocess_target(target:Dict[str, Any], anchors:np.ndarray, mirror:bool, img_width=800):
+  boxes = mirror_boxes(target['boxes'], img_width) if mirror else target['boxes']
+  matched_idxs = compute_matched_idxs(boxes, anchors)
   is_fg = matched_idxs >= 0
 
   fg_idxs = matched_idxs[is_fg]
@@ -17,12 +18,12 @@ def preprocess_target(target:Dict[str, Any], anchors:np.ndarray):
 
   masked_anchors = anchors * is_fg[:, None]
   matched_gt_boxes = np.zeros(anchors.shape, dtype=np.float32)
-  matched_gt_boxes[is_fg] = target['boxes'][fg_idxs]
+  matched_gt_boxes[is_fg] = boxes[fg_idxs]
   weights = np.array([1.0, 1.0, 1.0], dtype=np.float32)
   bbox_regr = encode_boxes(matched_gt_boxes, masked_anchors, weights)
   return np.concatenate([gt_classes[:, None], bbox_regr, is_fg.astype(np.float32)[:, None]], axis=1)
 
-def preprocess_image(fn:str, val:bool, img_size:Tuple[int, int]=(800, 800)):
+def preprocess_image(fn:str, mirror:bool, img_size:Tuple[int, int]=(800, 800)):
   if fn:
     img = Image.open(fn)
     img = img.convert('RGB') if img.mode != "RGB" else img
@@ -31,14 +32,14 @@ def preprocess_image(fn:str, val:bool, img_size:Tuple[int, int]=(800, 800)):
 
   if img:
     img = img.resize(img_size, Image.BILINEAR)
-    # if not val:
-    #   img = ImageOps.mirror(img) if random.random() < 0.5 else img
+    if mirror:
+      img = ImageOps.mirror(img) if random.random() < 0.5 else img
   else:
     img = np.tile(np.array([[[123.68, 116.78, 103.94]]], dtype=np.uint8), (*img_size, 1)) # pad data with training mean
   return img
 
-def compute_matched_idxs(target:Dict[str, Any], anchors:np.ndarray):
-  match_quality_matrix = box_iou(target['boxes'], anchors)
+def compute_matched_idxs(boxes:np.ndarray, anchors:np.ndarray):
+  match_quality_matrix = box_iou(boxes, anchors)
   return match(match_quality_matrix)
 
 def match(match_quality_matrix:np.ndarray, high:float=0.5, low:float=0.5, allow_low_quality_matches=False):
@@ -91,4 +92,10 @@ def encode_boxes(ref_boxes:np.ndarray, gt_boxes:np.ndarray, weights:np.ndarray) 
     targets_centers = np.where(mask, weights[:2] * (gt_centers - pred_centers) / pred_lengths, 0)
     targets_lengths = np.where(mask, weights[2:] * np.log(gt_lengths / pred_lengths), 0)
   ret = np.concatenate([targets_centers, targets_lengths], axis=1)
+  return ret
+
+def mirror_boxes(boxes:np.ndarray, img_width):
+  ret = np.empty(boxes.shape)
+  ret[:, (0, 2)] = -boxes[:, (0, 2)] + 800
+  ret[:, (1, 3)] = boxes[:, (1, 3)]
   return ret

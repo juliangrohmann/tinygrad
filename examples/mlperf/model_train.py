@@ -425,7 +425,7 @@ def train_retinanet():
       tg_v.assign(torch_v.detach().numpy())
       assert (tg_v.numpy() == torch_v.detach().numpy()).all(), f"{tg_k} init mismatch: {tg_v.numpy()=}, {torch_v.detach().numpy()=}"
     assert len(tg_keys) == len(torch_keys), f"param count mismatch: {len(tg_keys)}, {len(torch_keys)}"
-    
+
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
     if not getenv("SYNCBN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
