@@ -350,6 +350,25 @@ def train_retinanet():
   np.random.seed(seed)
   print(f"training on {GPUS}")
 
+  # ** train parameters **
+  epochs            = config["epochs"]        = getenv("EPOCHS", 10)
+  target_map        = getenv("TARGET", 1.01)
+  eval_start_epoch  = getenv("EVAL_START_EPOCH", 0)
+  eval_freq         = getenv("EVAL_FREQ", 1)
+  # ** hyperparameters **
+  BS                = config["BS"]            = getenv("BS", 8 * len(GPUS))
+  EVAL_BS           = config["EVAL_BS"]       = getenv("EVAL_BS", BS)
+  base_lr           = config["base_lr"]       = getenv("LR", 0.0001)
+  # ** other parameters **
+  config["DEFAULT_FLOAT"] = dtypes.default_float.name
+  config["TRAIN_BEAM"]    = getenv("TRAIN_BEAM", BEAM.value)
+  config["EVAL_BEAM"]     = getenv("EVAL_BEAM", BEAM.value)
+  config["WINO"]          = WINO.value
+  config["SYNCBN"]        = getenv("SYNCBN")
+  # ** debug parameters **
+  skip_train_at  = config["SKIP_TRAIN_AT"]   = getenv("SKIP_TRAIN_AT", -1)
+  skip_eval_at   = config["SKIP_EVAL_AT"]    = getenv("SKIP_EVAL_AT", -1)
+
   from tinygrad.nn import BatchNorm2d
   import extra.models.resnet as resnet
   import extra.models.retinanet as retinanet
@@ -372,11 +391,13 @@ def train_retinanet():
   if getenv("PRETRAINED"):
     print("loading retinanet from pretrained.")
     model.load_from_pretrained()
+  
+  def req_grad(k, trainable=('layer2', 'layer3', 'layer4')):
+    if not 'backbone' in k or 'fpn' in k: return True
+    return any(name in k for name in trainable) and not 'bn' in k and (not 'downsample' in k or '0.weight' in k)
 
-  trainable = ['layer2', 'layer3', 'layer4']
-  for k, v in get_state_dict(backbone).items():
-    if not any(name in k for name in trainable):
-      v.requires_grad = False
+  for k, v in get_state_dict(model).items():
+    v.requires_grad = req_grad(k)
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
@@ -385,24 +406,10 @@ def train_retinanet():
     else:
       x.realize().to_(GPUS)
 
-  # ** train parameters **
-  epochs            = config["epochs"]        = getenv("EPOCHS", 10)
-  target_map        = getenv("TARGET", 1.01)
-  eval_start_epoch  = getenv("EVAL_START_EPOCH", 0)
-  eval_freq         = getenv("EVAL_FREQ", 1)
-  # ** hyperparameters **
-  BS                = config["BS"]            = getenv("BS", 8 * len(GPUS))
-  EVAL_BS           = config["EVAL_BS"]       = getenv("EVAL_BS", BS)
-  base_lr           = config["base_lr"]       = getenv("LR", 0.0001)
-  # ** other parameters **
-  config["DEFAULT_FLOAT"] = dtypes.default_float.name
-  config["TRAIN_BEAM"]    = getenv("TRAIN_BEAM", BEAM.value)
-  config["EVAL_BEAM"]     = getenv("EVAL_BEAM", BEAM.value)
-  config["WINO"]          = WINO.value
-  config["SYNCBN"]        = getenv("SYNCBN")
-  # ** debug parameters **
-  skip_train = getenv("SKIP_TRAIN", -1)
-  skip_eval = getenv("SKIP_EVAL", -1)
+  # ** optimizer **
+  from tinygrad.nn.optim import Adam
+  parameters = [x for x in get_parameters(model) if x.requires_grad]
+  optimizer = Adam(parameters, lr=base_lr)
 
   # ** download dataset **
   from extra.datasets.openimages import openimages, get_targets
@@ -415,12 +422,6 @@ def train_retinanet():
   targets_train = get_targets("train", dataset_dir=dataset_dir, cache=getenv("CACHE", 1))
   steps_in_train_epoch  = config["steps_in_train_epoch"]  = round_up(len(targets_train), BS) // BS
   steps_in_val_epoch    = config["steps_in_val_epoch"]    = round_up(len(targets_val), EVAL_BS) // EVAL_BS
-
-  # ** optimizer **
-  from tinygrad.nn.optim import Adam
-  skip_list = [v for k, v in get_state_dict(model).items() if '.fc.' in k or '.bn' in k or 'downsample' in k or '.layer1.' in k or v.requires_grad is False]
-  parameters = [x for x in get_parameters(model) if x not in set(skip_list)]
-  optimizer = Adam(parameters, lr=base_lr )
 
   # ** resume from checkpointing **
   if ckpt := getenv("RESUME", ""):
@@ -497,7 +498,7 @@ def train_retinanet():
     prev_cookies = []
     st = time.perf_counter()
     while proc is not None:
-      if i >= skip_train >= 0:
+      if i >= skip_train_at >= 0:
         print(f"skipped training at step {i}.")
         break
 
@@ -558,7 +559,7 @@ def train_retinanet():
 
       dl_cookies, post_cookies = [], []
       while proc is not None:
-        if i >= skip_eval >= 0:
+        if i >= skip_eval_at >= 0:
           print(f"skipped eval at step {i}.")
           break
 
