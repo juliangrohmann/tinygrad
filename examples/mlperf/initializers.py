@@ -2,7 +2,9 @@ import math
 from typing import Union, Tuple
 
 from tinygrad import Tensor, nn, dtypes
+from tinygrad.multi import MultiLazyBuffer
 from tinygrad.helpers import prod, argfix, getenv
+from examples.hlb_cifar10 import UnsyncedBatchNorm
 
 # rejection sampling truncated randn
 def rand_truncn(*shape, dtype=None, truncstds=2, **kwargs) -> Tensor:
@@ -68,6 +70,27 @@ class FrozenBatchNorm(nn.BatchNorm2d):
   def __call__(self, x:Tensor):
     batch_invstd = self.running_var.reshape(1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
     return x.batchnorm(self.weight, self.bias, self.running_mean, batch_invstd)
+
+class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
+  def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1, num_devices=None):
+    super().__init__(sz, eps=eps, affine=affine, track_running_stats=track_running_stats, momentum=momentum, num_devices=num_devices)
+
+  def __call__(self, x:Tensor):
+    if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
+
+    xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
+    batch_mean, batch_invstd = self.calc_stats(xr)
+    ret = xr.batchnorm(
+      self.weight.reshape(1, -1).expand((self.num_devices, -1)),
+      self.bias.reshape(1, -1).expand((self.num_devices, -1)),
+      batch_mean, batch_invstd, axis=(0, 2))
+    return ret.reshape(x.shape).cast(x.dtype)
+
+  def calc_stats(self, x:Tensor):
+    batch_mean = self.running_mean
+    # NOTE: this can be precomputed for static inference. we expand it here so it fuses
+    batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
+    return batch_mean, batch_invstd
 
 class LinearBert(nn.Linear):
   def __init__(self, in_features, out_features, bias=True, std=0.02):

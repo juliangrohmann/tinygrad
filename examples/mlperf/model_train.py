@@ -354,7 +354,7 @@ def train_retinanet():
   import extra.models.resnet as resnet
   import extra.models.retinanet as retinanet
   from examples.hlb_cifar10 import UnsyncedBatchNorm
-  from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, Conv2dHeNormal, FrozenBatchNorm
+  from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, Conv2dHeNormal, FrozenBatchNorm, FrozenUnsyncedBatchNorm
 
   # ** model definition and initializers **
   if getenv("SYNCBN"):
@@ -362,7 +362,7 @@ def train_retinanet():
     resnet.BatchNorm = FrozenBatchNorm
   else:
     print("using unsynced bn.")
-    resnet.BatchNorm = functools.partial(UnsyncedBatchNorm, num_devices=len(GPUS)) # TODO: freeze unsynced batchnorm
+    resnet.BatchNorm = functools.partial(FrozenUnsyncedBatchNorm, num_devices=len(GPUS))
   retinanet.Conv2d = Conv2dRetina
   retinanet.Conv2dCls = Conv2dClsRetina
   retinanet.Conv2dFPN = Conv2dFPN
@@ -375,7 +375,8 @@ def train_retinanet():
 
   trainable = ['layer2', 'layer3', 'layer4']
   for k, v in get_state_dict(backbone).items():
-    v.requires_grad = any(name in k for name in trainable)
+    if not any(name in k for name in trainable):
+      v.requires_grad = False
 
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
@@ -417,7 +418,7 @@ def train_retinanet():
 
   # ** optimizer **
   from tinygrad.nn.optim import Adam
-  skip_list = [v for k, v in get_state_dict(model).items() if '.fc.' in k or '.bn' in k or 'downsample' in k or '.layer1.' in k]
+  skip_list = [v for k, v in get_state_dict(model).items() if '.fc.' in k or '.bn' in k or 'downsample' in k or '.layer1.' in k or v.requires_grad is False]
   parameters = [x for x in get_parameters(model) if x not in set(skip_list)]
   optimizer = Adam(parameters, lr=base_lr )
 
