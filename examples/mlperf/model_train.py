@@ -468,11 +468,11 @@ def train_retinanet():
   def normalize(x):
     return ((x.permute([0, 3, 1, 2]) / 255.0 - input_mean) / input_std).cast(dtypes.default_float)
 
-  # @TinyJit
+  @TinyJit
   def train_step(X, Y, Y_dat):
     optimizer.zero_grad()
     out = model(normalize(X))
-    loss = model.compute_loss(Y, out, prep_dat=Y_dat).realize()
+    loss = model.compute_loss(Y, out, prep_dat=Y_dat)
     loss.backward()
     # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
     optimizer.step()
