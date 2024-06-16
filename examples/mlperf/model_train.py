@@ -475,7 +475,6 @@ def train_retinanet():
     loss = model.compute_loss(Y, out, prep_dat=Y_dat)
     loss.backward()
     # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
-    reshard_params()
     optimizer.step()
     return loss.realize()
 
@@ -483,18 +482,6 @@ def train_retinanet():
   def eval_step(X):
     out = model(normalize(X))
     return out['bbox_regression'].cat(out['cls_logits'].sigmoid(), dim=-1).cast(dtypes.float32).realize()
-
-  def reshard_params():
-    # some param grads become sharded during backprop if inp is sharded
-    # this causes Tensor.assign to fail in optimizer step.
-    # reshard all params to fix for now (~1 ms)
-    for p in optimizer.params:
-      if p.lazydata.axis is not None:
-        p.to_(GPUS[0])
-        p.shard_(GPUS)
-      if p.grad.lazydata.axis is not None:
-        p.grad.to_(GPUS[0])
-        p.grad.shard_(GPUS)
 
   def data_get(it):
     x, y, y_dat, cookie = next(it)
