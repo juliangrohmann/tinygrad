@@ -97,6 +97,6 @@ def encode_boxes(ref_boxes:np.ndarray, gt_boxes:np.ndarray, weights:np.ndarray) 
 
 def mirror_boxes(boxes:np.ndarray, img_width):
   ret = np.empty(boxes.shape)
-  ret[:, (0, 2)] = -boxes[:, (0, 2)] + 800
+  ret[:, (0, 2)] = -boxes[:, (2, 0)] + img_width
   ret[:, (1, 3)] = boxes[:, (1, 3)]
   return ret
