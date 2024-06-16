@@ -10,6 +10,7 @@ from tinygrad import Tensor
 def preprocess_target(target:Dict[str, Any], anchors:np.ndarray, mirror:bool, img_width=800):
   boxes = mirror_boxes(target['boxes'], img_width) if mirror else target['boxes']
   matched_idxs = compute_matched_idxs(boxes, anchors)
+  is_valid = matched_idxs != -2
   is_fg = matched_idxs >= 0
 
   fg_idxs = matched_idxs[is_fg]
@@ -21,7 +22,7 @@ def preprocess_target(target:Dict[str, Any], anchors:np.ndarray, mirror:bool, im
   matched_gt_boxes[is_fg] = boxes[fg_idxs]
   weights = np.array([1.0, 1.0, 1.0], dtype=np.float32)
   bbox_regr = encode_boxes(matched_gt_boxes, masked_anchors, weights)
-  return np.concatenate([gt_classes[:, None], bbox_regr, is_fg.astype(np.float32)[:, None]], axis=1)
+  return np.concatenate([gt_classes[:, None], bbox_regr, is_fg.astype(np.float32)[:, None], is_valid.astype(np.float32)[:, None]], axis=1)
 
 def preprocess_image(fn:str, mirror:bool, img_size:Tuple[int, int]=(800, 800)):
   if fn:
@@ -33,7 +34,7 @@ def preprocess_image(fn:str, mirror:bool, img_size:Tuple[int, int]=(800, 800)):
   if img:
     img = img.resize(img_size, Image.BILINEAR)
     if mirror:
-      img = ImageOps.mirror(img) if random.random() < 0.5 else img
+      img = ImageOps.mirror(img)
   else:
     img = np.tile(np.array([[[123.68, 116.78, 103.94]]], dtype=np.uint8), (*img_size, 1)) # pad data with training mean
   return img
@@ -42,7 +43,7 @@ def compute_matched_idxs(boxes:np.ndarray, anchors:np.ndarray):
   match_quality_matrix = box_iou(boxes, anchors)
   return match(match_quality_matrix)
 
-def match(match_quality_matrix:np.ndarray, high:float=0.5, low:float=0.5, allow_low_quality_matches=False):
+def match(match_quality_matrix:np.ndarray, high:float=0.5, low:float=0.5, allow_low_quality_matches=True):
   assert match_quality_matrix.size > 0, "empty targets or proposals not supported during training"
   matched_vals, matches = np.max(match_quality_matrix, axis=0), np.argmax(match_quality_matrix, axis=0)
   all_matches = copy.copy(matches) if allow_low_quality_matches else None

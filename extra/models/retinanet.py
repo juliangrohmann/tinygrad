@@ -183,10 +183,12 @@ class RetinaNet:
       dat = []
       anchors = np.concatenate(self.anchor_gen(input_size))
       for t in targets:
-        dat.append(preprocess_target(t, anchors)[None, ...])
+        dat.append(preprocess_target(t, anchors, False)[None, ...])
       prep_dat = Tensor(np.concatenate(dat, axis=0), head_outputs['cls_logits'].device, head_outputs['cls_logits'].dtype)
 
     losses = self.head.compute_loss(targets, head_outputs, prep_dat)
+    print(f"tinyg cls: {losses['classification'].item()}")
+    print(f"tinyg regr: {losses['bbox_regression'].item()}")
     return losses['classification'] + losses['bbox_regression']
 
   def load_from_pretrained(self):
@@ -284,9 +286,10 @@ class ClassificationHead:
     return out[0].cat(*out[1:], dim=1)
   def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor) -> Dict[str, Tensor]:
     cls_logits = head_outputs['cls_logits']
-    gt_classes, fg_mask = prep_dat[:, :, 0].one_hot(self.num_classes), prep_dat[:, :, -1:]
-    diff = sigmoid_focal_loss(cls_logits, gt_classes, reduction=None).sum(axis=(1, 2))
-    losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
+    gt_classes, fg_mask, valid_mask = prep_dat[:, :, 0].one_hot(self.num_classes), prep_dat[:, :, -2:-1], prep_dat[:, :, -1:]
+    f_loss = sigmoid_focal_loss(cls_logits, gt_classes, reduction=None)
+    valid_loss = (f_loss * valid_mask).sum(axis=(1, 2))
+    losses = valid_loss / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
     return losses.sum() / max(1, len(targets))
 
 class RegressionHead:
@@ -297,7 +300,7 @@ class RegressionHead:
     out = [self.bbox_reg(feat.sequential(self.conv)).permute(0, 2, 3, 1).reshape(feat.shape[0], -1, 4) for feat in x]
     return out[0].cat(*out[1:], dim=1)
   def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor):
-    target_regr, fg_mask = prep_dat[:, :, -5:-1], prep_dat[:, :, -1:]
+    target_regr, fg_mask = prep_dat[:, :, -6:-2], prep_dat[:, :, -2:-1]
     out_regr = head_outputs['bbox_regression'] * fg_mask
     diff = l1_loss(out_regr, target_regr, reduction=None).sum(axis=(1, 2))
     losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)

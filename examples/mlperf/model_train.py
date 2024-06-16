@@ -468,15 +468,61 @@ def train_retinanet():
   def normalize(x):
     return ((x.permute([0, 3, 1, 2]) / 255.0 - input_mean) / input_std).cast(dtypes.default_float)
 
-  @TinyJit
+  # @TinyJit
   def train_step(X, Y, Y_dat):
     optimizer.zero_grad()
     out = model(normalize(X))
-    loss = model.compute_loss(Y, out, prep_dat=Y_dat)
+    t_loss = torch_loss(Y, out, anchors)
+    print(f"torch loss: {t_loss.item()}")
+    loss = model.compute_loss(Y, out, prep_dat=Y_dat).realize()
+    print(f"tinyg loss: {loss.item()}")
     loss.backward()
+
+    if abs(t_loss.item() - loss.item()) > 0.1:
+      # print("writing Y_dat")
+      # np.save(Path(__file__).parent / "retinanet" / "Y_dat.npy", Y_dat)
+      # for k, v in out.items():
+      #   print(f"writing {k}")
+      #   np.save(Path(__file__).parent / "retinanet" / f"out_{k}.npy", v.numpy())
+      # for k, v in Y[0].items():
+      #   if isinstance(v, np.ndarray):
+      #     print(f"writing {k}")
+      #     np.save(Path(__file__).parent / "retinanet" / f"Y_{k}.npy", v)
+      assert abs(t_loss.item() - loss.item()) <= 0.1
+
     # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
     optimizer.step()
     return loss.realize()
+
+  def torch_loss(targets, out, anchors, dtype=torch.float32):
+    torch_anchors = [torch.tensor(anchors, dtype=dtype)] * len(targets)
+    torch_out = {k: torch.tensor(v.numpy(), dtype=dtype) for k, v in out.items()}
+    torch_targets = [{k: v for k, v in target.items()} for target in targets]
+    for target in torch_targets:
+      for k, v in target.items():
+        if isinstance(v, np.ndarray):
+          target[k] = torch.tensor(v, dtype=torch_dtype(v.dtype))
+          print(f"{k}: {v.shape=}")
+    loss = torch_model.compute_loss(torch_targets, torch_out, torch_anchors)
+    print(f"torch cls: {loss['classification'].item()}")
+    print(f"torch regr: {loss['bbox_regression'].item()}")
+    return loss['classification'] + loss['bbox_regression']
+
+  def torch_dtype(dtype):
+    numpy_to_torch_dtype_dict = {
+      bool          : torch.bool,
+      np.uint8      : torch.uint8,
+      np.int8       : torch.int8,
+      np.int16      : torch.int16,
+      np.int32      : torch.int32,
+      np.dtype('int64')      : torch.int64,
+      np.float16    : torch.float16,
+      np.dtype('float32')    : torch.float32,
+      np.float64    : torch.float64,
+      np.complex64  : torch.complex64,
+      np.complex128 : torch.complex128
+    }
+    return numpy_to_torch_dtype_dict[dtype]
 
   @TinyJit
   def eval_step(X):

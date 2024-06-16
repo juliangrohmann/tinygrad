@@ -189,7 +189,7 @@ def loader_process_retinanet(q_in, q_out, X, Y_dat, targets, shm_name, seed):
       q_out.put(idx)
     q_out.put(None)
 
-def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(120087, 6), model="retinanet", batch_size=64,
+def batch_load_retinanet(targets, anchors, img_shape=(800, 800, 3), dat_shape=(120087, 7), model="retinanet", batch_size=64,
                          val=False, shuffle=True, seed=None, pad_first_batch=False, max_procs=512, dataset_dir=None):
   from extra.datasets.openimages import BASEDIR
   if not dataset_dir:
