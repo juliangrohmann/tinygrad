@@ -533,11 +533,22 @@ def train_retinanet():
       i += 1
 
       cl = time.perf_counter()
-      tqdm.write(
-        f"{i:5} {cl - st:7.2f} s run, {(pt - tt) * 1000:6.2f} ms step, {(dt - pt) * 1000.0:6.2f} ms fetch data, {loss:5.2f} loss, "
-        f"{GlobalCounters.mem_used / 1e9:.2f} GB used, {GlobalCounters.global_ops * 1e-9 / (cl - st):9.2f} GFLOPS")
+
+      metrics = {
+        "epoch": epoch + (i + 1) / steps_in_train_epoch,
+        'train/loss': loss,
+        'train/run_time': (cl - st) * 1000,
+        'train/step_time': (pt - tt) * 1000,
+        'train/fetch_time': (dt -  pt) * 1000,
+        'train/mem_used': GlobalCounters.mem_used / 1e9,
+        'train/GFLOPS': GlobalCounters.global_ops * 1e-9 / (cl - st),
+      }
       if WANDB:
-        wandb.log({"train/loss": loss, "epoch": epoch + (i + 1) / steps_in_train_epoch})
+        wandb.log(metrics)
+      tqdm.write(
+        f"{i:5} {metrics['train/run_time']:7.2f} s run, {metrics['train/step_time']:6.2f} ms step, "
+        f"{metrics['train/fetch_time']:6.2f} ms fetch data, {loss:5.2f} loss, {metrics['train/mem_used']:.2f} GB used, "
+        f"{metrics['train/GFLOPS']:9.2f} GFLOPS")
 
     # before eval checkpoint TODO: remove
     ckpt_dir = Path(dataset_dir) / ".ckpts" if dataset_dir else Path(__file__).parent / ".ckpts"
@@ -633,8 +644,16 @@ def train_retinanet():
         t5 = time.perf_counter()
         post_cookies = []
 
-        tqdm.write(f"{(t1 - t0) * 1000:6.2f} ms step, {(t2 -  t1) * 1000:6.2f} ms fetch data, {(t3 - t2) * 1000:6.2f} ms queue post, "
-                   f"{(t4 - t3) * 1000:6.2f} ms receive post, {(t5 - t4) * 1000:6.2f} ms coco")
+        metrics = {
+          'eval/step_time': (t1 - t0) * 1000,
+          'eval/fetch_time': (t2 -  t1) * 1000,
+          'eval/queue_time': (t3 -  t2) * 1000,
+          'eval/receive_time': (t4 -  t3) * 1000,
+          'eval/coco_time': (t5 -  t4) * 1000,
+        }
+        tqdm.write(f"{metrics['train/step_time']:6.2f} ms step, {metrics['train/fetch_time']:6.2f} ms fetch data, "
+                   f"{metrics['train/queue_time']:6.2f} ms queue post, {metrics['train/receive_time']:6.2f} ms receive post, "
+                   f"{metrics['train/coco_time']:6.2f} ms coco")
 
       if getenv("RESET_STEP", 1): eval_step.reset()
       coco_eval.params.imgIds = evaluated_imgs
@@ -645,7 +664,7 @@ def train_retinanet():
       mean_ap = coco_eval.stats[0]
       tqdm.write(f"mean_ap: {mean_ap:.4f}")
       if WANDB:
-        wandb.log({"eval/mAP": mean_ap, "epoch": epoch + 1})
+        wandb.log({"mAP": mean_ap, "epoch": epoch + 1})
 
       ckpt_dir = Path(dataset_dir) / ".ckpts" if dataset_dir else Path(__file__).parent / ".ckpts"
       # save model if achieved target
