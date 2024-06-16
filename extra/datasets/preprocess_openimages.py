@@ -10,8 +10,8 @@ from tinygrad import Tensor
 def preprocess_target(target:Dict[str, Any], anchors:np.ndarray, mirror:bool, img_width=800):
   boxes = mirror_boxes(target['boxes'], img_width) if mirror else target['boxes']
   matched_idxs = compute_matched_idxs(boxes, anchors)
-  is_valid = matched_idxs != -2
   is_fg = matched_idxs >= 0
+  is_valid = matched_idxs != -2
 
   fg_idxs = matched_idxs[is_fg]
   gt_classes = np.full(matched_idxs.shape, -1, dtype=np.float32)
@@ -48,14 +48,14 @@ def match(match_quality_matrix:np.ndarray, high:float=0.5, low:float=0.5, allow_
   matched_vals, matches = np.max(match_quality_matrix, axis=0), np.argmax(match_quality_matrix, axis=0)
   all_matches = copy.copy(matches) if allow_low_quality_matches else None
   below_low_threshold = matched_vals < low
+  between_thresholds = (matched_vals >= low) & (matched_vals < high)
   matches[below_low_threshold] = -1
+  matches[between_thresholds] = -2
 
   if allow_low_quality_matches:
-    between_thresholds = (matched_vals >= low) & (matched_vals < high)
-    matches[between_thresholds] = -2
-    pred_inds_to_update = np.argmax(match_quality_matrix, axis=1).tolist()
-    for i in pred_inds_to_update:
-      matches[i] = all_matches[i]
+    highest_quality_foreach_gt = match_quality_matrix.max(axis=1)
+    pred_inds_to_update = np.where(match_quality_matrix == highest_quality_foreach_gt[:, None])[1]
+    matches[pred_inds_to_update] = all_matches[pred_inds_to_update]
 
   return matches
 

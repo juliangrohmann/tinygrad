@@ -287,9 +287,10 @@ class ClassificationHead:
   def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor) -> Dict[str, Tensor]:
     cls_logits = head_outputs['cls_logits']
     gt_classes, fg_mask, valid_mask = prep_dat[:, :, 0].one_hot(self.num_classes), prep_dat[:, :, -2:-1], prep_dat[:, :, -1:]
-    f_loss = sigmoid_focal_loss(cls_logits, gt_classes, reduction=None)
-    valid_loss = (f_loss * valid_mask).sum(axis=(1, 2))
-    losses = valid_loss / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
+    f_loss = sigmoid_focal_loss(cls_logits, gt_classes.cast(dtypes.float64), reduction=None)
+    print(f"{f_loss.dtype=}")
+    valid_loss = (f_loss * valid_mask)
+    losses = valid_loss.sum(axis=(1, 2)) / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
     return losses.sum() / max(1, len(targets))
 
 class RegressionHead:
@@ -299,8 +300,14 @@ class RegressionHead:
   def __call__(self, x):
     out = [self.bbox_reg(feat.sequential(self.conv)).permute(0, 2, 3, 1).reshape(feat.shape[0], -1, 4) for feat in x]
     return out[0].cat(*out[1:], dim=1)
+  # def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor):
+  #   target_regr, fg_mask = prep_dat[:, :, -5:-1], prep_dat[:, :, -1:]
+  #   out_regr = head_outputs['bbox_regression'] * fg_mask
+  #   diff = l1_loss(out_regr, target_regr, reduction=None).sum(axis=(1, 2))
+  #   losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)
+  #   return losses.sum() / max(1, len(targets))
   def compute_loss(self, targets:List[Dict[str, np.ndarray]], head_outputs:Dict[str, Tensor], prep_dat:Tensor):
-    target_regr, fg_mask = prep_dat[:, :, -6:-2], prep_dat[:, :, -2:-1]
+    target_regr, fg_mask = prep_dat[:, :, 1:5], prep_dat[:, :, -2:-1]
     out_regr = head_outputs['bbox_regression'] * fg_mask
     diff = l1_loss(out_regr, target_regr, reduction=None).sum(axis=(1, 2))
     losses = diff / fg_mask.squeeze(dim=2).sum(axis=1).maximum(1)

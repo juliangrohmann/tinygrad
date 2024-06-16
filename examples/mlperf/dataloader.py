@@ -180,7 +180,8 @@ def loader_process_retinanet(q_in, q_out, X, Y_dat, targets, shm_name, seed):
         np.random.seed(new_seed := seed * 2 ** 10 + idx)
         random.seed(new_seed)
 
-      mirror = not val and np.random.uniform(0, 1) < 0.5
+      # mirror = not val and np.random.uniform(0, 1) < 0.5
+      mirror = False
       img = preprocess_image(fn, mirror)
       dat = preprocess_target(targets[tidx], anchors, mirror)
       # faster than X[idx].assign(img.tobytes())

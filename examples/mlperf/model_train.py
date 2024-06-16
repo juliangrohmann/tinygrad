@@ -479,16 +479,16 @@ def train_retinanet():
     loss.backward()
 
     if abs(t_loss.item() - loss.item()) > 0.1:
-      # print("writing Y_dat")
-      # np.save(Path(__file__).parent / "retinanet" / "Y_dat.npy", Y_dat)
-      # for k, v in out.items():
-      #   print(f"writing {k}")
-      #   np.save(Path(__file__).parent / "retinanet" / f"out_{k}.npy", v.numpy())
-      # for k, v in Y[0].items():
-      #   if isinstance(v, np.ndarray):
-      #     print(f"writing {k}")
-      #     np.save(Path(__file__).parent / "retinanet" / f"Y_{k}.npy", v)
-      assert abs(t_loss.item() - loss.item()) <= 0.1
+      print("writing Y_dat")
+      np.save(Path(__file__).parent / "retinanet" / "Y_dat.npy", Y_dat)
+      for k, v in out.items():
+        print(f"writing {k}")
+        np.save(Path(__file__).parent / "retinanet" / f"out_{k}.npy", v.numpy())
+      for k, v in Y[0].items():
+        if isinstance(v, np.ndarray):
+          print(f"writing {k}")
+          np.save(Path(__file__).parent / "retinanet" / f"Y_{k}.npy", v)
+      assert abs(t_loss.item() - loss.item()) <= 0.0001
 
     # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
     optimizer.step()
