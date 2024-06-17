@@ -1,11 +1,8 @@
 import numpy as np
 import copy
-import random
 import warnings
 from PIL import Image, ImageOps
 from typing import Tuple, Dict, Any
-from extra.datasets.openimages import MLPERF_CLASSES
-from tinygrad import Tensor
 
 def preprocess_target(target:Dict[str, Any], anchors:np.ndarray, mirror:bool, img_width=800):
   boxes = mirror_boxes(target['boxes'], img_width) if mirror else target['boxes']

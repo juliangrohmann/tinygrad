@@ -1,22 +1,15 @@
 import concurrent.futures
-import glob
 import json
-import math
-import multiprocessing
-import os
 import pathlib
 import pickle
-import random
 import sys
 import boto3, botocore
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageOps
-from pycocotools.coco import COCO
+from PIL import Image
 from tqdm import tqdm
 import extra.datasets.get_image_size as get_image_size
-from tinygrad.helpers import fetch, diskcache
-from tinygrad import Tensor
+from tinygrad.helpers import fetch
 
 BASEDIR = pathlib.Path(__file__).parent / "open-images-v6-mlperf"
 BUCKET_NAME = "open-images-dataset"
@@ -71,12 +64,6 @@ def openimages(split, dataset_dir=None):
   if not ann_file.is_file():
     fetch_openimages(ann_file, split, dataset_dir=dataset_dir)
   return ann_file
-
-@diskcache
-def get_files(split, dataset_dir=None):
-  dataset_dir = _valargs(split, dataset_dir)
-  if not (files := glob.glob(p := str(dataset_dir / split / "data/*"))): raise FileNotFoundError(f"No {split} files in {p}")
-  return files
 
 def get_targets(split, dataset_dir=None, cache=False):
   dataset_dir = _valargs(split, dataset_dir)

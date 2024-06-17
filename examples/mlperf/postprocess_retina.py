@@ -1,102 +1,10 @@
-from multiprocessing import Process, Queue, Manager, shared_memory, cpu_count
+
 import numpy as np
 
 from extra.datasets.openimages import MLPERF_CLASSES
 from extra.models.retinanet import compute_grid_sizes
 
-class Postprocessor:
-  def __init__(self, anchors_by_lvl, num_classes=None, max_size=128, max_procs=None):
-    self.anchors_by_lvl, self.max_size = anchors_by_lvl, max_size,
-    self.max_procs = max_procs if max_procs else max_size
-    self.num_classes = num_classes if num_classes else len(MLPERF_CLASSES)
-    self.q_in, self.q_out = Queue(), Queue()
-    self.pred_queue = []
-    self.idle = list(range(max_size))
-    self.shutdown_ = False
-    self.buf_pred, self.shared_anchors, self.shm_pred, self.detections, self.procs, self.manager = None, None, None, None, None, None
 
-  def __del__(self):
-    self.shutdown()
-
-  def add(self, prediction, orig_size, img_id):
-    self.pred_queue.append((prediction, orig_size, img_id))
-    if self.buf_pred is not None and self.idle:
-      self._enqueue(self.idle[0])
-
-  def receive(self):
-    img_id, idx = self.q_out.get()
-    return (img_id, self.detections[idx], Cookie(idx, self)) if idx is not None else None
-
-  def start(self):
-    try:
-      self.manager = Manager()
-      self.detections = self.manager.list([None] * self.max_size)
-      num_anchors = sum(anchors.shape[0] for anchors in self.anchors_by_lvl)
-      pred_buf_shp = (self.max_size, num_anchors, self.num_classes + 4)
-      pred_bytes = np.empty(pred_buf_shp, dtype=np.float32).nbytes
-      self.shm_pred = shared_memory.SharedMemory(create=True, size=pred_bytes)
-      self.buf_pred = np.ndarray(pred_buf_shp, dtype=np.float32, buffer=self.shm_pred.buf)
-      self.shared_anchors = self.manager.list(self.anchors_by_lvl)
-
-      self.procs = []
-      proc_count = cpu_count() if not self.max_procs else min(cpu_count(), self.max_procs)
-      for _ in range(proc_count):
-        args = (self.q_in, self.q_out, self.detections, self.shared_anchors, self.shm_pred.name, self.num_classes, num_anchors, self.max_size)
-        p = Process(target=pp_process, args=args)
-        p.daemon = True
-        p.start()
-        self.procs.append(p)
-      while self.idle and self.pred_queue:
-        self._enqueue(self.idle[0])
-    except Exception as e:
-      self.shutdown()
-      raise e
-
-  def shutdown(self):
-    self.shutdown_ = True
-    if self.procs is not None:
-      for _ in self.procs: self.q_in.put(None)
-    if self.q_in is not None:
-      self.q_in.close()
-    if self.procs is not None and self.q_out is not None:
-      for _ in self.procs:
-        while self.q_out.get() is not None: pass
-      self.q_out.close()
-      for p in self.procs: p.join()
-    if self.manager is not None:
-      self.manager.shutdown()
-
-  def _enqueue(self, idx):
-    if self.shutdown_:
-      pass
-    elif self.pred_queue:
-      prediction, orig_size, img_id = self.pred_queue.pop(0)
-      self.buf_pred[idx][:] = prediction[:]
-      self.q_in.put((idx, orig_size, img_id))
-      if idx in self.idle:
-        self.idle.remove(idx)
-    elif not idx in self.idle:
-      self.idle.append(idx)
-
-class Cookie:
-  def __init__(self, idx, post_proc):
-    self.idx, self.post_proc = idx, post_proc
-  def __del__(self):
-    if not self.post_proc.shutdown_:
-      self.post_proc._enqueue(self.idx)
-
-
-def pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, num_anchors, max_size):
-  import signal
-  signal.signal(signal.SIGINT, lambda _, __: exit(0))
-
-  shm_pred = shared_memory.SharedMemory(name=shm_pred_name)
-  predictions = np.ndarray((max_size, num_anchors, num_classes + 4), dtype=np.float32, buffer=shm_pred.buf)
-  while (_recv := q_in.get()) is not None:
-    idx, orig_size, img_id = _recv
-    detections[idx] = postprocess_detection(predictions[idx], anchors, orig_size=orig_size)
-    q_out.put((img_id, idx))
-  q_out.put(None)
 
 def postprocess_detection(prediction, anchors, input_size=(800, 800), orig_size=None, score_thresh=0.05, topk_candidates=1000, nms_thresh=0.5, num_anchors=9, num_classes=None):
   num_classes = num_classes if num_classes else len(MLPERF_CLASSES)

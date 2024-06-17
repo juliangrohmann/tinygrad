@@ -7,7 +7,7 @@ from tqdm import tqdm
 from tinygrad import dtypes, Tensor
 from tinygrad.helpers import getenv, prod, Context, round_up
 from collections import deque
-from multiprocessing import Queue, Process, shared_memory, connection, Lock, cpu_count, Pool, Manager
+from multiprocessing import Queue, Process, shared_memory, connection, Lock, cpu_count, Manager
 
 class MyQueue:
   def __init__(self, multiple_readers=True, multiple_writers=True):
@@ -135,7 +135,7 @@ def batch_load_resnet(batch_size=64, val=False, shuffle=True, seed=None, pad_fir
   try:
     # disk:shm is slower
     #X = Tensor.empty(*sz, dtype=dtypes.uint8, device=f"disk:shm:{shm.name}")
-    X = Tensor.empty(*sz, dtype=dtypes.uint8, device=f"disk:/dev/shm/resnet_X")
+    X = Tensor.empty(*sz, dtype=dtypes.uint8, device="disk:/dev/shm/resnet_X")
     Y = [None] * (batch_size*BATCH_COUNT)
 
     for _ in range(cpu_count()):

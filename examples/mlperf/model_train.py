@@ -369,11 +369,9 @@ def train_retinanet():
   skip_train_at  = config["SKIP_TRAIN_AT"]   = getenv("SKIP_TRAIN_AT", -1)
   skip_eval_at   = config["SKIP_EVAL_AT"]    = getenv("SKIP_EVAL_AT", -1)
 
-  from tinygrad.nn import BatchNorm2d
   import extra.models.resnet as resnet
   import extra.models.retinanet as retinanet
-  from examples.hlb_cifar10 import UnsyncedBatchNorm
-  from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, Conv2dHeNormal, FrozenBatchNorm, FrozenUnsyncedBatchNorm
+  from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, FrozenBatchNorm, FrozenUnsyncedBatchNorm
 
   # ** model definition and initializers **
   if getenv("SYNCBN"):
@@ -489,14 +487,13 @@ def train_retinanet():
     return x.shard(GPUS, axis=axis).realize(), y, y_dat.shard(GPUS, axis=axis).realize(), cookie
 
   from examples.mlperf.dataloader import batch_load_retinanet
-  from extra.datasets.postprocess_openimages import Postprocessor
+  from extra.models.retinanet import Postprocessor
   from contextlib import redirect_stdout
 
   print(f"training with batch size {BS} for {epochs} epochs")
   anchors_by_lvl = model.anchor_gen((800, 800))
   anchors = np.concatenate(anchors_by_lvl)
 
-  from extra.models.retinanet import compute_grid_sizes
   # ** epoch loop **
   for epoch in range(getenv("START_EPOCH", 0), epochs):
     # ** train loop **
