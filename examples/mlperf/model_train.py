@@ -651,6 +651,8 @@ def train_retinanet():
           'eval/receive_time': (t4 -  t3) * 1000,
           'eval/coco_time': (t5 -  t4) * 1000,
         }
+        if WANDB:
+          wandb.log(metrics)
         tqdm.write(f"{metrics['eval/step_time']:6.2f} ms step, {metrics['eval/fetch_time']:6.2f} ms fetch data, "
                    f"{metrics['eval/queue_time']:6.2f} ms queue post, {metrics['eval/receive_time']:6.2f} ms receive post, "
                    f"{metrics['eval/coco_time']:6.2f} ms coco")
