@@ -367,7 +367,6 @@ def train_retinanet():
   config["SYNCBN"]        = getenv("SYNCBN")
   # ** debug parameters **
   skip_train_at  = config["SKIP_TRAIN_AT"]   = getenv("SKIP_TRAIN_AT", -1)
-  skip_eval_at   = config["SKIP_EVAL_AT"]    = getenv("SKIP_EVAL_AT", -1)
 
   import extra.models.resnet as resnet
   import extra.models.retinanet as retinanet
@@ -486,6 +485,27 @@ def train_retinanet():
     axis = 0 if BS >= 2 else None # MLB reshape misaligns axis if x.shape[axis] == 1, don't shard single batch
     return x.shard(GPUS, axis=axis).realize(), y, y_dat.shard(GPUS, axis=axis).realize(), cookie
 
+  def receive_predictions(post_proc, n=EVAL_BS):
+    preds = []
+    cookies = []
+    for _ in range(n):
+      img_id, pred, cookie = post_proc.receive()
+      preds.append((img_id, pred))
+      cookies.append(cookie)
+    return preds, cookies
+
+  def eval_coco(predictions, coco_eval, coco_val):
+    img_ids = [img_id for img_id, _ in predictions]
+    coco_results = [{"image_id": img_id, "category_id": label, "bbox": box.tolist(), "score": score}
+                    for img_id, prediction in predictions for box, score, label in zip(*prediction.values())]
+
+    with redirect_stdout(None):
+      coco_eval.cocoDt = coco_val.loadRes(coco_results) if coco_results else COCO()
+      coco_eval.params.imgIds = img_ids
+      coco_eval.evaluate()
+    evaluated_imgs.extend(img_ids)
+    coco_evalimgs.append(np.array(coco_eval.evalImgs).reshape(ncats, narea, len(img_ids)))
+
   from examples.mlperf.dataloader import batch_load_retinanet
   from extra.models.retinanet import Postprocessor
   from contextlib import redirect_stdout
@@ -574,17 +594,14 @@ def train_retinanet():
       batch_loader = batch_load_retinanet(
         targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), max_procs=dl_cpus, seed=seed*epochs+epoch)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
-      i, proc = 0, data_get(it)
+      i, recv_cnt, proc = 0, 0, data_get(it)
 
       post_proc = Postprocessor(anchors_by_lvl, max_procs=post_cpus)
       post_proc.start()
+      queue_steps = post_proc.max_size // EVAL_BS
 
       dl_cookies, post_cookies = [], []
       while proc is not None:
-        if i >= skip_eval_at >= 0:
-          print(f"skipped eval at step {i}.")
-          break
-
         t0 = time.perf_counter()
         out, targets, proc = eval_step(proc[0]).numpy(), proc[1], proc[3]  # drop inputs, keep cookie
         t1 = time.perf_counter()
@@ -603,14 +620,15 @@ def train_retinanet():
           post_proc.add(out[idx], t['image_size'], t['image_id'])
         t3 = time.perf_counter()
 
-        predictions = []
-        for _ in range(len(targets)):
-          img_id, pred, cookie = post_proc.receive()
-          predictions.append((img_id, pred))
-          post_cookies.append(cookie)
+        if i >= queue_steps - 1: # only start receiving after input buffer is full to reduce idle time
+          predictions, c = receive_predictions(post_proc)
+          post_cookies.extend(c)
+          recv_cnt += 1
+        else:
+          predictions = None
         t4 = time.perf_counter()
 
-        if getenv("TEST_EVAL"):
+        if getenv("TEST_EVAL") and predictions:
           for i in range(len(predictions)):
             img_id, p = predictions[i]
             cmp_fn = Path(__file__).parent / "retinanet" / "cmp" / f"{img_id}.npy"
@@ -628,16 +646,8 @@ def train_retinanet():
               raise e
           tqdm.write(f"img set {i} passed eval test.")
 
-        img_ids = [img_id for img_id, _ in predictions]
-        coco_results = [{"image_id": img_id, "category_id": label, "bbox": box.tolist(), "score": score}
-                        for img_id, prediction in predictions for box, score, label in zip(*prediction.values())]
-
-        with redirect_stdout(None):
-          coco_eval.cocoDt = coco_val.loadRes(coco_results) if coco_results else COCO()
-          coco_eval.params.imgIds = img_ids
-          coco_eval.evaluate()
-        evaluated_imgs.extend(img_ids)
-        coco_evalimgs.append(np.array(coco_eval.evalImgs).reshape(ncats, narea, len(img_ids)))
+        if predictions:
+          eval_coco(predictions, coco_eval, coco_val)
         t5 = time.perf_counter()
         post_cookies = []
 
@@ -653,6 +663,17 @@ def train_retinanet():
         tqdm.write(f"{metrics['eval/step_time']:6.2f} ms step, {metrics['eval/fetch_time']:6.2f} ms fetch data, "
                    f"{metrics['eval/queue_time']:6.2f} ms queue post, {metrics['eval/receive_time']:6.2f} ms receive post, "
                    f"{metrics['eval/coco_time']:6.2f} ms coco")
+
+      while recv_cnt < i: # receive remaining predictions
+        ts = time.perf_counter()
+        predictions, c = receive_predictions(post_proc)
+        recv += 1
+        tr = time.perf_counter()
+        post_cookies.extend(c)
+        eval_coco(predictions, coco_eval, coco_val)
+        post_cookies = []
+        tf = time.perf_counter()
+        tqdm.write(f"{(tr - ts) * 1000:6.2f} ms recv after eval, {(tf - tr) * 1000:6.2f} ms coco after eval, ")
 
       if getenv("RESET_STEP", 1): eval_step.reset()
       coco_eval.params.imgIds = evaluated_imgs
