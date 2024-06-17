@@ -592,7 +592,7 @@ def train_retinanet():
       post_cpus = total_cpus - dl_cpus
 
       batch_loader = batch_load_retinanet(
-        targets_val, anchors, batch_size=BS, val=True, shuffle=getenv("SHUFFLE", 0), max_procs=dl_cpus, seed=seed*epochs+epoch)
+        targets_val, anchors, batch_size=EVAL_BS, val=True, shuffle=getenv("SHUFFLE", 0), max_procs=dl_cpus, seed=seed*epochs+epoch)
       it = iter(tqdm(batch_loader, total=steps_in_val_epoch, desc=f"epoch {epoch} (eval)"))
       i, recv_cnt, proc = 0, 0, data_get(it)
 
