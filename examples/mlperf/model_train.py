@@ -562,7 +562,7 @@ def train_retinanet():
       safe_save(get_state_dict({'model': model, 'optimizer': optimizer}), fn)
 
     # ** eval loop **
-    if steps_in_val_epoch > 0:
+    if steps_in_val_epoch > 0 and (epoch + 1 - eval_start_epoch) % eval_freq == 0:
       if getenv("RESET_STEP", 1):
         train_step.reset()
 
