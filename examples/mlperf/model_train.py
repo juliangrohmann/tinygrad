@@ -495,6 +495,7 @@ def train_retinanet():
   for epoch in range(getenv("START_EPOCH", 0), epochs):
     # ** train loop **
     Tensor.training = True
+    Tensor.no_grad = False
     BEAM.value = config["TRAIN_BEAM"]
 
     batch_loader = batch_load_retinanet(
@@ -561,6 +562,7 @@ def train_retinanet():
         train_step.reset()
 
       Tensor.training = False
+      Tensor.no_grad = True
       BEAM.value = config["EVAL_BEAM"]
       total_cpus = multiprocessing.cpu_count()
       post_cpus = min(total_cpus // 2, EVAL_BS * 2)

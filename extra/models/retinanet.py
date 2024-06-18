@@ -1,7 +1,5 @@
-import os
 import math
 import pathlib
-import time
 from multiprocessing import Process, Queue, Manager, shared_memory, cpu_count
 import numpy as np
 from typing import List, Dict
@@ -332,6 +330,15 @@ class Postprocessor:
       self.shutdown()
       raise e
 
+  def enqueue(self, dat, orig_size, img_id):
+    if not self.shutdown_:
+      self.q_block.put(None) # blocks until there is space in input buffer
+      idx = next((i for i, v in enumerate(self.idle) if v), None)
+      assert idx is not None, "attempting to overwrite data in input buffer"
+      self.buf_pred[idx][:] = dat[:]
+      self.q_in.put((idx, orig_size, img_id))
+      self.idle[idx] = False
+
   def eval(self):
     for _ in self.procs: self.q_in.put(None)
     for p in self.procs: p.join()
@@ -353,15 +360,6 @@ class Postprocessor:
     self.shm_pred.unlink()
     if self.manager is not None:
       self.manager.shutdown()
-
-  def enqueue(self, dat, orig_size, img_id):
-    if not self.shutdown_:
-      self.q_block.put(None) # blocks until there is space in input buffer
-      idx = next((i for i, v in enumerate(self.idle) if v), None)
-      assert idx is not None, "attempting to overwrite data in input buffer"
-      self.buf_pred[idx][:] = dat[:]
-      self.q_in.put((idx, orig_size, img_id))
-      self.idle[idx] = False
 
 def _post_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, num_anchors, max_size):
   import signal
