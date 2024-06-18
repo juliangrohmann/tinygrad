@@ -1,4 +1,7 @@
+import os
 import math
+import pathlib
+import time
 from multiprocessing import Process, Queue, Manager, shared_memory, cpu_count
 import numpy as np
 from typing import List, Dict
@@ -7,6 +10,7 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import flatten, get_child
 import tinygrad.nn as nn
 from extra.models.resnet import ResNet
+import extra.datasets.openimages as openimages
 from extra.datasets.preprocess_openimages import preprocess_target
 
 # allow monkeypatching in layer implementations
@@ -294,31 +298,18 @@ class FPN:
     return results
 
 class Postprocessor:
-  def __init__(self, anchors_by_lvl, num_classes=264, max_size=128, max_procs=None):
+  def __init__(self, anchors_by_lvl, num_classes=264, max_size=32, dataset_dir=None):
     self.anchors_by_lvl, self.num_classes, self.max_size = anchors_by_lvl, num_classes, max_size,
-    self.max_procs = max_procs if max_procs else max_size
-    self.q_in, self.q_out = Queue(), Queue()
-    self.pred_queue = []
-    self.idle = list(range(max_size))
+    self.dataset_dir = pathlib.Path(dataset_dir) if dataset_dir else pathlib.Path(openimages.BASEDIR)
+    self.q_in, self.q_out, self.q_map, self.q_block = Queue(), Queue(), Queue(), Queue(maxsize=self.max_size)
     self.shutdown_ = False
-    self.buf_pred, self.shared_anchors, self.shm_pred, self.detections, self.procs, self.manager = None, None, None, None, None, None
-
-  def __del__(self):
-    self.shutdown()
-
-  def add(self, prediction, orig_size, img_id):
-    self.pred_queue.append((prediction, orig_size, img_id))
-    if self.buf_pred is not None and self.idle:
-      self._enqueue(self.idle[0])
-
-  def receive(self):
-    img_id, idx = self.q_out.get()
-    return (img_id, self.detections[idx], Cookie(idx, self)) if idx is not None else None
+    self.buf_pred, self.shm_pred, self.procs, self.eval_proc, self.manager = None, None, None, None, None
 
   def start(self):
     try:
       self.manager = Manager()
       self.detections = self.manager.list([None] * self.max_size)
+      self.idle = self.manager.list([True] * self.max_size)
       num_anchors = sum(anchors.shape[0] for anchors in self.anchors_by_lvl)
       pred_buf_shp = (self.max_size, num_anchors, self.num_classes + 4)
       pred_bytes = np.empty(pred_buf_shp, dtype=np.float32).nbytes
@@ -327,53 +318,52 @@ class Postprocessor:
       self.shared_anchors = self.manager.list(self.anchors_by_lvl)
 
       self.procs = []
-      for _ in range(min(cpu_count(), self.max_procs)):
+      for _ in range(min(cpu_count() - 1, self.max_size)):
         args = (self.q_in, self.q_out, self.detections, self.shared_anchors, self.shm_pred.name, self.num_classes, num_anchors, self.max_size)
-        p = Process(target=_pp_process, args=args)
+        p = Process(target=_post_process, args=args)
         p.daemon = True
         p.start()
         self.procs.append(p)
-      while self.idle and self.pred_queue:
-        self._enqueue(self.idle[0])
+      eval_args = (self.q_out, self.q_map, self.q_block, self.detections, self.idle, self.dataset_dir)
+      self.eval_proc = Process(target=_eval_process, args=eval_args)
+      self.eval_proc.daemon = True
+      self.eval_proc.start()
     except Exception as e:
       self.shutdown()
       raise e
+
+  def eval(self):
+    for _ in self.procs: self.q_in.put(None)
+    for p in self.procs: p.join()
+    self.q_out.put(None)
+    return self.q_map.get()
 
   def shutdown(self):
     self.shutdown_ = True
     if self.procs is not None:
       for _ in self.procs: self.q_in.put(None)
-    if self.q_in is not None:
-      self.q_in.close()
-    if self.procs is not None and self.q_out is not None:
-      for _ in self.procs:
-        while self.q_out.get() is not None: pass
-      self.q_out.close()
-      for p in self.procs: p.join()
+      self.q_out.put(None)
+    self.q_in.close()
+    self.q_out.close()
+    self.q_map.close()
+    self.q_block.close()
+    for p in self.procs: p.join()
+    self.eval_proc.join()
+    self.shm_pred.close()
+    self.shm_pred.unlink()
     if self.manager is not None:
       self.manager.shutdown()
 
-  def _enqueue(self, idx):
-    if self.shutdown_:
-      pass
-    elif self.pred_queue:
-      prediction, orig_size, img_id = self.pred_queue.pop(0)
-      self.buf_pred[idx][:] = prediction[:]
+  def enqueue(self, dat, orig_size, img_id):
+    if not self.shutdown_:
+      self.q_block.put(None) # blocks until there is space in input buffer
+      idx = next((i for i, v in enumerate(self.idle) if v), None)
+      assert idx is not None, "attempting to overwrite data in input buffer"
+      self.buf_pred[idx][:] = dat[:]
       self.q_in.put((idx, orig_size, img_id))
-      if idx in self.idle:
-        self.idle.remove(idx)
-    elif not idx in self.idle:
-      self.idle.append(idx)
+      self.idle[idx] = False
 
-class Cookie:
-  def __init__(self, idx, post_proc):
-    self.idx, self.post_proc = idx, post_proc
-  def __del__(self):
-    if not self.post_proc.shutdown_:
-      self.post_proc._enqueue(self.idx)
-
-
-def _pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, num_anchors, max_size):
+def _post_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, num_anchors, max_size):
   import signal
   signal.signal(signal.SIGINT, lambda _, __: exit(0))
 
@@ -383,4 +373,38 @@ def _pp_process(q_in, q_out, detections, anchors, shm_pred_name, num_classes, nu
     idx, orig_size, img_id = _recv
     detections[idx] = postprocess_detection(predictions[idx], anchors, orig_size=orig_size)
     q_out.put((img_id, idx))
-  q_out.put(None)
+
+def _eval_process(q_in, q_out, q_block, detections, idle, dataset_dir):
+  import signal
+  signal.signal(signal.SIGINT, lambda _, __: exit(0))
+
+  from contextlib import redirect_stdout
+  from pycocotools.coco import COCO
+  from pycocotools.cocoeval import COCOeval
+
+  coco_val = COCO(openimages.openimages("validation", dataset_dir=dataset_dir))
+  coco_eval = COCOeval(coco_val, iouType="bbox")
+  coco_evalimgs, evaluated_imgs, ncats, narea = [], [], len(coco_eval.params.catIds), len(coco_eval.params.areaRng)
+
+  while (_recv := q_in.get()) is not None:
+    im_id, idx = _recv
+    predictions = [(im_id, detections[idx])]
+    coco_results = [{"image_id": img_id, "category_id": label, "bbox": box.tolist(), "score": score}
+                    for img_id, prediction in predictions for box, score, label in zip(*prediction.values())]
+    idle[idx] = True
+    q_block.get()
+
+    img_ids = [im_id]
+    with redirect_stdout(None):
+      coco_eval.cocoDt = coco_val.loadRes(coco_results) if coco_results else COCO()
+      coco_eval.params.imgIds = img_ids
+      coco_eval.evaluate()
+    evaluated_imgs.extend(img_ids)
+    coco_evalimgs.append(np.array(coco_eval.evalImgs).reshape(ncats, narea, len(img_ids)))
+
+  coco_eval.params.imgIds = evaluated_imgs
+  coco_eval._paramsEval.imgIds = evaluated_imgs
+  coco_eval.evalImgs = list(np.concatenate(coco_evalimgs, -1).flatten())
+  coco_eval.accumulate()
+  coco_eval.summarize()
+  q_out.put(coco_eval.stats[0])
