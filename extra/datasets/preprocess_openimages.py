@@ -40,7 +40,7 @@ def compute_matched_idxs(boxes:np.ndarray, anchors:np.ndarray):
   match_quality_matrix = box_iou(boxes, anchors)
   return match(match_quality_matrix)
 
-def match(match_quality_matrix:np.ndarray, high:float=0.5, low:float=0.5, allow_low_quality_matches=True):
+def match(match_quality_matrix:np.ndarray, high:float=0.5, low:float=0.4, allow_low_quality_matches=True):
   assert match_quality_matrix.size > 0, "empty targets or proposals not supported during training"
   matched_vals, matches = np.max(match_quality_matrix, axis=0), np.argmax(match_quality_matrix, axis=0)
   all_matches = copy.copy(matches) if allow_low_quality_matches else None
