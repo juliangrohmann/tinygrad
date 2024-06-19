@@ -578,15 +578,12 @@ def train_retinanet():
       post_proc.start()
 
       dl_cookies = []
-      st = time.perf_counter()
       while proc is not None:
         if i >= skip_eval_at >= 0:
           print(f"skipped eval at step {i}.")
           break
 
-        tt = time.perf_counter()
         out, targets, proc = eval_step(proc[0]).numpy(), proc[1], proc[3]  # drop inputs, keep cookie
-        ot = time.perf_counter()
 
         if len(dl_cookies) == getenv("STORE_COOKIES", 1): dl_cookies = []  # free previous cookies after gpu work has been enqueued
         try:
@@ -597,21 +594,8 @@ def train_retinanet():
         proc, next_proc = next_proc, None
         i += 1
         
-        ft = time.perf_counter()
         for idx, t in enumerate(targets):
           post_proc.enqueue(out[idx], t['image_size'], t['image_id'])
-        qt = time.perf_counter()
-
-        metrics = {
-          'eval/run_time': (qt - st) * 1000,
-          'eval/step_time': (ot - tt) * 1000,
-          'eval/fetch_time': (ft - ot) * 1000,
-          'eval/queue_time': (qt - ft) * 1000,
-        }
-        if WANDB:
-          wandb.log(metrics)
-        tqdm.write(f"{metrics['eval/run_time']:7.2f} ms run, {metrics['eval/step_time']:6.2f} ms step, "
-                   f"{metrics['eval/fetch_time']:6.2f} ms fetch data, {metrics['eval/queue_time']:6.2f} ms queue post,")
 
       if getenv("RESET_STEP", 1): eval_step.reset()
 
