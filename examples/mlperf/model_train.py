@@ -372,6 +372,7 @@ def train_retinanet():
   import extra.models.resnet as resnet
   import extra.models.retinanet as retinanet
   from examples.mlperf.initializers import Conv2dRetina, Conv2dClsRetina, Conv2dFPN, FrozenBatchNorm, FrozenUnsyncedBatchNorm
+  from examples.hlb_cifar10 import UnsyncedBatchNorm
 
   # ** model definition and initializers **
   if getenv("SYNCBN"):
@@ -379,7 +380,8 @@ def train_retinanet():
     resnet.BatchNorm = FrozenBatchNorm
   else:
     print("using unsynced bn.")
-    resnet.BatchNorm = functools.partial(FrozenUnsyncedBatchNorm, num_devices=len(GPUS))
+    resnet.BatchNorm = functools.partial(FrozenUnsyncedBatchNorm if not getenv("UNFROZEN") else UnsyncedBatchNorm, num_devices=len(GPUS))
+    print(f"{type(resnet.BatchNorm)=}")
   retinanet.Conv2d = Conv2dRetina
   retinanet.Conv2dCls = Conv2dClsRetina
   retinanet.Conv2dFPN = Conv2dFPN
