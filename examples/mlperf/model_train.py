@@ -422,7 +422,10 @@ def train_retinanet():
       torch_k, torch_v = torch_item
       assert torch_k == tg_k, f"key mismatch: {tg_k=}, {torch_k=}"
       assert tg_v.requires_grad == torch_v.requires_grad, f"{tg_k} grad mismatch: {tg_v.requires_grad=}, {torch_v.requires_grad=}"
-      tg_v.assign(torch_v.detach().numpy())
+      dat = torch_v.detach().numpy()
+      if ('.running_mean' in tg_k or '.running_var' in tg_k) and tg_v.shape != dat.shape: # shape mismatch when using unsynced batchnorm
+        dat = np.tile(dat, (tg_v.shape[0], 1))
+      tg_v.assign(dat)
       assert (tg_v.numpy() == torch_v.detach().numpy()).all(), f"{tg_k} init mismatch: {tg_v.numpy()=}, {torch_v.detach().numpy()=}"
     assert len(tg_keys) == len(torch_keys), f"param count mismatch: {len(tg_keys)}, {len(torch_keys)}"
 
