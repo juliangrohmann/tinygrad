@@ -473,11 +473,11 @@ def train_retinanet():
   def train_step(X, Y, Y_dat):
     optimizer.zero_grad()
     out = model(normalize(X))
-    loss = model.compute_loss(Y, out, prep_dat=Y_dat)
-    loss.backward()
+    cls_loss, regr_loss = model.compute_loss(Y, out, prep_dat=Y_dat)
+    (cls_loss + regr_loss).backward()
     # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
     optimizer.step()
-    return loss.realize()
+    return cls_loss.realize(), regr_loss.realize()
 
   @TinyJit
   def eval_step(X):
@@ -517,7 +517,8 @@ def train_retinanet():
         break
 
       tt = time.perf_counter()
-      loss, proc = train_step(proc[0], proc[1], proc[2]).item(), proc[3]
+      losses, proc = train_step(proc[0], proc[1], proc[2]), proc[3]
+      cls_loss, regr_loss = losses[0].item(), losses[1].item()
       if len(prev_cookies) == getenv("STORE_COOKIES", 1):
         prev_cookies = []  # free previous cookies after gpu work has been enqueued
 
@@ -536,7 +537,9 @@ def train_retinanet():
 
       metrics = {
         "epoch": epoch + (i + 1) / steps_in_train_epoch,
-        'train/loss': loss,
+        'train/loss': cls_loss + regr_loss,
+        'train/cls_loss': cls_loss,
+        'train/regr_loss': regr_loss,
         'train/run_time': (cl - st) * 1000,
         'train/step_time': (pt - tt) * 1000,
         'train/fetch_time': (dt -  pt) * 1000,
@@ -547,8 +550,9 @@ def train_retinanet():
         wandb.log(metrics)
       tqdm.write(
         f"{i:5} {metrics['train/run_time']:7.2f} s run, {metrics['train/step_time']:6.2f} ms step, "
-        f"{metrics['train/fetch_time']:6.2f} ms fetch data, {loss:5.2f} loss, {metrics['train/mem_used']:.2f} GB used, "
-        f"{metrics['train/GFLOPS']:9.2f} GFLOPS")
+        f"{metrics['train/fetch_time']:6.2f} ms fetch data, {metrics['train/loss']:5.2f} total loss, "
+        f"{metrics['train/cls_loss']:5.2f} cls loss, {metrics['train/regr_loss']:5.2f} regr loss, "
+        f"{metrics['train/mem_used']:.2f} GB used, {metrics['train/GFLOPS']:9.2f} GFLOPS")
 
     # before eval checkpoint TODO: remove
     ckpt_dir = Path(dataset_dir) / ".ckpts" if dataset_dir else Path(__file__).parent / ".ckpts"

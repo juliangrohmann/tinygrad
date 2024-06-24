@@ -176,7 +176,7 @@ class RetinaNet:
       prep_dat = Tensor(np.concatenate(dat, axis=0), head_outputs['cls_logits'].device, head_outputs['cls_logits'].dtype)
 
     losses = self.head.compute_loss(targets, head_outputs, prep_dat)
-    return losses['classification'] + losses['bbox_regression']
+    return losses['classification'], losses['bbox_regression']
 
   def load_from_pretrained(self):
     model_urls = {
