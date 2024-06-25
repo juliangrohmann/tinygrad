@@ -20,3 +20,14 @@ class PolynomialDecayWithWarmup(LR_Scheduler):
     warmup_lr = (self.epoch_counter * (1.0 / self.warmup)) * self.initial_lr
     x = (1 - (self.epoch_counter - self.warmup) / (self.epochs - self.warmup + 1))
     return (self.epoch_counter <= self.warmup).where(warmup_lr, (self.initial_lr - self.end_lr) * x ** self.power + self.end_lr).cast(self.optimizer.lr.dtype)
+  
+class BilinearLR(LR_Scheduler):
+  def __init__(self, optimizer: Optimizer, end_lr, warmup_factor, warmup_steps):
+    super().__init__(optimizer)
+    self.end_lr = end_lr
+    self.warmup_factor = warmup_factor
+    self.warmup_steps = warmup_steps
+
+  def get_lr(self) -> Tensor:
+    alpha = self.epoch_counter / self.warmup_steps
+    return self.end_lr * (self.epoch_counter <= self.warmup_steps).where(self.warmup_factor * (1 - alpha) + alpha, 1.0)

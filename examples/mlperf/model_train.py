@@ -359,6 +359,8 @@ def train_retinanet():
   BS                = config["BS"]            = getenv("BS", 8 * len(GPUS))
   EVAL_BS           = config["EVAL_BS"]       = getenv("EVAL_BS", BS)
   base_lr           = config["base_lr"]       = getenv("LR", 0.0001)
+  warmup_epochs     = config["warmup_epochs"] = getenv("WARMUP_EPOCHS", 1)
+  warmup_factor     = config["warmup_factor"] = getenv("WARMUP_FACTOR", 0.001)
   # ** other parameters **
   config["DEFAULT_FLOAT"] = dtypes.default_float.name
   config["TRAIN_BEAM"]    = getenv("TRAIN_BEAM", BEAM.value)
@@ -436,11 +438,6 @@ def train_retinanet():
     else:
       x.realize().to_(GPUS)
 
-  # ** optimizer **
-  from tinygrad.nn.optim import Adam
-  parameters = [x for x in get_parameters(model) if x.requires_grad]
-  optimizer = Adam(parameters, lr=base_lr)
-
   # ** download dataset **
   from extra.datasets.openimages import openimages, get_targets
   dataset_dir = getenv("DATASET_DIR", "")
@@ -448,12 +445,21 @@ def train_retinanet():
   openimages("train", dataset_dir=dataset_dir)
   targets_val = get_targets("validation", dataset_dir=dataset_dir, cache=getenv("CACHE", 1))
   targets_train = get_targets("train", dataset_dir=dataset_dir, cache=getenv("CACHE", 1))
-  steps_in_train_epoch  = config["steps_in_train_epoch"]  = round_up(len(targets_train), BS) // BS
-  steps_in_val_epoch    = config["steps_in_val_epoch"]    = round_up(len(targets_val), EVAL_BS) // EVAL_BS
+  steps_in_train_epoch  = config["steps_in_train_epoch"]  = len(targets_train) // BS
+  steps_in_val_epoch    = config["steps_in_val_epoch"]    = len(targets_val) // BS
+
+  # ** optimizer **
+  from tinygrad.nn.optim import Adam
+  parameters = [x for x in get_parameters(model) if x.requires_grad]
+  optimizer = Adam(parameters, lr=base_lr)
+
+  # ** LR scheduler **
+  from examples.mlperf.lr_schedulers import BilinearLR
+  scheduler = BilinearLR(optimizer, base_lr, warmup_factor, warmup_epochs * steps_in_train_epoch)
 
   # ** resume from checkpointing **
   if ckpt := getenv("RESUME", ""):
-    load_state_dict({'model': model, 'optimizer': optimizer}, safe_load(ckpt))
+    load_training_state(model, optimizer, scheduler, safe_load(ckpt))
     print(f"resuming from {ckpt}")
 
   # ** init wandb **
@@ -477,6 +483,7 @@ def train_retinanet():
     (cls_loss + regr_loss).backward()
     # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
     optimizer.step()
+    scheduler.step()
     return cls_loss.realize(), regr_loss.realize()
 
   @TinyJit
@@ -540,6 +547,7 @@ def train_retinanet():
         'train/loss': cls_loss + regr_loss,
         'train/cls_loss': cls_loss,
         'train/regr_loss': regr_loss,
+        'train/lr': optimizer.lr.numpy()[0],
         'train/run_time': (cl - st) * 1000,
         'train/step_time': (pt - tt) * 1000,
         'train/fetch_time': (dt -  pt) * 1000,
@@ -549,21 +557,11 @@ def train_retinanet():
       if WANDB:
         wandb.log(metrics)
       tqdm.write(
-        f"{i:5} {metrics['train/run_time']:7.2f} s run, {metrics['train/step_time']:6.2f} ms step, "
-        f"{metrics['train/fetch_time']:6.2f} ms fetch data, {metrics['train/loss']:5.2f} total loss, "
-        f"{metrics['train/cls_loss']:5.2f} cls loss, {metrics['train/regr_loss']:5.2f} regr loss, "
+        f"{i:5} {metrics['train/loss']:.2f} total loss, {metrics['train/cls_loss']:.2f} cls loss, "
+        f"{metrics['train/regr_loss']:.2f} regr loss, {metrics['train/lr']:.7f} lr, "
+        f"{metrics['train/run_time']:7.2f} s run, {metrics['train/step_time']:7.2f} ms step, "
+        f"{metrics['train/fetch_time']:6.2f} ms fetch data, "
         f"{metrics['train/mem_used']:.2f} GB used, {metrics['train/GFLOPS']:9.2f} GFLOPS")
-
-    # before eval checkpoint TODO: remove
-    ckpt_dir = Path(dataset_dir) / ".ckpts" if dataset_dir else Path(__file__).parent / ".ckpts"
-    if getenv("CKPT"):
-      ckpt_dir.mkdir(parents=True, exist_ok=True)
-      if WANDB and wandb.run is not None:
-        fn = ckpt_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_bef_{wandb.run.id}_e{epoch}.safe"
-      else:
-        fn = ckpt_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_bef_e{epoch}.safe"
-      print(f"saving ckpt to {fn}")
-      safe_save(get_state_dict({'model': model, 'optimizer': optimizer}), fn)
 
     # ** eval loop **
     if steps_in_val_epoch > 0 and (epoch + 1 - eval_start_epoch) % eval_freq == 0:
@@ -633,7 +631,7 @@ def train_retinanet():
         else:
           fn = ckpt_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_e{epoch}.safe"
         print(f"saving ckpt to {fn}")
-        safe_save(get_state_dict({'model': model, 'optimizer': optimizer}), fn)
+        safe_save(get_training_state(model, optimizer, scheduler), fn)
 
 def train_unet3d():
   # TODO: Unet3d
