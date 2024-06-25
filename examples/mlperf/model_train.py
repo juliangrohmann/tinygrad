@@ -518,6 +518,7 @@ def train_retinanet():
 
     prev_cookies = []
     st = time.perf_counter()
+    GlobalCounters.reset()
     while proc is not None:
       if i >= skip_train_at >= 0:
         print(f"skipped training at step {i}.")
@@ -548,7 +549,7 @@ def train_retinanet():
         'train/cls_loss': cls_loss,
         'train/regr_loss': regr_loss,
         'train/lr': optimizer.lr.numpy()[0],
-        'train/run_time': (cl - st) * 1000,
+        'train/run_time': (cl - st),
         'train/step_time': (pt - tt) * 1000,
         'train/fetch_time': (dt -  pt) * 1000,
         'train/mem_used': GlobalCounters.mem_used / 1e9,
