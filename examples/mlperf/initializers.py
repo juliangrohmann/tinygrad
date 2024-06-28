@@ -91,6 +91,10 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
       batch_mean, batch_invstd = self.calc_stats(xr)
       weight = self.weight.reshape(1, -1).expand((self.num_devices, -1))
       bias = self.bias.reshape(1, -1).expand((self.num_devices, -1))
+      tqdm.write(f"{batch_mean.shape=}")
+      tqdm.write(f"{batch_invstd.shape=}")
+      tqdm.write(f"{self.weight.shape=}")
+      tqdm.write(f"{self.bias.shape=}")
       self.scale = weight.reshape(xr.shape) * batch_invstd.reshape(xr.shape)
       self.bias_term = bias.reshape(xr.shape) - self.running_mean.reshape(xr.shape) * self.scale
     return xr * self.scale + self.bias_term
