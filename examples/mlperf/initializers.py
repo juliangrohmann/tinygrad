@@ -99,7 +99,7 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
       tqdm.write(f"{shape=}")
       self.scale = weight.reshape(shape) * batch_invstd.reshape(shape)
       self.bias_term = bias.reshape(shape) - self.running_mean.reshape(shape) * self.scale
-    return xr * self.scale + self.bias_term
+    return (xr * self.scale + self.bias_term).reshape(x.shape).cast(x.dtype)
 
     batch_mean, batch_invstd = self.calc_stats(xr)
     ret = xr.batchnorm(
