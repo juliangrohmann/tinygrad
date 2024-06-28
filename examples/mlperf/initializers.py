@@ -78,35 +78,15 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
 
   def __call__(self, x:Tensor):
     if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
-    # scale = weight * invstd
-    # bias_term = bias - mean * scale
-    # ret = x * scale + bias_term
     xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
-    from tqdm import tqdm
-    tqdm.write(f"{x.shape=}")
-    tqdm.write(f"{xr.shape=}")
-    tqdm.write(f"{self.running_mean.shape=}")
-    tqdm.write(f"{self.running_var.shape=}")
     if self.scale is None or self.bias_term is None:
-      batch_mean, batch_invstd = self.calc_stats(xr)
-      weight = self.weight.reshape(1, -1).expand((self.num_devices, -1))
-      bias = self.bias.reshape(1, -1).expand((self.num_devices, -1))
-      tqdm.write(f"{batch_mean.shape=}")
-      tqdm.write(f"{batch_invstd.shape=}")
-      tqdm.write(f"{self.weight.shape=}")
-      tqdm.write(f"{self.bias.shape=}")
       shape = tuple(s if ax in (0, 2) else 1 for ax, s in enumerate(xr.shape))
-      tqdm.write(f"{shape=}")
-      self.scale = weight.reshape(shape) * batch_invstd.reshape(shape)
-      self.bias_term = bias.reshape(shape) - self.running_mean.reshape(shape) * self.scale
+      batch_mean, batch_invstd = self.calc_stats(xr)
+      wr = self.weight.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
+      br = self.bias.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
+      self.scale = wr * batch_invstd.reshape(shape)
+      self.bias_term = br - self.running_mean.reshape(shape) * self.scale
     return (xr * self.scale + self.bias_term).reshape(x.shape).cast(x.dtype)
-
-    batch_mean, batch_invstd = self.calc_stats(xr)
-    ret = xr.batchnorm(
-      self.weight.reshape(1, -1).expand((self.num_devices, -1)),
-      self.bias.reshape(1, -1).expand((self.num_devices, -1)),
-      batch_mean, batch_invstd, axis=(0, 2))
-    return ret.reshape(x.shape).cast(x.dtype)
 
 class LinearBert(nn.Linear):
   def __init__(self, in_features, out_features, bias=True, std=0.02):
