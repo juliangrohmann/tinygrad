@@ -74,7 +74,7 @@ class FrozenBatchNorm(nn.BatchNorm2d):
 class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
   def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1, num_devices=None):
     super().__init__(sz, eps=eps, affine=affine, track_running_stats=track_running_stats, momentum=momentum, num_devices=num_devices)
-    self.precomputed = False
+    self.scale, self.bias_term = None, None
 
   def __call__(self, x:Tensor):
     if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
@@ -87,29 +87,20 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
     tqdm.write(f"{xr.shape=}")
     tqdm.write(f"{self.running_mean.shape=}")
     tqdm.write(f"{self.running_var.shape=}")
-    if self.precomputed:
-      return xr * self.scale + self.bias_term
+    if self.scale is None or self.bias_term is None:
+      batch_mean, batch_invstd = self.calc_stats(xr)
+      weight = self.weight.reshape(1, -1).expand((self.num_devices, -1))
+      bias = self.bias.reshape(1, -1).expand((self.num_devices, -1))
+      self.scale = weight.reshape(xr.shape) * batch_invstd.reshape(xr.shape)
+      self.bias_term = bias.reshape(xr.shape) - self.running_mean.reshape(xr.shape) * self.scale
+    return xr * self.scale + self.bias_term
 
-    batch_mean, batch_invstd = self.calc_stats(xr)
-    ret = xr.batchnorm(
-      self.weight.reshape(1, -1).expand((self.num_devices, -1)),
-      self.bias.reshape(1, -1).expand((self.num_devices, -1)),
-      batch_mean, batch_invstd, axis=(0, 2))
-    return ret.reshape(x.shape).cast(x.dtype)
-
-  def precompute(self, batch_shape):
-    weight = self.weight.reshape(1, -1).expand((self.num_devices, -1))
-    bias = self.bias.reshape(1, -1).expand((self.num_devices, -1))
-    invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(batch_shape).add(self.eps).rsqrt()
-    self.scale = weight.reshape(batch_shape) * invstd.reshape(batch_shape)
-    self.bias_term = bias.reshape(batch_shape) - self.running_mean.reshape(batch_shape) * self.scale
-    self.precomputed = True
-
-  def calc_stats(self, x:Tensor):
-    batch_mean = self.running_mean
-    # NOTE: this can be precomputed for static inference. we expand it here so it fuses
-    batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
-    return batch_mean, batch_invstd
+    # batch_mean, batch_invstd = self.calc_stats(xr)
+    # ret = xr.batchnorm(
+    #   self.weight.reshape(1, -1).expand((self.num_devices, -1)),
+    #   self.bias.reshape(1, -1).expand((self.num_devices, -1)),
+    #   batch_mean, batch_invstd, axis=(0, 2))
+    # return ret.reshape(x.shape).cast(x.dtype)
 
 class LinearBert(nn.Linear):
   def __init__(self, in_features, out_features, bias=True, std=0.02):
