@@ -149,7 +149,7 @@ class ResNet:
         continue # Skip FC if transfer learning
 
       if 'bn' not in k and 'downsample' not in k: assert obj.shape == dat.shape, (k, obj.shape, dat.shape)
-      obj.assign(dat.expand(obj.shape).reshape(obj.shape))
+      obj.assign(dat.broadcast_to(obj.shape))
 
 ResNet18 = lambda num_classes=1000: ResNet(18, num_classes=num_classes)
 ResNet34 = lambda num_classes=1000: ResNet(34, num_classes=num_classes)
