@@ -85,6 +85,8 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
     from tqdm import tqdm
     tqdm.write(f"{x.shape=}")
     tqdm.write(f"{xr.shape=}")
+    tqdm.write(f"{self.running_mean.shape=}")
+    tqdm.write(f"{self.running_var.shape=}")
     if self.precomputed:
       return xr * self.scale + self.bias_term
 
