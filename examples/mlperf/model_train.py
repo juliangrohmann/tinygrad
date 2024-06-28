@@ -352,13 +352,13 @@ def train_retinanet():
 
   # ** train parameters **
   epochs            = config["epochs"]        = getenv("EPOCHS", 10)
-  target_map        = getenv("TARGET", 1.01)
+  target_map        = getenv("TARGET", 0.34)
   eval_start_epoch  = getenv("EVAL_START_EPOCH", 0)
   eval_freq         = getenv("EVAL_FREQ", 1)
   # ** hyperparameters **
-  BS                = config["BS"]            = getenv("BS", 8 * len(GPUS))
+  BS                = config["BS"]            = getenv("BS", 4 * len(GPUS))
   EVAL_BS           = config["EVAL_BS"]       = getenv("EVAL_BS", BS)
-  base_lr           = config["base_lr"]       = getenv("LR", 0.0001)
+  base_lr           = config["base_lr"]       = getenv("LR", 0.00006)
   warmup_epochs     = config["warmup_epochs"] = getenv("WARMUP_EPOCHS", 1)
   warmup_factor     = config["warmup_factor"] = getenv("WARMUP_FACTOR", 0.001)
   # ** other parameters **
