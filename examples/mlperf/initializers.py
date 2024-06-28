@@ -95,16 +95,18 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
       tqdm.write(f"{batch_invstd.shape=}")
       tqdm.write(f"{self.weight.shape=}")
       tqdm.write(f"{self.bias.shape=}")
-      self.scale = weight.reshape(xr.shape) * batch_invstd.reshape(xr.shape)
-      self.bias_term = bias.reshape(xr.shape) - self.running_mean.reshape(xr.shape) * self.scale
+      shape = tuple(s if ax in (0, 2) else 1 for ax, s in enumerate(xr.shape))
+      tqdm.write(f"{shape=}")
+      self.scale = weight.reshape(shape) * batch_invstd.reshape(shape)
+      self.bias_term = bias.reshape(shape) - self.running_mean.reshape(shape) * self.scale
     return xr * self.scale + self.bias_term
 
-    # batch_mean, batch_invstd = self.calc_stats(xr)
-    # ret = xr.batchnorm(
-    #   self.weight.reshape(1, -1).expand((self.num_devices, -1)),
-    #   self.bias.reshape(1, -1).expand((self.num_devices, -1)),
-    #   batch_mean, batch_invstd, axis=(0, 2))
-    # return ret.reshape(x.shape).cast(x.dtype)
+    batch_mean, batch_invstd = self.calc_stats(xr)
+    ret = xr.batchnorm(
+      self.weight.reshape(1, -1).expand((self.num_devices, -1)),
+      self.bias.reshape(1, -1).expand((self.num_devices, -1)),
+      batch_mean, batch_invstd, axis=(0, 2))
+    return ret.reshape(x.shape).cast(x.dtype)
 
 class LinearBert(nn.Linear):
   def __init__(self, in_features, out_features, bias=True, std=0.02):
