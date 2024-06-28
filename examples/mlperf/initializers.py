@@ -74,7 +74,7 @@ class FrozenBatchNorm(nn.BatchNorm2d):
 class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
   def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1, num_devices=None):
     super().__init__(sz, eps=eps, affine=affine, track_running_stats=track_running_stats, momentum=momentum, num_devices=num_devices)
-    # self.precomputed = False
+    self.precomputed = False
 
   def __call__(self, x:Tensor):
     if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices

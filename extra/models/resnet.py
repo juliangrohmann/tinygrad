@@ -141,7 +141,6 @@ class ResNet:
 
     self.url = model_urls[(self.num, self.groups, self.base_width)]
     for k, v in torch_load(fetch(self.url)).items():
-      print(f"{self}")
       obj: Tensor = get_child(self, k)
       dat = v.numpy()
 
