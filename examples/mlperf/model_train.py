@@ -448,7 +448,7 @@ def train_retinanet():
     out = model(normalize(X))
     cls_loss, regr_loss = model.compute_loss(Y, out, prep_dat=Y_dat)
     (cls_loss + regr_loss).backward()
-    # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
+    # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler TODO: fp16 support
     optimizer.step()
     scheduler.step()
     return cls_loss.realize(), regr_loss.realize()

@@ -128,7 +128,7 @@ def batch_load_resnet(batch_size=64, val=False, shuffle=True, seed=None, pad_fir
   q_in, q_out = Queue(), Queue()
 
   sz = (batch_size*BATCH_COUNT, 224, 224, 3)
-  if os.path.exists("/dev/shm/resnet_X"): os.unlink("/dev/shm/resnet_X")
+  if os.path.exists("/dev/shm/resnet_X"): os.unlink(f"/dev/shm/resnet_X")
   shm = shared_memory.SharedMemory(name="resnet_X", create=True, size=prod(sz))
   procs = []
 
@@ -347,7 +347,7 @@ def batch_load_train_bert(BS:int, start_step:int = 0):
         active_set.remove(sample)
         blob.append(sample)
         if remaining_set:
-          active_set.append(remaining_set.popleft())
+            active_set.append(remaining_set.popleft())
     yield process_batch_bert([load_datasample(sample) for sample in blob])
 
 # Reference: https://github.com/mlcommons/training/blob/1c8a098ae3e70962a4f7422c0b0bd35ae639e357/language_model/tensorflow/bert/run_pretraining.py, Line 416
@@ -360,9 +360,9 @@ def batch_load_val_bert(BS:int):
     start_idx = (idx * BS) % len(dataset)
     end_idx = ((idx + 1) * BS) % len(dataset)
     if start_idx < end_idx:
-      yield process_batch_bert(dataset[start_idx:end_idx])
+        yield process_batch_bert(dataset[start_idx:end_idx])
     else:  # wrap around the end to the beginning of the dataset
-      yield process_batch_bert(dataset[start_idx:] + dataset[:end_idx])
+        yield process_batch_bert(dataset[start_idx:] + dataset[:end_idx])
     idx += 1
 
 def load_unet3d_data(preprocessed_dataset_dir, seed, queue_in, queue_out, X:Tensor, Y:Tensor):
@@ -433,7 +433,7 @@ def batch_load_unet3d(preprocessed_dataset_dir:Path, batch_size:int=6, val:bool=
       proc = Process(target=load_unet3d_data, args=(preprocessed_dataset_dir, seed, queue_in, queue_out, X, Y))
       proc.daemon = True
       proc.start()
-
+      
       procs.append(proc)
 
     for bc in range(batch_count):
