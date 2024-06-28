@@ -398,36 +398,6 @@ def train_retinanet():
   for k, v in get_state_dict(model).items():
     v.requires_grad = req_grad(k)
 
-  if getenv("TORCH_INIT"):
-    import sys
-    sys.path.append(getenv("MLCOMMONS_DIR", ""))
-    import torch
-    from model.retinanet import retinanet_from_backbone
-
-    print("Creating torch model")
-    torch_model = retinanet_from_backbone(backbone='resnext50_32x4d',
-                                          num_classes=264,
-                                          image_size=[800, 800],
-                                          data_layout='channels_last',
-                                          pretrained=False,
-                                          trainable_backbone_layers=3)
-    torch_model = torch_model.to(memory_format=torch.channels_last)
-    torch_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(torch_model)
-
-    torch_keys = sorted([(k.replace("_modules.", "").replace("_buffers.", "").replace("_parameters.", ""), v) for k, v in get_state_dict(torch_model, tensor_type=torch.Tensor).items() if not 'anchor_generator' in k])
-    tg_keys = sorted([(k, v) for k, v in get_state_dict(model).items() if not 'num_batches_tracked' in k])
-    for torch_item, tg_item in zip(torch_keys, tg_keys):
-      tg_k, tg_v = tg_item
-      torch_k, torch_v = torch_item
-      assert torch_k == tg_k, f"key mismatch: {tg_k=}, {torch_k=}"
-      assert tg_v.requires_grad == torch_v.requires_grad, f"{tg_k} grad mismatch: {tg_v.requires_grad=}, {torch_v.requires_grad=}"
-      dat = torch_v.detach().numpy()
-      if ('.running_mean' in tg_k or '.running_var' in tg_k) and tg_v.shape != dat.shape: # shape mismatch when using unsynced batchnorm
-        dat = np.tile(dat, (tg_v.shape[0], 1))
-      tg_v.assign(dat)
-      assert (tg_v.numpy() == torch_v.detach().numpy()).all(), f"{tg_k} init mismatch: {tg_v.numpy()=}, {torch_v.detach().numpy()=}"
-    assert len(tg_keys) == len(torch_keys), f"param count mismatch: {len(tg_keys)}, {len(torch_keys)}"
-
   # shard weights and initialize in order
   for k, x in get_state_dict(model).items():
     if not getenv("SYNCBN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
