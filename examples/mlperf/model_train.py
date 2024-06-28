@@ -442,7 +442,7 @@ def train_retinanet():
   def normalize(x):
     return ((x.permute([0, 3, 1, 2]) / 255.0 - input_mean) / input_std).cast(dtypes.default_float)
 
-  @TinyJit
+  # @TinyJit
   def train_step(X, Y, Y_dat):
     optimizer.zero_grad()
     out = model(normalize(X))
