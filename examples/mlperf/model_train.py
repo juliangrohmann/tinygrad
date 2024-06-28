@@ -367,9 +367,6 @@ def train_retinanet():
   config["EVAL_BEAM"]     = getenv("EVAL_BEAM", BEAM.value)
   config["WINO"]          = WINO.value
   config["SYNCBN"]        = getenv("SYNCBN")
-  # ** debug parameters **
-  skip_train_at  = config["SKIP_TRAIN_AT"]    = getenv("SKIP_TRAIN_AT", -1)
-  skip_eval_at  = config["SKIP_EVAL_AT"]      = getenv("SKIP_EVAL_AT", -1)
 
   import extra.models.resnet as resnet
   import extra.models.retinanet as retinanet
@@ -520,10 +517,6 @@ def train_retinanet():
     st = time.perf_counter()
     GlobalCounters.reset()
     while proc is not None:
-      if i >= skip_train_at >= 0:
-        print(f"skipped training at step {i}.")
-        break
-
       tt = time.perf_counter()
       losses, proc = train_step(proc[0], proc[1], proc[2]), proc[3]
       cls_loss, regr_loss = losses[0].item(), losses[1].item()
@@ -587,10 +580,6 @@ def train_retinanet():
 
       dl_cookies = []
       while proc is not None:
-        if i >= skip_eval_at >= 0:
-          print(f"skipped eval at step {i}.")
-          break
-
         out, targets, proc = eval_step(proc[0]).numpy(), proc[1], proc[3]  # drop inputs, keep cookie
 
         if len(dl_cookies) == getenv("STORE_COOKIES", 1): dl_cookies = []  # free previous cookies after gpu work has been enqueued
