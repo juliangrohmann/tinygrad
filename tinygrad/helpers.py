@@ -50,6 +50,7 @@ def unwrap2(x:Tuple[T,Any]) -> T:
   return ret
 def get_child(obj, key):
   for k in key.split('.'):
+    print(f"{key}")
     if k.isnumeric(): obj = obj[int(k)]
     elif isinstance(obj, dict): obj = obj[k]
     else: obj = getattr(obj, k)
