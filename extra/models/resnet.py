@@ -141,22 +141,15 @@ class ResNet:
 
     self.url = model_urls[(self.num, self.groups, self.base_width)]
     for k, v in torch_load(fetch(self.url)).items():
-      if 'fc.' in k and self.fc is None:
-        continue
-
       obj: Tensor = get_child(self, k)
-      dat = v.detach().numpy()
+      dat = v.numpy()
 
       if 'fc.' in k and obj.shape != dat.shape:
         print("skipping fully connected layer")
         continue # Skip FC if transfer learning
-      if '.num_batches_tracked' in k and obj.shape == (1,) and v.shape == (): # bn.num_batches_tracked is zero dim in torch
-        dat = Tensor([dat.item()], device=obj.device, dtype=obj.dtype)
-      if ('.running_mean' in k or '.running_var' in k) and obj.shape != dat.shape: # shape mismatch when using unsynced batchnorm
-        dat = np.tile(dat, (obj.shape[0], 1))
 
-      assert obj.shape == dat.shape, (k, obj.shape, dat.shape)
-      obj.assign(dat)
+      if 'bn' not in k and 'downsample' not in k: assert obj.shape == dat.shape, (k, obj.shape, dat.shape)
+      obj.assign(dat.reshape(obj.shape))
 
 ResNet18 = lambda num_classes=1000: ResNet(18, num_classes=num_classes)
 ResNet34 = lambda num_classes=1000: ResNet(34, num_classes=num_classes)

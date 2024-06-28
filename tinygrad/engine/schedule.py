@@ -144,6 +144,8 @@ def _recurse_lb(buf:LazyBuffer, realizes:Dict[LazyBuffer, None], allbufs:Dict[La
         pass # don't realize image to image casts. this is part of a larger problem
       else:
         realizes[buf.base] = None
+    # check all other pads for safe fusion
+    elif any(v.mask is not None for v in buf.st.views): simple_pads.add(buf.base)
     return _recurse_lb(buf.base, realizes, allbufs, simple_pads, children)
   # base
   allbufs[buf] = None
@@ -314,7 +316,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer], seen:Optional[Set[LazyBuffe
   if SAVE_SCHEDULE:
     def _save():
       print(f"saving {len(SCHEDULES)} schedule graphs to", fp:=getenv("SAVE_SCHEDULE_PATH", "schedule.pkl"))
-      pickle.dump(SCHEDULES, open(fp, "wb"))
+      with open(fp, "wb") as f: pickle.dump(SCHEDULES, f)
     if len(SCHEDULES) == 0: atexit.register(_save)
     SCHEDULES.extend((ps.ast for ps in prescheduled.values()) if getenv("CAPTURE_AST") else [(graph, prescheduled)])
   # confirm everything was scheduled correctly

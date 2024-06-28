@@ -1,8 +1,8 @@
 from __future__ import annotations
 from collections import defaultdict
-import math, itertools
-from typing import DefaultDict, NamedTuple, Optional, List, Tuple, cast, Dict, Union
-from tinygrad.ops import LazyOp, UnaryOps, BinaryOps, ReduceOps, MemBuffer, ConstBuffer, BufferOps, UNSAFE_PAD_OPS
+import itertools
+from typing import DefaultDict, Optional, List, Tuple, cast, Dict, Union
+from tinygrad.ops import LazyOp, UnaryOps, BinaryOps, ReduceOps, MemBuffer, ConstBuffer, BufferOps, UNSAFE_PAD_OPS, verify_lazyop
 from tinygrad.device import Device
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.dtype import dtypes, ImageDType, DType
@@ -35,16 +35,20 @@ class Opt:
     if self.op in {OptOps.GROUP, OptOps.GROUPTOP}: return k.first_reduce+k.group_for_reduces+self.axis
     return self.axis
 
-class TensorCoreOptions(NamedTuple):
-  axes: List[int] # the location of the original N and M axes if still in the shape
-  axes_exist: List[bool] # true if the original N and M axes are still in the shape
-  axis_pads: List[Tuple[int, int]]
-  def fix_axes(self, removed_axis:int): # adjust the TC axes if necesssary when an dimension is removed
-    for tc_dim in [i for i in range(2) if self.axes_exist[i]]:
-      if removed_axis < self.axes[tc_dim]: self.axes[tc_dim] -= 1
-      elif removed_axis == self.axes[tc_dim]: self.axes_exist[tc_dim] = False
+@dataclass
+class TensorCoreOptions:
+  axes: Tuple[int, ...] # the location of the original N and M axes if still in the shape
+  axes_exist: Tuple[bool, ...] # true if the original N and M axes are still in the shape
+  axis_pads: Tuple[Tuple[int, int], ...]
+  def fix_axes(self, removed_axis:int): # adjust the TC axes if necesssary when a dimension is removed
+    axes, axes_exist = list(self.axes), list(self.axes_exist)
+    for tc_dim in [i for i in range(2) if axes_exist[i]]:
+      if removed_axis < axes[tc_dim]: axes[tc_dim] -= 1
+      elif removed_axis == axes[tc_dim]: axes_exist[tc_dim] = False
+    self.axes, self.axes_exist = tuple(axes), tuple(axes_exist)
 
-class LocalBuffer(NamedTuple):
+@dataclass(frozen=True)
+class LocalBuffer:
   name: str
   size: int
   dtype: DType = dtypes.float32
@@ -54,24 +58,21 @@ class LocalBuffer(NamedTuple):
 class Kernel:
   def __init__(self, *ast:LazyOp, opts:Optional[Renderer]=None):
     self.opts = opts if opts is not None else Device[Device.DEFAULT].renderer
-    assert all(op.op is BufferOps.STORE for op in ast), f"kernels must have stores as the output, got {ast}"
-    assert len(set(op.arg.st.size for op in ast)) == 1, f"all outbufs should have the same size, got {[op.arg.st for op in ast]}"
+    verify_lazyop(*ast)
     self.ast = ast
     self.lazyops = flatten([op.lazyops for op in self.ast])
 
-    # there's only allowed to be one reduceop
     cached_ordered_lazyops: Dict[LazyOp, List[LazyOp]] = {}
     def ordered_lazyops(op):
       if op not in cached_ordered_lazyops: cached_ordered_lazyops[op] = dedup([item for x in op.src for item in ordered_lazyops(x)] + [op])
       return cached_ordered_lazyops[op]
     self.reduceops = dedup([x for out in self.ast for x in ordered_lazyops(out) if x.op in ReduceOps])
-    assert len(self.reduceops) < 2, "Only one reduceop allowed"
 
     self.outbufs, self.vars = [x.arg for x in self.ast], flatten([x.vars() for x in self.ast])
     loadops = [BufferOps.LOAD, BufferOps.CONST]
     self.bufs: List[Union[MemBuffer, ConstBuffer, LocalBuffer]] = self.outbufs + dedup([x.arg for x in self.lazyops if x.op in loadops])
 
-    # get earlybufs, before the one reduce op
+    # get earlybufs, before any reduceops
     self.earlybufs = [x.arg for reduceop in self.reduceops for x in reduceop.lazyops if x.op in BufferOps]
     self.full_buf_index: int = self.bufs.index(self.earlybufs[0]) if self.earlybufs else 0
 
@@ -282,33 +283,6 @@ class Kernel:
 
   # ******************** helpers ********************
 
-  def _limit_size(self, x: Tuple[int], max_size: List[Union[int,float]]) -> Tuple[int, ...]:
-    new_shape = list(x)
-    for i in range(len(new_shape)):
-      next_idx = (i + 1) % len(new_shape)
-      while new_shape[i] > max_size[i]:
-        # TODO: what if new_shape[i] is not a multiple of 2??
-        new_shape[i] = new_shape[i] // 2
-        next_idx = next_idx if new_shape[next_idx] <= max_size[next_idx] else (next_idx + 1) % len(new_shape)
-        new_shape[next_idx] = new_shape[next_idx] * 2
-    return tuple(new_shape)
-
-  def limit_dims_to_max(self, global_max: List[int], local_max: List[int]):
-    # Check the global allocation limit, current the global_size will be flipped during codegen
-    # and then padded right with 1s if its length < 3 which makes this part a bit awkward to write
-    if self.global_dims > 0:
-      if global_max:
-        tmp = global_max[:self.global_dims] + (local_max[:self.local_dims] if local_max else [])
-        if max(global_max) < max(self.full_shape[:self.global_dims]):
-          self.reshape_and_permute(lambda x: self._limit_size(x, tmp + [math.inf] * (len(self.full_shape)-len(tmp))), None)
-        assert max(global_max) >= max(self.full_shape[:self.global_dims]), f"device max allocation {max(self.full_shape[:self.global_dims])} exceeds global dim maximum {max(global_max)}"  # noqa: E501
-      for i in range(self.global_dims-1):
-        if i < len(global_max) and self.full_shape[i] > global_max[i]:
-          order = list(range(len(self.full_shape)))
-          order[i], order[self.global_dims-1] = order[self.global_dims-1], order[i]
-          self.reshape_and_permute(None, order)
-          if DEBUG >= 3: print("permuted global dim", order, "due to allocation exceeds global limit")
-
   def alias_buffer(self, op:LazyOp, i:int, pattern:List[int]) -> None:
     assert len(pattern) == len(self.sts[i].shape), f"must include a pattern for each shape {pattern} {self.sts[i].shape}"
 
@@ -353,11 +327,11 @@ class Kernel:
     if not(axis < len(axis_choices)): return None
 
     s0, s1, s2 = axis_choices[-(axis+1)][0][0], axis_choices[-(axis+1)][1][0], axis_choices[-(axis+1)][2]  # s0 is n, s1 is m, s2 is k
-    axis_pads = [(x, tc.dims[i]) for i, x in enumerate([s0, s1, s2]) if self.full_shape[x]%tc.dims[i] != 0]
+    axis_pads = tuple((x, tc.dims[i]) for i, x in enumerate([s0, s1, s2]) if self.full_shape[x]%tc.dims[i] != 0)
     if axis_pads and (opt_level < 2): return None
     self.bufs_for_tensor_core[reduceop] = (buf0, buf1)
     if DEBUG >= 3: print("TENSOR CORES", axis_buf0, axis_buf1, tc)
-    return TensorCoreOptions(axes=[s0, s1, s2], axes_exist=[True, True], axis_pads=axis_pads)
+    return TensorCoreOptions(axes=(s0, s1, s2), axes_exist=(True, True), axis_pads=axis_pads)
 
   def _apply_tc_opt(self, use_tensor_cores:int, axis:int, opt_level:int) -> bool:
     if use_tensor_cores and self.opts.has_local and self.reduceop is not None and self.reduceop.op is ReduceOps.SUM:

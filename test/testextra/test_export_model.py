@@ -1,6 +1,5 @@
 import unittest
 from extra.export_model import export_model, EXPORT_SUPPORTED_DEVICE
-from tinygrad.helpers import getenv
 from tinygrad.tensor import Tensor, Device
 import json
 
@@ -14,7 +13,6 @@ class MockMultiOutputModel:
 
 # TODO: move compile_efficientnet tests here
 @unittest.skipUnless(Device.DEFAULT in EXPORT_SUPPORTED_DEVICE, f"Model export is not supported on {Device.DEFAULT}")
-@unittest.skipIf(getenv("RUN_PROCESS_REPLAY"), "TODO: kernel ordering is non-deterministic")
 class TextModelExport(unittest.TestCase):
   def test_multi_input_model_export(self):
     model = MockMultiInputModel()
@@ -33,9 +31,9 @@ class TextModelExport(unittest.TestCase):
 
   def test_multi_output_model_export(self):
     model = MockMultiOutputModel()
-    input = Tensor.rand(2,2)
-    outputs = model(input)
-    prg, _, out_sizes, _ = export_model(model, "", input)
+    input_tensor = Tensor.rand(2,2)
+    outputs = model(input_tensor)
+    prg, _, out_sizes, _ = export_model(model, "", input_tensor)
     prg = json.loads(prg)
 
     assert len(outputs) == len(prg["outputs"]) == len(out_sizes), f"Model and exported outputs don't match: mdl={len(outputs)}, prg={len(prg['outputs'])}, inp_sizes={len(out_sizes)}"  # noqa: E501

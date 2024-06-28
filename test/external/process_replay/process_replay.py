@@ -1,8 +1,8 @@
+#!/usr/bin/env python3
 # compare kernels created by HEAD against master
 import difflib, pickle
-from tqdm import tqdm
 from tinygrad.codegen.linearizer import Linearizer
-from tinygrad.helpers import colored, db_connection, VERSION
+from tinygrad.helpers import colored, db_connection, VERSION, getenv, tqdm
 
 page_size = 100
 conn = db_connection()
@@ -11,18 +11,16 @@ row_count = cur.execute(f"select count(*) from 'process_replay_{VERSION}'").fetc
 for offset in tqdm(range(0, row_count, page_size)):
   cur.execute(f"SELECT val FROM 'process_replay_{VERSION}' LIMIT ? OFFSET ?", (page_size, offset))
   for row in cur.fetchall():
-    compare_k: Linearizer = pickle.loads(row[0])
-    compare_src = compare_k.opts.render("test", compare_k.uops)
-    k = Linearizer(*compare_k.ast, opts=compare_k.opts)
-    for opt in compare_k.applied_opts: k.apply_opt(opt)
-    good_uops = k.linearize().uops
-    good_src = k.opts.render("test", good_uops)
+    ast, opts, applied_opts, name, compare_src = pickle.loads(row[0])
+    k = Linearizer(*ast, opts=opts)
+    for opt in applied_opts: k.apply_opt(opt)
+    good_src = k.opts.render(name, k.linearize().uops)
     try: assert compare_src == good_src
     except AssertionError as e:
-      print("PROCESS REPLAY FAILED")
-      print(compare_k.ast)
-      print(compare_k.applied_opts)
+      print("PROCESS REPLAY DETECTED CHANGE")
+      print(ast)
+      print(applied_opts)
       diff = list(difflib.unified_diff(good_src.splitlines(), compare_src.splitlines()))
       for line in diff:
         print(colored(line, "red" if line.startswith("-") else "green" if line.startswith("+") else None))
-      raise e
+      if getenv("ASSERT_PROCESS_REPLAY", 1): raise e
