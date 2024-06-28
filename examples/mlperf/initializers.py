@@ -82,7 +82,7 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
     # bias_term = bias - mean * scale
     # ret = x * scale + bias_term
     xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
-    import tqdm
+    from tqdm import tqdm
     tqdm.write(f"{x.shape=}")
     tqdm.write(f"{xr.shape=}")
     if self.precomputed:
