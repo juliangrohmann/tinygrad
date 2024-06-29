@@ -402,7 +402,7 @@ def train_retinanet():
   temp = BEAM.value
   BEAM.value = 0
   Tensor.no_grad = True
-  model(Tensor.rand((32, 3, 800, 800))).realize()
+  model(Tensor.rand((32, 3, 800, 800)))
   Tensor.no_grad = False
   BEAM.value = temp
   print("done precomputing")
