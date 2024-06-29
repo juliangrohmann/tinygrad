@@ -399,9 +399,12 @@ def train_retinanet():
   for k, v in get_state_dict(model).items():
     v.requires_grad = req_grad(k)
 
+  temp = BEAM.value
+  BEAM.value = 0
   Tensor.no_grad = True
   model(Tensor.rand((32, 3, 800, 800))).realize()
   Tensor.no_grad = False
+  BEAM.value = temp
   print("done precomputing")
   # shard weights and initialize in order
   sharded_keys = ['running_mean', 'running_var', 'scale', 'bias_term']
