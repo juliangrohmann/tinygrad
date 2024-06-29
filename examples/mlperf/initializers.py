@@ -80,12 +80,15 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
     if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
     xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
     if self.scale is None or self.bias_term is None:
+      from tqdm import tqdm
       shape = tuple(s if ax in (0, 2) else 1 for ax, s in enumerate(xr.shape))
       batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(xr.shape).add(self.eps).rsqrt()
       wr = self.weight.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
       br = self.bias.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
       self.scale = (wr * batch_invstd).realize()
       self.bias_term = (br - self.running_mean.reshape(shape) * self.scale).realize()
+      tqdm.write(f"{self.scale.lazydata.axis=}")
+      tqdm.write(f"{self.bias_term.lazydata.axis=}")
     return (xr * self.scale + self.bias_term).reshape(x.shape).cast(x.dtype)
 
 class LinearBert(nn.Linear):
