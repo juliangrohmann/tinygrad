@@ -438,6 +438,7 @@ def train_retinanet():
 
   input_mean = Tensor([0.485, 0.456, 0.406], device=GPUS, dtype=dtypes.float32).reshape(1, -1, 1, 1)
   input_std = Tensor([0.229, 0.224, 0.225], device=GPUS, dtype=dtypes.float32).reshape(1, -1, 1, 1)
+  loss_scaler = 512.0 if dtypes.default_float in [dtypes.float16] else 1.0
 
   def normalize(x):
     return ((x.permute([0, 3, 1, 2]) / 255.0 - input_mean) / input_std).cast(dtypes.default_float)
@@ -448,7 +449,7 @@ def train_retinanet():
     out = model(normalize(X))
     cls_loss, regr_loss = model.compute_loss(Y, out, prep_dat=Y_dat)
     (cls_loss + regr_loss).backward()
-    # for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler TODO: fp16 support
+    for p in optimizer.params: p.grad = p.grad.contiguous() / loss_scaler
     optimizer.step()
     scheduler.step()
     return cls_loss.realize(), regr_loss.realize()
