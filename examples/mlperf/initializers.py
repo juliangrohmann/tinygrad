@@ -86,7 +86,7 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
       batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(xr.shape).add(self.eps).rsqrt()
       wr = self.weight.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
       br = self.bias.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
-      self.scale = (wr * batch_invstd.reshape(shape)).realize()
+      self.scale = (wr * batch_invstd).realize()
       self.bias_term = (br - self.running_mean.reshape(shape) * self.scale).realize()
     return (xr * self.scale + self.bias_term).reshape(x.shape).cast(x.dtype)
 
