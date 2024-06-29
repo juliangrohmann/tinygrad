@@ -384,7 +384,8 @@ def train_retinanet():
   retinanet.Conv2d = Conv2dRetina
   retinanet.Conv2dCls = Conv2dClsRetina
   retinanet.Conv2dFPN = Conv2dFPN
-  backbone = resnet.ResNeXt50_32X4D(num_classes=None)
+  backbone = resnet.ResNeXt50_32X4D()
+  backbone.fc = None
   backbone.load_from_pretrained()
   model = retinanet.RetinaNet(backbone)
   if getenv("PRETRAINED"):
