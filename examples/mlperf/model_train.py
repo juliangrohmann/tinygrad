@@ -406,14 +406,14 @@ def train_retinanet():
     else:
       x.realize().to_(GPUS)
 
-  # temp = BEAM.value
-  # BEAM.value = 0
-  # Tensor.no_grad = True
-  # X = Tensor.rand((32, 3, 800, 800)).shard(GPUS, axis=0)
-  # model(X)
-  # Tensor.no_grad = False
-  # BEAM.value = temp
-  # print("done precomputing")
+  temp = BEAM.value
+  BEAM.value = 0
+  Tensor.no_grad = True
+  X = Tensor.rand((32, 3, 800, 800)).shard(GPUS, axis=0)
+  model(X)
+  Tensor.no_grad = False
+  BEAM.value = temp
+  print("done precomputing")
 
   # ** download dataset **
   from extra.datasets.openimages import openimages, get_targets
