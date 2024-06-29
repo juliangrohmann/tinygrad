@@ -394,7 +394,7 @@ def train_retinanet():
 
   def req_grad(k, trainable=('layer2', 'layer3', 'layer4')):
     if not 'backbone' in k or 'fpn' in k: return True
-    return any(name in k for name in trainable) and not 'bn' in k and (not 'downsample' in k or '0.weight' in k)
+    return any(name in k for name in trainable) and 'bn' not in k and ('downsample' not in k or '0.weight' in k)
 
   for k, v in get_state_dict(model).items():
     v.requires_grad = req_grad(k)
@@ -407,7 +407,7 @@ def train_retinanet():
   BEAM.value = temp
   print("done precomputing")
   # shard weights and initialize in order
-  sharded_keys = []
+  sharded_keys = ['running_mean', 'running_var']
   for k, x in get_state_dict(model).items():
     if not getenv("SYNCBN") and any(key in k for key in sharded_keys) and len(GPUS) > 1:
       x.realize().shard_(GPUS, axis=0)
