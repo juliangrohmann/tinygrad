@@ -83,7 +83,7 @@ class FrozenUnsyncedBatchNorm(UnsyncedBatchNorm):
       from tqdm import tqdm
       tqdm.write("precomputing")
       shape = tuple(s if ax in (0, 2) else 1 for ax, s in enumerate(xr.shape))
-      batch_mean, batch_invstd = self.calc_stats(xr)
+      batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(xr.shape).add(self.eps).rsqrt()
       wr = self.weight.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
       br = self.bias.reshape(1, -1).expand((self.num_devices, -1)).reshape(shape)
       self.scale = (wr * batch_invstd.reshape(shape)).realize()
