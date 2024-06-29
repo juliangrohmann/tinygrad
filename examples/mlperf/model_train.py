@@ -400,7 +400,6 @@ def train_retinanet():
     v.requires_grad = req_grad(k)
 
   # shard weights and initialize in order
-  sharded_keys = ['running_mean', 'running_var']
   for k, x in get_state_dict(model).items():
     if not getenv("SYNCBN") and ("running_mean" in k or "running_var" in k) and len(GPUS) > 1:
       x.realize().shard_(GPUS, axis=0)
