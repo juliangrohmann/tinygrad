@@ -1,12 +1,15 @@
 from __future__ import annotations
 import subprocess, hashlib, tempfile, ctypes, ctypes.util, functools, re
 from pathlib import Path
+from io import BytesIO
 from typing import Tuple, Optional, List
 import tinygrad.runtime.autogen.cuda as cuda
 from tinygrad.helpers import DEBUG, getenv, from_mv, to_char_p_p, init_c_var, init_c_struct_t, colored, cpu_time_execution
 from tinygrad.device import Compiled, Compiler, CompileError, BufferOptions, LRUAllocator, MallocAllocator
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.renderer.assembly import PTXRenderer
+from CuAsm import CubinFile, CuAsmParser, CuAsmLogger
+
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl  # noqa: F401
 
 def pretty_ptx(s):
@@ -50,6 +53,33 @@ def cu_time_execution(cb, enable=False) -> Optional[float]:
 def _get_bytes(arg, get_str, get_sz, check) -> bytes:
   sz = init_c_var(ctypes.c_size_t(), lambda x: check(get_sz(arg, ctypes.byref(x))))
   return ctypes.string_at(init_c_var(ctypes.create_string_buffer(sz.value), lambda x: check(get_str(arg, x))), size=sz.value)
+
+class SASSCompiler(Compiler):
+  def __init__(self, arch:str):
+    self.arch = arch
+    self.version = "7.8" if arch >= "sm_89" else "7.5"
+    super().__init__(f"compile_ptx_{self.arch}")
+  def compile(self, src:str) -> bytes:
+    fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(src.encode()).hexdigest()}").as_posix()
+    with open(fn + ".cu", "w") as f: f.write(src)
+    subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn + ".cu"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    CubinFile(fn + ".cubin").saveAsCuAsm(fn + ".cuasm")
+    ret = BytesIO()
+    cap = CuAsmParser()
+    cap.parse(fn + ".cuasm")
+    cap.saveAsCubin(ret)
+    if out_dir := getenv("WRITE_SRC", ""):
+      Path(out_dir).mkdir(parents=True, exist_ok=True)
+      out_fn = Path(out_dir) / "debug"
+      with open(str(out_fn) + ".cubin", "wb") as f:
+        f.write(ret.getbuffer())
+      with open(str(fn) + ".cuasm") as src:
+        with open(str(out_fn) + ".cuasm", "w") as f:
+          f.write(src.read())
+      with open(str(fn) + ".cu") as src:
+        with open(str(out_fn) + ".cu", "w") as f:
+          f.write(src.read())
+    return bytes(ret.getbuffer())
 
 class PTXCompiler(Compiler):
   def __init__(self, arch:str):
