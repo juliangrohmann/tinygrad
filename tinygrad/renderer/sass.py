@@ -216,6 +216,32 @@ class SASSRenderer(Renderer):
       render_mov(uop, dest, val_f, uop.dtype)
       render_mov(uop, dest, val_t, uop.dtype, pred)
 
+    def render_log2(uop:UOp, dest:str, src:str):
+      p0 = new_pred()
+      buf0, buf1, buf2, buf3 = [new_reg() for _ in range(4)]
+      queue(uop, ControlCode(), f"FSETP.GEU.AND {p0}, PT, {src}, 1.175494350822287508e-38, PT")
+      queue(uop, ControlCode(), f"@!{p0} FMUL {src}, {src}, 8388608")
+      queue(uop, ControlCode(), f"IADD3 {dest}, {src}, -0x3f3504f3, RZ")
+      queue(uop, ControlCode(), f"LOP3.LUT {buf0}, {dest}, 0xff800000, RZ, 0xc0, !PT")
+      queue(uop, ControlCode(), f"IADD3 {dest}, {src}, -{buf0}, RZ")
+      queue(uop, ControlCode(), f"I2FP.F32.S32 {buf0}, {buf0}")
+      queue(uop, ControlCode(), f"FADD {buf1}, {dest}, -1")
+      queue(uop, ControlCode(), f"FSEL {dest}, RZ, -23, {p0}")
+      queue(uop, ControlCode(), f"ISETP.GE.U32.AND {p0}, PT, {src}, 0x7f800000, PT")
+      queue(uop, ControlCode(), f"MOV {buf2}, 0x3dc6b27f")
+      queue(uop, ControlCode(), f"FFMA {buf3}, {buf1}, {buf2}, -0.16845393180847167969")
+      params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
+                "0.28857114911079406738", "-0.36067417263984680176", "0.48089820146560668945", "-0.72134751081466674805"]
+      for p in params: queue(uop, ControlCode(), f"FFMA {buf3}, {buf1}, {buf3}, {p}")
+      for _ in range(2): queue(uop, ControlCode(), f"FMUL {buf3}, {buf1}, {buf3}")
+      queue(uop, ControlCode(), f"FFMA {buf3}, {buf1}, 1.4426950216293334961, {buf3}")
+      queue(uop, ControlCode(), f"FFMA {dest}, {buf0}, 1.1920928955078125e-07, {dest}")
+      queue(uop, ControlCode(), f"@{p0} MOV {buf0}, 0x7f800000")
+      queue(uop, ControlCode(), f"FADD {dest}, {dest}, {buf3}")
+      queue(uop, ControlCode(), f"@{p0} FFMA {dest}, {src}, {buf0}, +INF")
+      queue(uop, ControlCode(), f"FSETP.NEU.AND {p0}, PT, {src}, RZ, PT")
+      queue(uop, ControlCode(), f"FSEL {dest}, {dest}, -INF, {p0}")
+
     vals[0] = "RZ"
     vals[float("inf")] = "INF"
     vals[float("-inf")] = "-INF"
@@ -318,6 +344,10 @@ class SASSRenderer(Renderer):
           queue(u, ControlCode(), f"ISETP.LT.AND {dest}, PT, {', '.join(srcs)}, PT")
         elif arg is TernaryOps.WHERE:
           render_where(u, new_reg(dtype.itemsize), *[vals[v] for v in vin])
+        elif arg is UnaryOps.LOG2:
+          assert dtype is dtypes.float, f"log2 not supported for {dtype}"
+          vals[u] = dest = new_reg()
+          render_log2(u, dest, vals[vin[0]])
         else:
           raise NotImplementedError
       else:
