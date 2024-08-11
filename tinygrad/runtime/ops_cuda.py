@@ -58,8 +58,28 @@ class SASSCompiler(Compiler):
   def __init__(self, arch:str):
     self.arch = arch
     self.version = "7.8" if arch >= "sm_89" else "7.5"
-    super().__init__(f"compile_ptx_{self.arch}")
+    super().__init__(f"compile_sass_{self.arch}")
   def compile(self, src:str) -> bytes:
+    fn = (Path(tempfile.gettempdir()) / f"cuasm_{hashlib.md5(src.encode()).hexdigest()}").as_posix()
+    with open(fn + ".cuasm", "w") as f: f.write(src)
+    if out_dir := getenv("WRITE_SRC", ""):
+      out_dir = Path(out_dir)
+      out_dir.mkdir(parents=True, exist_ok=True)
+      with open(out_dir / "rendered.cuasm", "w") as f:
+        f.write(src)
+    ret = BytesIO()
+    cap = CuAsmParser()
+    cap.parse(fn + ".cuasm")
+    cap.saveAsCubin(ret)
+    return bytes(ret.getbuffer())
+
+class CuAsmCompiler(Compiler):
+  def __init__(self, arch:str):
+    self.arch = arch
+    self.version = "7.8" if arch >= "sm_89" else "7.5"
+    super().__init__(f"compile_cuasm_{self.arch}")
+  def compile(self, src:str) -> bytes:
+    print("cuasm compile")
     fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(src.encode()).hexdigest()}").as_posix()
     with open(fn + ".cu", "w") as f: f.write(src)
     subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn + ".cu"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -69,8 +89,9 @@ class SASSCompiler(Compiler):
     cap.parse(fn + ".cuasm")
     cap.saveAsCubin(ret)
     if out_dir := getenv("WRITE_SRC", ""):
-      Path(out_dir).mkdir(parents=True, exist_ok=True)
-      out_fn = Path(out_dir) / "debug"
+      out_dir = Path(out_dir)
+      out_dir.mkdir(parents=True, exist_ok=True)
+      out_fn = out_dir / "debug"
       with open(str(out_fn) + ".cubin", "wb") as f:
         f.write(ret.getbuffer())
       with open(str(fn) + ".cuasm") as src:
