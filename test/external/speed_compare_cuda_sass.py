@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [5, 6, 7, 9, 10, 11]
+  impl = [5, 6, 7, 9, 10, 11, 12]
   for num,ast in list(enumerate(ast_strs))[getenv("START", 0):getenv("END", len(ast_strs))]:
     if getenv("TEST", 0) and num not in impl:
       continue

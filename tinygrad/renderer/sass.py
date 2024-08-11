@@ -163,6 +163,9 @@ class SASSRenderer(Renderer):
     def const_addr(uop:UOp, offset=0):
       return f"c[0x0][{hex(param_cbank + uop.arg[0] * 8 + offset)}]"
 
+    def is_contiguous(srcs:List[str]):
+      return all(s[0] == "R" for s in srcs) and all(int(srcs[i][1]) - int(srcs[0][1]) == i for i in range(len(srcs)))
+
     def render_glob_addr(idx:UOp, glob:UOp, pred=None):
       if idx.uop is UOps.CONST:
         glob_addr = vals[glob]
@@ -174,7 +177,8 @@ class SASSRenderer(Renderer):
           vals[glob] = glob_addr
         glob_addr += ".64"
         if idx and idx.arg != 0:
-          offset = hex(idx.arg * glob.dtype.itemsize) if idx.uop == UOps.CONST else vals[idx]
+          n = (glob.dtype.itemsize + 3) // 4
+          offset = hex(idx.arg * n * 4) if idx.uop == UOps.CONST else vals[idx]
           glob_addr += f"+{offset}"
         return glob_addr
       else:
@@ -231,6 +235,28 @@ class SASSRenderer(Renderer):
           queue(u, ControlCode(), f"STG{''.join(mods)} desc[UR4][{glob_addr}], {to_reg(vin[2])}")  # explicit memory descriptor
         else:
           raise NotImplementedError
+      elif uop is UOps.CAST:
+        if dtypes.is_float(dtype):
+          if dtypes.is_int(vin[0].dtype):
+            assert vin[0].dtype.count == 1, f"can't cast int to {vin[0].dtype}"
+            vals[u] = dest = new_reg(dtype.itemsize)
+            queue(u, ControlCode(), f"I2F.{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{vin[0].dtype.itemsize * 8} {dest}, {vals[u.vin[0]]}")
+          elif all(dtypes.is_float(v.dtype) for v in vin) and dtype.count > 1:
+            print(f"{dtype.itemsize=}")
+            print(f"{dtype.count=}")
+            srcs = [vals[v] for v in vin]
+            if not is_contiguous(srcs):
+              vals[u] = dest = new_reg(dtype.itemsize)
+              n = (vin[0].dtype.itemsize + 3) // 4
+              idx = int(dest[1:])
+              for s in srcs:
+                queue(u, ControlCode(), f"MOV{f'.{n*32}' if n != 1 else ''} R{idx}, {s}")
+                idx += n
+            else:
+              vals[u] = srcs[0]
+          else:
+            raise NotImplementedError
+
       elif uop is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
