@@ -115,7 +115,7 @@ class SASSRenderer(Renderer):
     def new_reg(byte_size:int=4):
       nonlocal reg_cnt
       n = (byte_size + 3) // 4
-      reg = reg_cnt + reg_cnt % n
+      reg = n * ((reg_cnt + n - 1) // n) # ceil
       reg_cnt = reg + n
       assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new register: all registers filled" # TODO: remove & optim regs after render
       return f"R{reg}"
@@ -294,6 +294,7 @@ class SASSRenderer(Renderer):
           srcs = [vals[v] for v in vin]
           if not is_contiguous(srcs):
             dest = new_reg(dtype.itemsize)
+            print(f"{dtype.itemsize=}")
             n = (vin[0].dtype.itemsize + 3) // 4
             idx = int(dest[1:])
             for s in srcs:
