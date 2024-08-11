@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [5, 6, 7, 9, 10, 11, 12]
+  impl = [5, 6, 7, 9, 10, 11, 12, 13]
   for num,ast in list(enumerate(ast_strs))[getenv("START", 0):getenv("END", len(ast_strs))]:
     if getenv("TEST", 0) and num not in impl:
       continue
@@ -90,8 +90,10 @@ if __name__ == "__main__":
       print(f"debug: {debug_prg(debug_bufs, {}, wait=True)*1e6:7.2f} us")
       if allclose(cuda_bufs, debug_bufs):
         print("success")
+        result["success"].append(num)
       else:
         print("mismatch")
+        result["mismatch"].append((num, info(cuda_bufs, debug_bufs)))
     else:
       # run programs
       try:

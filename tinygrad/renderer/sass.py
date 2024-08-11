@@ -139,9 +139,12 @@ class SASSRenderer(Renderer):
 
     def unity():
       if not 1 in vals:
-        vals[1] = new_reg()
-        queue(None, ControlCode(), f"MOV {vals[1]}, 0x1")
+        vals[1] = dest = new_reg()
+        render_mov(None, dest, "0x1", dtypes.int)
       return vals[1]
+
+    def is_contiguous(srcs:List[str]):
+      return all(s[0] == "R" for s in srcs) and all(int(srcs[i][1]) - int(srcs[0][1]) == i for i in range(len(srcs)))
 
     addr = 0
     def queue(uop:UOp, ctrl:ControlCode, ins:str):
@@ -163,8 +166,12 @@ class SASSRenderer(Renderer):
     def const_addr(uop:UOp, offset=0):
       return f"c[0x0][{hex(param_cbank + uop.arg[0] * 8 + offset)}]"
 
-    def is_contiguous(srcs:List[str]):
-      return all(s[0] == "R" for s in srcs) and all(int(srcs[i][1]) - int(srcs[0][1]) == i for i in range(len(srcs)))
+    def to_reg(uop:UOp):
+      var = vals[uop]
+      if "R" in var: return var
+      vals[uop] = dest = new_reg()
+      render_mov(uop, dest, var, uop.dtype)
+      return dest
 
     def render_glob_addr(idx:UOp, glob:UOp, pred=None):
       if idx.uop is UOps.CONST:
@@ -184,19 +191,24 @@ class SASSRenderer(Renderer):
       else:
         if glob.dtype.itemsize not in vals:
           vals[glob.dtype.itemsize] = dest = new_reg()
-          queue(None, ControlCode(), f"MOV {dest}, {hex(glob.dtype.itemsize)}")
+          render_mov(None, dest, hex(glob.dtype.itemsize), dtypes.int)
         dest = new_reg(byte_size=8)
         prefix = f"@{pred} " if pred else ""
         queue(None, ControlCode(), prefix + f"IMAD.WIDE {dest}, {vals[idx]}, {vals[glob.dtype.itemsize]}, {vals[glob]}")
         dest += ".64"
         return dest
 
-    def to_reg(uop:UOp):
-      var = vals[uop]
-      if "R" in var: return var
-      vals[uop] = dest = new_reg()
-      queue(uop, ControlCode(), f"MOV {dest}, {var}")
-      return dest
+    def render_mov(uop, dest, src, dtype, pred=None):
+      if uop:
+        vals[uop] = dest
+      if dtypes.is_float(dtype) and not src.startswith("R") and not src.startswith("0x"):
+        src = render_val(float(src), dtype)
+      n = (dtype.itemsize + 3) // 4
+      queue(uop, ControlCode(), f"{f'@{pred} ' if pred else ''}MOV{f'.{n*32}' if n > 1 else ''} {dest}, {src}")
+
+    def render_where(uop, dest, pred, val_t, val_f):
+      render_mov(uop, dest, val_f, uop.dtype)
+      render_mov(uop, dest, val_t, uop.dtype, pred)
 
     vals[0] = "RZ"
     vals[float("inf")] = "INF"
@@ -212,6 +224,8 @@ class SASSRenderer(Renderer):
       elif uop is UOps.CONST:
         if arg in vals:
           vals[u] = vals[arg]
+        elif dtypes.is_float(dtype):
+          vals[u] = str(arg)
         else:
           vals[u] = render_val(arg, dtype)
       elif uop is UOps.DEFINE_GLOBAL:
@@ -224,7 +238,7 @@ class SASSRenderer(Renderer):
           vals[u] = dest = new_reg(dtype.itemsize)
           queue(u, ControlCode(write=new_barrier()), f"{f'@{pred} ' if pred else ''}LDG.E {dest}, desc[UR4][{glob_addr}]") # explicit memory desc
           if pred:
-            queue(u, ControlCode(), f"@!{pred} MOV {dest}, {vals[vin[3]]}")
+            render_mov(u, dest, vals[vin[3]], dtype, "!"+pred)
         else:
           raise NotImplementedError
       elif uop is UOps.STORE:
@@ -236,27 +250,29 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif uop is UOps.CAST:
-        if dtypes.is_float(dtype):
-          if dtypes.is_int(vin[0].dtype):
+        if dtypes.is_int(vin[0].dtype):
+          if dtypes.is_float(dtype):
             assert vin[0].dtype.count == 1, f"can't cast int to {vin[0].dtype}"
             vals[u] = dest = new_reg(dtype.itemsize)
             queue(u, ControlCode(), f"I2F.{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{vin[0].dtype.itemsize * 8} {dest}, {vals[u.vin[0]]}")
-          elif all(dtypes.is_float(v.dtype) for v in vin) and dtype.count > 1:
-            print(f"{dtype.itemsize=}")
-            print(f"{dtype.count=}")
-            srcs = [vals[v] for v in vin]
-            if not is_contiguous(srcs):
-              vals[u] = dest = new_reg(dtype.itemsize)
-              n = (vin[0].dtype.itemsize + 3) // 4
-              idx = int(dest[1:])
-              for s in srcs:
-                queue(u, ControlCode(), f"MOV{f'.{n*32}' if n != 1 else ''} R{idx}, {s}")
-                idx += n
-            else:
-              vals[u] = srcs[0]
           else:
             raise NotImplementedError
-
+        elif all(dtypes.is_float(v.dtype) for v in vin) and dtype.count > 1:
+          srcs = [vals[v] for v in vin]
+          if not is_contiguous(srcs):
+            dest = new_reg(dtype.itemsize)
+            n = (vin[0].dtype.itemsize + 3) // 4
+            idx = int(dest[1:])
+            for s in srcs:
+              render_mov(u, f"R{idx}", s, vin[0].dtype)
+              idx += n
+            vals[u] = dest
+          else:
+            vals[u] = srcs[0]
+        elif vin[0].dtype is dtypes.bool:
+          render_where(u, new_reg(dtype.itemsize), vals[vin[0]], render_val(1, dtype), render_val(0, dtype))
+        else:
+          raise NotImplementedError
       elif uop is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
@@ -290,9 +306,7 @@ class SASSRenderer(Renderer):
           srcs = [to_reg(v) for v in vin]
           queue(u, ControlCode(), f"ISETP.LT.AND {dest}, PT, {', '.join(srcs)}, PT")
         elif arg is TernaryOps.WHERE:
-          vals[u] = dest = new_reg()
-          queue(None, ControlCode(), f"MOV {dest}, {vals[vin[2]]}")
-          queue(u, ControlCode(), f"@{vals[vin[0]]} MOV {dest}, {vals[vin[1]]}")
+          render_where(u, new_reg(dtype.itemsize), *[vals[v] for v in vin])
         else:
           raise NotImplementedError
       else:
