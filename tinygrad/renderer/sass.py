@@ -88,6 +88,12 @@ class SASSRenderer(Renderer):
       dtypes.float32: "FADD",
       dtypes.float64: "DADD",
     },
+    BinaryOps.SUB: {
+      dtypes.int: "IMAD",
+      dtypes.half: "HADD2",
+      dtypes.float32: "FADD",
+      dtypes.float64: "DADD",
+    },
     BinaryOps.MUL: {
       dtypes.int: "IMAD",
       dtypes.half: "HMUL2",
@@ -318,21 +324,21 @@ class SASSRenderer(Renderer):
           vals[u] = dest = new_pred()
           if len(srcs) == 2: srcs.append("PT")
           queue(u, ControlCode(), f"PLOP3.LUT {dest}, PT, {', '.join(srcs)}, {', '.join(self.plop['&'])}")
-        elif arg is BinaryOps.MUL or arg is BinaryOps.ADD:
+        elif arg in [BinaryOps.MUL, BinaryOps.ADD, BinaryOps.SUB]:
           assert len(srcs) == 2
           vals[u] = dest = new_reg()
           if dtype is dtypes.int:
             if arg is BinaryOps.MUL:
               srcs.append(vals[0])
-            elif arg is BinaryOps.ADD:
+            elif arg in [BinaryOps.ADD, BinaryOps.SUB]:
               srcs[1:1] = [unity()]
             else:
               raise NotImplementedError
-            queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
           else:
             assert len(srcs) == 2
-            vals[u] = dest = new_reg()
-            queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
+          if arg is BinaryOps.SUB:
+            srcs[-1] = f"-{srcs[-1]}"
+          queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
         elif arg is BinaryOps.MAX:
           assert all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in min/max: {dt}"
           vals[u] = dest = new_reg(vin[0].dtype.itemsize)
