@@ -107,16 +107,17 @@ class SASSRenderer(Renderer):
 
     kernel:List[Tuple[ControlCode, int, str]] = []
     ctrl_codes:Dict[UOp, List[ControlCode]] = defaultdict(list)
-    vars:Dict[Any, str] = {}
+    vals:Dict[Any, str] = {}
     param_cbank = int("160", 16) # TODO: make variable
     pred_cap = 251
 
     reg_cnt = 0
-    def new_reg(is_64_bit=False):
+    def new_reg(byte_size:int=4):
       nonlocal reg_cnt
-      reg = reg_cnt + (reg_cnt % 2 if is_64_bit else 0)
-      reg_cnt = reg + (2 if is_64_bit else 1)
-      assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new register: all registers filled"
+      n = (byte_size + 3) // 4
+      reg = reg_cnt + reg_cnt % n
+      reg_cnt = reg + n
+      assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new register: all registers filled" # TODO: remove & optim regs after render
       return f"R{reg}"
 
     pred_cnt = 0
@@ -124,7 +125,7 @@ class SASSRenderer(Renderer):
       nonlocal pred_cnt
       pred = pred_cnt
       pred_cnt += 1
-      assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new predicate: all registers filled"
+      assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new predicate: all registers filled" # TODO: remove & optim regs after render
       return f"P{pred}"
 
     active_barriers = []
@@ -137,10 +138,10 @@ class SASSRenderer(Renderer):
       return active_barriers[0]
 
     def unity():
-      if not 1 in vars:
-        vars[1] = new_reg()
-        queue(None, ControlCode(), f"MOV {vars[1]}, 0x1")
-      return vars[1]
+      if not 1 in vals:
+        vals[1] = new_reg()
+        queue(None, ControlCode(), f"MOV {vals[1]}, 0x1")
+      return vals[1]
 
     addr = 0
     def queue(uop:UOp, ctrl:ControlCode, ins:str):
@@ -164,62 +165,62 @@ class SASSRenderer(Renderer):
 
     def render_glob_addr(idx:UOp, glob:UOp, pred=None):
       if idx.uop is UOps.CONST:
-        glob_addr = vars[glob]
+        glob_addr = vals[glob]
         if "R" not in glob_addr:
-          glob_addr = new_reg(True)
+          glob_addr = new_reg(byte_size=8)
           queue(None, ControlCode(), f"IMAD.MOV.U32 {glob_addr}, RZ, RZ, {const_addr(glob)}")
           addr_ext = f"R{int(glob_addr[1:]) + 1}"
           queue(None, ControlCode(), f"IMAD.MOV.U32 {addr_ext}, RZ, RZ, {const_addr(glob, offset=4)}")
-          vars[glob] = glob_addr
+          vals[glob] = glob_addr
         glob_addr += ".64"
         if idx and idx.arg != 0:
-          offset = hex(idx.arg * glob.dtype.itemsize) if idx.uop == UOps.CONST else vars[idx]
+          offset = hex(idx.arg * glob.dtype.itemsize) if idx.uop == UOps.CONST else vals[idx]
           glob_addr += f"+{offset}"
         return glob_addr
       else:
-        if glob.dtype.itemsize not in vars:
-          vars[glob.dtype.itemsize] = dest = new_reg()
+        if glob.dtype.itemsize not in vals:
+          vals[glob.dtype.itemsize] = dest = new_reg()
           queue(None, ControlCode(), f"MOV {dest}, {hex(glob.dtype.itemsize)}")
-        dest = new_reg(True)
+        dest = new_reg(byte_size=8)
         prefix = f"@{pred} " if pred else ""
-        queue(None, ControlCode(), prefix + f"IMAD.WIDE {dest}, {vars[idx]}, {vars[glob.dtype.itemsize]}, {vars[glob]}")
+        queue(None, ControlCode(), prefix + f"IMAD.WIDE {dest}, {vals[idx]}, {vals[glob.dtype.itemsize]}, {vals[glob]}")
         dest += ".64"
         return dest
 
     def to_reg(uop:UOp):
-      var = vars[uop]
+      var = vals[uop]
       if "R" in var: return var
-      vars[uop] = dest = new_reg()
+      vals[uop] = dest = new_reg()
       queue(uop, ControlCode(), f"MOV {dest}, {var}")
       return dest
 
-    vars[0] = "RZ"
-    vars[float("inf")] = "INF"
-    vars[float("-inf")] = "-INF"
+    vals[0] = "RZ"
+    vals[float("inf")] = "INF"
+    vals[float("-inf")] = "-INF"
     queue(None, ControlCode(), "ULDC.64 UR4, c[0x0][0x118]") # load explicit memory desc
     for u in uops:
       print(u)
       uop, dtype, vin, arg = u.uop, u.dtype, u.vin, u.arg
       if uop is UOps.SPECIAL:
-        vars[u] = dest = new_reg()
+        vals[u] = dest = new_reg()
         src = (self.gid if arg[1][:3] == "gid" else self.tid)[arg[0]]
         queue(u, ControlCode(write=new_barrier()), f"S2R {dest}, {src}")
       elif uop is UOps.CONST:
-        if arg in vars:
-          vars[u] = vars[arg]
+        if arg in vals:
+          vals[u] = vals[arg]
         else:
-          vars[u] = render_val(arg, dtype)
+          vals[u] = render_val(arg, dtype)
       elif uop is UOps.DEFINE_GLOBAL:
-        vars[u] = const_addr(u)
+        vals[u] = const_addr(u)
       elif uop is UOps.LOAD:
         print(f"{[v.dtype for v in vin]=}")
         if vin[0].uop is UOps.DEFINE_GLOBAL:
-          pred = vars[vin[2]] if len(vin) == 4 else None
+          pred = vals[vin[2]] if len(vin) == 4 else None
           glob_addr = render_glob_addr(vin[1], vin[0], pred=pred)
-          vars[u] = dest = new_reg(dtype.itemsize > 4)
+          vals[u] = dest = new_reg(dtype.itemsize)
           queue(u, ControlCode(write=new_barrier()), f"{f'@{pred} ' if pred else ''}LDG.E {dest}, desc[UR4][{glob_addr}]") # explicit memory desc
           if pred:
-            queue(u, ControlCode(), f"@!{pred} MOV {dest}, {vars[vin[3]]}")
+            queue(u, ControlCode(), f"@!{pred} MOV {dest}, {vals[vin[3]]}")
         else:
           raise NotImplementedError
       elif uop is UOps.STORE:
@@ -231,18 +232,18 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif uop is UOps.ALU:
-        srcs = [vars[v] for v in vin]
+        srcs = [vals[v] for v in vin]
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
           assert 2 <= len(srcs) <= 3, f"too many arguments for bool mul: {len(srcs)}"
-          vars[u] = dest = new_pred()
+          vals[u] = dest = new_pred()
           if len(srcs) == 2: srcs.append("PT")
           queue(u, ControlCode(), f"PLOP3.LUT {dest}, PT, {', '.join(srcs)}, {', '.join(self.plop['&'])}")
         elif arg is BinaryOps.MUL or arg is BinaryOps.ADD:
           assert len(srcs) == 2
-          vars[u] = dest = new_reg()
+          vals[u] = dest = new_reg()
           if dtype is dtypes.int:
             if arg is BinaryOps.MUL:
-              srcs.append(vars[0])
+              srcs.append(vals[0])
             elif arg is BinaryOps.ADD:
               srcs[1:1] = [unity()]
             else:
@@ -250,22 +251,22 @@ class SASSRenderer(Renderer):
             queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
           else:
             assert len(srcs) == 2
-            vars[u] = dest = new_reg()
+            vals[u] = dest = new_reg()
             queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
         elif arg is BinaryOps.MAX:
           assert all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in min/max: {dt}"
-          vars[u] = dest = new_reg(vin[0].dtype.itemsize > 4)
-          srcs = [vars[v] for v in vin]
+          vals[u] = dest = new_reg(vin[0].dtype.itemsize)
+          srcs = [vals[v] for v in vin]
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}"
           queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}, !PT")
         elif arg is BinaryOps.CMPLT:
-          vars[u] = dest = new_pred()
+          vals[u] = dest = new_pred()
           srcs = [to_reg(v) for v in vin]
           queue(u, ControlCode(), f"ISETP.LT.AND {dest}, PT, {', '.join(srcs)}, PT")
         elif arg is TernaryOps.WHERE:
-          vars[u] = dest = new_reg()
-          queue(None, ControlCode(), f"MOV {dest}, {vars[vin[2]]}")
-          queue(u, ControlCode(), f"@{vars[vin[0]]} MOV {dest}, {vars[vin[1]]}")
+          vals[u] = dest = new_reg()
+          queue(None, ControlCode(), f"MOV {dest}, {vals[vin[2]]}")
+          queue(u, ControlCode(), f"@{vals[vin[0]]} MOV {dest}, {vals[vin[1]]}")
         else:
           raise NotImplementedError
       else:
@@ -278,4 +279,3 @@ class SASSRenderer(Renderer):
 sass_matcher = PatternMatcher([
 
 ])
-# 5, 6, 7, 9, 10, 11

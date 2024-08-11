@@ -49,14 +49,17 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
+  impl = [5, 6, 7, 9, 10, 11]
   for num,ast in list(enumerate(ast_strs))[getenv("START", 0):getenv("END", len(ast_strs))]:
+    if getenv("TEST", 0) and num not in impl:
+      continue
     # cuda compile
     dev.compiler = CUDACompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=dev.renderer)
     lin.hand_coded_optimizations()
     cuda_prg = CompiledRunner(lin.to_program())
 
-    # sass compile
+    # sass compile # TODO: keep trying
     # try:
     dev.compiler = SASSCompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=sass)
@@ -108,3 +111,8 @@ if __name__ == "__main__":
 
   with open("results.json", "w") as f:
     json.dump(result, f)
+
+  print(f"{len(result["success"])=}")
+  print(f"{result["compile_failure"]=}")
+  print(f"{result["runtime_failure"]=}")
+  print(f"{result["mismatch"]=}")
