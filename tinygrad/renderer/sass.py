@@ -146,17 +146,23 @@ class SASSRenderer(Renderer):
     def is_contiguous(srcs:List[str]):
       return all(s[0] == "R" for s in srcs) and all(int(srcs[i][1]) - int(srcs[0][1]) == i for i in range(len(srcs)))
 
+    def wait_on_barriers(uop:UOp, ctrl:ControlCode):
+      for oper in uop.vin:
+        if not oper in ctrl_codes:
+          wait_on_barriers(oper, ctrl)
+        else:
+          for c in ctrl_codes[oper]:
+            if c.write in active_barriers:
+              ctrl.wait.append(c.write)
+              active_barriers.remove(c.write)
+              if not active_barriers:
+                return
+
     addr = 0
     def queue(uop:UOp, ctrl:ControlCode, ins:str):
       nonlocal addr, active_barriers
-      if uop:
-        for oper in uop.vin:
-          if oper in ctrl_codes:
-            for c in ctrl_codes[oper]:
-              if c.write in active_barriers:
-                ctrl.wait.append(c.write)
-      for i in ctrl.wait:
-        active_barriers.remove(i)
+      if uop and active_barriers:
+        wait_on_barriers(uop, ctrl)
       ctrl.yield_ |= ctrl.stall >= 12 # TODO: is it 12?
       ins += " ;"
       kernel.append((ctrl, addr, ins))
@@ -231,12 +237,13 @@ class SASSRenderer(Renderer):
       elif uop is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
       elif uop is UOps.LOAD:
-        print(f"{[v.dtype for v in vin]=}")
         if vin[0].uop is UOps.DEFINE_GLOBAL:
           pred = vals[vin[2]] if len(vin) == 4 else None
           glob_addr = render_glob_addr(vin[1], vin[0], pred=pred)
           vals[u] = dest = new_reg(dtype.itemsize)
-          queue(u, ControlCode(write=new_barrier()), f"{f'@{pred} ' if pred else ''}LDG.E {dest}, desc[UR4][{glob_addr}]") # explicit memory desc
+          n = (dtype.itemsize + 3) // 4
+          size_mod = f".{n*32}" if n > 1 else ''
+          queue(u, ControlCode(write=new_barrier()), f"{f'@{pred} ' if pred else ''}LDG.E{size_mod} {dest}, desc[UR4][{glob_addr}]") # explicit memory desc
           if pred:
             render_mov(u, dest, vals[vin[3]], dtype, "!"+pred)
         else:
@@ -273,6 +280,10 @@ class SASSRenderer(Renderer):
           render_where(u, new_reg(dtype.itemsize), vals[vin[0]], render_val(1, dtype), render_val(0, dtype))
         else:
           raise NotImplementedError
+      elif uop is UOps.GEP:
+        src = vals[vin[0]]
+        assert src.startswith("R"), f"GEP only supported on registers. src: {src}"
+        vals[u] = f"R{int(src[1:]) + arg}"
       elif uop is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
