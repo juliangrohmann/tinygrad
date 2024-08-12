@@ -352,8 +352,10 @@ class SASSRenderer(Renderer):
               srcs[1:1] = [unity()]
             else:
               raise NotImplementedError
-          else:
+          elif not srcs[0].startswith("R"):
             assert len(srcs) == 2
+            if srcs[1].startswith("R"): srcs = srcs[::-1]
+            else: srcs[0] = to_reg(vin[0])
           if arg is BinaryOps.SUB:
             srcs[-1] = f"-{srcs[-1]}"
           queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
