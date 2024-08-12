@@ -20,9 +20,11 @@ def info(bufs_cuda, bufs_sass):
     cuda_vals, sass_vals = [np.frombuffer(buf.as_buffer(), dtype=buf.dtype.np) for buf in [cuda, sass]]
     mask = ~(np.isnan(cuda_vals) & np.isnan(sass_vals))
     b_info["cuda"], b_info["sass"] = cuda_vals.tolist(), sass_vals.tolist()
-    if cuda_vals[mask].shape == sass_vals[mask].shape and len(cuda_vals[mask]) > 0:
+    try:
       b_info["sum_diff"] = np.abs(np.sum(cuda_vals[mask] - sass_vals[mask])).item()
       b_info["max_diff"] = np.max(np.abs(cuda_vals[mask] - sass_vals[mask])).item()
+    except Exception as e:
+      pass
     ret.append(b_info)
   return ret
 
@@ -49,10 +51,11 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [2, 5, 6, 7, 9, 10, 11, 12, 13, 16, 17, 19]
+  impl = [2, 5, 6, 7, 9, 10, 11, 12, 13, 16, 17, 19, 21, 23, 28, 29]
   for num,ast in list(enumerate(ast_strs))[getenv("START", 0):getenv("END", len(ast_strs))]:
     if getenv("TEST", 0) and num not in impl:
       continue
+
     # cuda compile
     dev.compiler = CUDACompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=dev.renderer)
@@ -65,7 +68,8 @@ if __name__ == "__main__":
     lin = ast_str_to_lin(ast, opts=sass)
     lin.hand_coded_optimizations()
     raw_prg = lin.to_program()
-    sass_prg = CompiledRunner(raw_prg)
+    if not debug_src:
+      sass_prg = CompiledRunner(raw_prg)
 
     # except Exception as e:
     #   print(e)

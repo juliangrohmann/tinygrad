@@ -24,6 +24,7 @@ def render_val(x, dtype):
     form = formats[dtype] if dtype in formats else "f"
     return "0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{form}", x))
   else:
+    print(dtype)
     raise NotImplementedError
 
 def attach_sections(sass_src:str, cuda_src:str, reg_cnt:int): # TODO remove HACK: ELF headers/sections attached from nvcc compile
@@ -79,7 +80,12 @@ class SASSRenderer(Renderer):
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
   plop = {
-    "&": ("0x80", "0x0")
+    "&": ("0x80", "0x0"), # a & b & c
+    "^": ("0x28", "0x0",) # (a ^ b) & c
+  }
+  setp_mod = {
+    BinaryOps.CMPLT: "LT",
+    BinaryOps.CMPNE: "NE"
   }
   alu = {
     BinaryOps.ADD: {
@@ -120,7 +126,7 @@ class SASSRenderer(Renderer):
     reg_cnt = 0
     def new_reg(byte_size:int=4):
       nonlocal reg_cnt
-      n = (byte_size + 3) // 4
+      n = nregs(byte_size)
       reg = n * ((reg_cnt + n - 1) // n) # ceil
       reg_cnt = reg + n
       assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new register: all registers filled" # TODO: remove & optim regs after render
@@ -152,6 +158,9 @@ class SASSRenderer(Renderer):
     def is_contiguous(srcs:List[str]):
       return all(s[0] == "R" for s in srcs) and all(int(srcs[i][1]) - int(srcs[0][1]) == i for i in range(len(srcs)))
 
+    def nregs(byte_size):
+      return (byte_size + 3) // 4
+
     def wait_on_barriers(uop:UOp, ctrl:ControlCode):
       for oper in uop.vin:
         if not oper in ctrl_codes:
@@ -178,11 +187,17 @@ class SASSRenderer(Renderer):
     def const_addr(uop:UOp, offset=0):
       return f"c[0x0][{hex(param_cbank + uop.arg[0] * 8 + offset)}]"
 
+    def to_var(uop:UOp):
+      return var if (var := vals[uop]).startswith("R") or var.startswith("P") else to_reg(uop) # TODO: move to pred instead if PT/!PT
+
     def to_reg(uop:UOp):
       var = vals[uop]
-      if "R" in var: return var
+      if var.startswith("R"): return var
       vals[uop] = dest = new_reg()
-      render_mov(uop, dest, var, uop.dtype)
+      if var.startswith("P"):
+        render_where(uop, dest, var, "0x1", vals[0])
+      else:
+        render_mov(uop, dest, var, uop.dtype)
       return dest
 
     def render_glob_addr(idx:UOp, glob:UOp, pred=None):
@@ -196,7 +211,7 @@ class SASSRenderer(Renderer):
           vals[glob] = glob_addr
         glob_addr += ".64"
         if idx and idx.arg != 0:
-          n = (glob.dtype.itemsize + 3) // 4
+          n = nregs(glob.dtype.itemsize)
           offset = hex(idx.arg * n * 4) if idx.uop == UOps.CONST else vals[idx]
           glob_addr += f"+{offset}"
         return glob_addr
@@ -215,7 +230,7 @@ class SASSRenderer(Renderer):
         vals[uop] = dest
       if dtypes.is_float(dtype) and not src.startswith("R") and not src.startswith("0x"):
         src = render_val(float(src), dtype)
-      n = (dtype.itemsize + 3) // 4
+      n = nregs(dtype.itemsize)
       queue(uop, ControlCode(), f"{f'@{pred} ' if pred else ''}MOV{f'.{n*32}' if n > 1 else ''} {dest}, {src}")
 
     def render_where(uop, dest, pred, val_t, val_f):
@@ -264,6 +279,8 @@ class SASSRenderer(Renderer):
           vals[u] = vals[arg]
         elif dtypes.is_float(dtype):
           vals[u] = str(arg)
+        elif dtype is dtypes.bool:
+          vals[u] = "PT" if arg else "!PT"
         else:
           vals[u] = render_val(arg, dtype)
       elif uop is UOps.DEFINE_GLOBAL:
@@ -273,7 +290,7 @@ class SASSRenderer(Renderer):
           pred = vals[vin[2]] if len(vin) == 4 else None
           glob_addr = render_glob_addr(vin[1], vin[0], pred=pred)
           vals[u] = dest = new_reg(dtype.itemsize)
-          n = (dtype.itemsize + 3) // 4
+          n = nregs(dtype.itemsize)
           size_mod = f".{n*32}" if n > 1 else ''
           queue(u, ControlCode(write=new_barrier()), f"{f'@{pred} ' if pred else ''}LDG.E{size_mod} {dest}, desc[UR4][{glob_addr}]") # explicit memory desc
           if pred:
@@ -301,7 +318,7 @@ class SASSRenderer(Renderer):
           if not is_contiguous(srcs):
             dest = new_reg(dtype.itemsize)
             print(f"{dtype.itemsize=}")
-            n = (vin[0].dtype.itemsize + 3) // 4
+            n = nregs(vin[0].dtype.itemsize)
             idx = int(dest[1:])
             for s in srcs:
               render_mov(u, f"R{idx}", s, vin[0].dtype)
@@ -319,13 +336,14 @@ class SASSRenderer(Renderer):
         vals[u] = f"R{int(src[1:]) + arg}"
       elif uop is UOps.ALU:
         srcs = [vals[v] for v in vin]
+        assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}"
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
           assert 2 <= len(srcs) <= 3, f"too many arguments for bool mul: {len(srcs)}"
           vals[u] = dest = new_pred()
           if len(srcs) == 2: srcs.append("PT")
           queue(u, ControlCode(), f"PLOP3.LUT {dest}, PT, {', '.join(srcs)}, {', '.join(self.plop['&'])}")
         elif arg in [BinaryOps.MUL, BinaryOps.ADD, BinaryOps.SUB]:
-          assert len(srcs) == 2
+          assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}"
           vals[u] = dest = new_reg()
           if dtype is dtypes.int:
             if arg is BinaryOps.MUL:
@@ -340,15 +358,25 @@ class SASSRenderer(Renderer):
             srcs[-1] = f"-{srcs[-1]}"
           queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
         elif arg is BinaryOps.MAX:
-          assert all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in min/max: {dt}"
           vals[u] = dest = new_reg(vin[0].dtype.itemsize)
           srcs = [vals[v] for v in vin]
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}"
           queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}, !PT")
-        elif arg is BinaryOps.CMPLT:
-          vals[u] = dest = new_pred()
-          srcs = [to_reg(v) for v in vin]
-          queue(u, ControlCode(), f"ISETP.LT.AND {dest}, PT, {', '.join(srcs)}, PT")
+        elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
+          assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}"
+          srcs = [to_var(v) for v in vin]
+          if dtypes.is_int(vin[0].dtype) or dtypes.is_float(vin[0].dtype):
+            vals[u] = dest = new_pred()
+            type_mod = f".U32" if dtypes.is_unsigned(dtype) else ""
+            queue(u, ControlCode(), f"ISETP.{self.setp_mod[arg]}{type_mod}.AND {dest}, PT, {', '.join(srcs)}, PT")
+            for i in range(1, nregs(vin[0].dtype.itemsize)): # 64bit+ (long)
+              srcs = [f"{s[0]}{int(s[1:]) + i}" for s in srcs]
+              queue(u, ControlCode(), f"ISETP.{self.setp_mod[arg]}{type_mod}.AND.EX {dest}, PT, {', '.join(srcs)}, PT, {dest}")
+          elif vin[0].dtype is dtypes.bool:
+            vals[u] = dest = new_pred()
+            queue(u, ControlCode(), f"PLOP3.LUT {dest}, PT, {', '.join(srcs)}, PT, {', '.join(self.plop['^'])}")
+          else:
+            raise NotImplementedError
         elif arg is TernaryOps.WHERE:
           render_where(u, new_reg(dtype.itemsize), *[vals[v] for v in vin])
         elif arg is UnaryOps.LOG2:
@@ -365,5 +393,10 @@ class SASSRenderer(Renderer):
     return attach_sections(sass_src, self.cuda_renderer.render(name, uops), reg_cnt)
 
 sass_matcher = PatternMatcher([
-
+    # Shift left/right for int mul/div by 2
+    # A, B -> ADD, C -> ADD               ===     A, B, C -> ADD3
+    # A, B -> MUL, C -> ADD               ===     A, B, C -> FMA
+    # A, B -> CMPNE, CONST True -> CMPNE  ===     A, B -> CMPEQ
+    # A, B -> CMP, C -> MUL               ===     A, B, C -> CMP.AND
+    # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
 ])
