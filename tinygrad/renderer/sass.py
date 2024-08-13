@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
-from typing import DefaultDict, Dict, List, Union, Optional, cast, Callable
+from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
 from tinygrad.helpers import getenv, all_same
 from tinygrad.codegen.linearizer import UOps, UOp
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
@@ -16,7 +16,15 @@ from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
 from CuAsm import CubinFile, CuAsmParser
 
-def render_val(x, dtype):
+def render_value(x, dtype):
+  if dtypes.is_float(dtype):
+    return str(x)
+  elif dtype is dtypes.bool:
+    return "PT" if x else "!PT"
+  else:
+    return render_binary(x, dtype)
+
+def render_binary(x, dtype):
   if dtypes.is_int(dtype):
     return hex(x)
   elif dtypes.is_float(dtype):
@@ -24,8 +32,17 @@ def render_val(x, dtype):
     form = formats[dtype] if dtype in formats else "f"
     return "0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{form}", x))
   else:
-    print(dtype)
     raise NotImplementedError
+
+def const_addr(uop:UOp, offset=0):
+  param_cbank = int("160", 16) # TODO: make variable
+  return f"c[0x0][{hex(param_cbank + uop.arg[0] * 8 + offset)}]"
+
+def is_contiguous(srcs:List[Any]):
+  return all(isinstance(s, Register) and s.idx - srcs[0].idx == i for i,s in enumerate(srcs))
+
+def nregs(byte_size):
+  return (byte_size + 3) // 4
 
 def attach_sections(sass_src:str, cuda_src:str, reg_cnt:int): # TODO remove HACK: ELF headers/sections attached from nvcc compile
   fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(cuda_src.encode()).hexdigest()}").as_posix()
@@ -54,6 +71,19 @@ def attach_sections(sass_src:str, cuda_src:str, reg_cnt:int): # TODO remove HACK
   return cuasm
 
 @dataclass
+class Register:
+  idx: int
+  size: int = 1
+  pred: bool = False
+  uniform: bool = False
+  negated: bool = False
+  def render(self):
+    prefix = '-!'[self.pred] if self.negated else ''
+    return f"{prefix}{'U' if self.uniform else ''}{'RP'[self.pred]}{self.idx if self.idx != -1 else 'Z'}"
+  def offset(self, n): return Register(self.idx + n, size=self.size, pred=self.pred, uniform=self.uniform, negated=self.negated)
+  def negate(self): return Register(self.idx, size=self.size, pred=self.pred, uniform=self.uniform, negated=not self.negated)
+
+@dataclass
 class ControlCode:
   wait: List[int] = field(default_factory=list)
   read: Optional[int] = None
@@ -63,7 +93,22 @@ class ControlCode:
   def render(self):
     bs = ''.join(['-' if b not in self.wait else str(b) for b in range(6)])
     rs, ws = [v if v is not None else '-' for v in [self.read, self.write]]
-    return f"[B{bs}:R{rs}:W{ws}:{'Y' if self.yield_ else '-'}:S{self.stall}]"
+    return f"[B{bs}:R{rs}:W{ws}:{'-Y'[self.yield_]}:S{self.stall}]"
+
+@dataclass
+class Instruction:
+  op: str
+  dest: Register
+  srcs: List[Union[Register, str]]
+  ctrl: ControlCode = field(default_factory=ControlCode)
+  mods: List[str] = field(default_factory=list)
+  pred: Register = None
+  def render(self):
+    assert self.dest is None or isinstance(self.dest, Register), f"{self.op=}, {self.dest=}"
+    assert all(isinstance(s, Register) or isinstance(s, str) for s in self.srcs), f"bad src: {self.op=}, {self.srcs=}"
+    operands = ', '.join(([self.dest.render()] if self.dest else []) + [s.render() if isinstance(s, Register) else s for s in self.srcs])
+    ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join(self.mods)} {operands}"
+    return f"{' '*6}{self.ctrl.render()}{' '*9}/*ADDR*/{' '*19}{ins} ;"
 
 class SASSRenderer(Renderer):
   device = "CUDA"
@@ -113,35 +158,71 @@ class SASSRenderer(Renderer):
     }
   }
 
+  def render_mov(self, dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None):
+    if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"):
+      src = render_binary(float(src), dtype)
+    ins = Instruction("MOV", dest, [src], pred=pred)
+    if(n := nregs(dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
+    return ins
+
+  def render_where(self, dest, pred:Union[Register, str], src_t:Union[Register,str], src_f:Union[Register,str], dtype:DType):
+    return [self.render_mov(dest, src_f, dtype), self.render_mov(dest, src_t, dtype, pred=pred)]
+
+  def render_log2(self, dest:Register, src:Register, pred:Register, *bufs:List[Register]):
+    assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
+    ins = [Instruction("FSETP", pred,    ["PT", src, "1.175494350822287508e-38", "PT"], mods=[".GEU", ".AND"]),
+           Instruction("FMUL",  src,     [src, "8388608"],                              pred=pred.negate()),
+           Instruction("IADD3", dest,    [src, "-0x3f3504f3", "RZ"]),
+           Instruction("LOP3",  bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"],     mods=[".LUT"]),
+           Instruction("IADD3", dest,    [src, bufs[0].negate(), "RZ"]),
+           Instruction("I2FP",  bufs[0], [bufs[0]], mods=[".F32", ".S32"]),
+           Instruction("FADD",  bufs[1], [dest, "-1"]),
+           Instruction("FSEL",  dest,    ["RZ", "-23", pred]),
+           Instruction("ISETP", pred,    ["PT", src, "0x7f800000", "PT"],               mods=[".GE", ".U32", ".AND"]),
+           Instruction("MOV",   bufs[2], ["0x3dc6b27f"]),
+           Instruction("FFMA",  bufs[3], [bufs[1], bufs[2], "-0.16845393180847167969"])]
+    params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
+              "0.28857114911079406738", "-0.36067417263984680176", "0.48089820146560668945", "-0.72134751081466674805"]
+    for p in params: ins.append(Instruction("FFMA", bufs[3], [bufs[1], bufs[3], p]))
+    for _ in range(2): ins.append(Instruction("FMUL", bufs[3], [bufs[1], bufs[3]]))
+    ins.extend([Instruction("FFMA",  bufs[3], [bufs[1], "1.4426950216293334961", bufs[3]]),
+                Instruction("FFMA",  dest,    [bufs[0], "1.1920928955078125e-07", dest]),
+                Instruction("MOV",   bufs[0], ["0x7f800000"],          pred=pred),
+                Instruction("FADD",  dest,    [dest, bufs[3]]),
+                Instruction("FFMA",  dest,    [src, bufs[0], "+INF"],  pred=pred),
+                Instruction("FSETP", pred,    ["PT", src, "RZ", "PT"], mods=[".NEU", ".AND"]),
+                Instruction("FSEL",  dest,    [dest, "-INF",           pred])])
+    return ins
+
   def render(self, name:str, uops:UOpGraph) -> str:
     uops.linearize(sass_matcher)
     attach_sections("", self.cuda_renderer.render(name, uops), 0) # TODO: remove (for writing debug src only)
 
-    kernel:List[Tuple[ControlCode, int, str]] = []
+    kernel:List[Instruction] = []
     ctrl_codes:Dict[UOp, List[ControlCode]] = defaultdict(list)
-    vals:Dict[Any, str] = {}
-    param_cbank = int("160", 16) # TODO: make variable
-    pred_cap = 251
+    vals:Dict[Any, Union[Register,str]] = {}
 
+    reg_cap = 251 # TODO: remove
     reg_cnt = 0
-    def new_reg(byte_size:int=4):
+    def new_reg(byte_size:int=4, uniform:bool=False) -> Register:
       nonlocal reg_cnt
       n = nregs(byte_size)
-      reg = n * ((reg_cnt + n - 1) // n) # ceil
-      reg_cnt = reg + n
-      assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new register: all registers filled" # TODO: remove & optim regs after render
-      return f"R{reg}"
+      idx = n * ((reg_cnt + n - 1) // n) # ceil
+      reg_cnt = idx + n
+      assert reg_cnt <= reg_cap, "trying to assign to new register: all registers filled" # TODO: remove & optim regs after render
+      return Register(idx, size=n, uniform=uniform)
 
+    pred_cap = 6 # TODO: remove
     pred_cnt = 0
-    def new_pred():
+    def new_pred() -> Register:
       nonlocal pred_cnt
-      pred = pred_cnt
+      idx = pred_cnt
       pred_cnt += 1
-      assert reg_cnt + pred_cnt <= pred_cap, "trying to assign to new predicate: all registers filled" # TODO: remove & optim regs after render
-      return f"P{pred}"
+      assert pred_cnt <= pred_cap, "trying to assign to new predicate: all registers filled" # TODO: remove & optim regs after render
+      return Register(idx, pred=True)
 
     active_barriers = []
-    def new_barrier():
+    def new_barrier() -> int:
       nonlocal active_barriers
       for i in range(6):
         if not i in active_barriers:
@@ -149,249 +230,157 @@ class SASSRenderer(Renderer):
           return i
       return active_barriers[0]
 
-    def unity():
-      if not 1 in vals:
-        vals[1] = dest = new_reg()
-        render_mov(None, dest, "0x1", dtypes.int)
+    def unity() -> Register:
+      if not 1 in vals: vals[1] = queue(None, self.render_mov(new_reg(), "0x1", dtypes.int))
       return vals[1]
-
-    def is_contiguous(srcs:List[str]):
-      return all(s[0] == "R" for s in srcs) and all(int(srcs[i][1]) - int(srcs[0][1]) == i for i in range(len(srcs)))
-
-    def nregs(byte_size):
-      return (byte_size + 3) // 4
 
     def wait_on_barriers(uop:UOp, ctrl:ControlCode):
       for oper in uop.vin:
         if not oper in ctrl_codes:
           wait_on_barriers(oper, ctrl)
         else:
-          for c in ctrl_codes[oper]:
-            if c.write in active_barriers:
-              ctrl.wait.append(c.write)
-              active_barriers.remove(c.write)
-              if not active_barriers:
-                return
+          for bidx in [c.write for c in ctrl_codes[oper] if c.write is not None]:
+            if not bidx in active_barriers: continue
+            ctrl.wait.append(bidx)
+            active_barriers.remove(bidx)
+            if not active_barriers: return
 
-    addr = 0
-    def queue(uop:UOp, ctrl:ControlCode, ins:str):
-      nonlocal addr, active_barriers
-      if uop and active_barriers:
-        wait_on_barriers(uop, ctrl)
-      ctrl.yield_ |= ctrl.stall >= 12 # TODO: is it 12?
-      ins += " ;"
-      kernel.append((ctrl, addr, ins))
-      if uop: ctrl_codes[uop].append(ctrl)
-      addr += 16
+    def queue(uop:UOp, instrs:Union[List[Instruction], Instruction]) -> Register:
+      if not isinstance(instrs, list): instrs = [instrs]
+      nonlocal active_barriers
+      for ins in instrs:
+        if uop and active_barriers:
+          wait_on_barriers(uop, ins.ctrl)
+        ctrl_codes[uop].append(ins.ctrl)
+        ins.ctrl.yield_ |= ins.ctrl.stall >= 12 # TODO: is it 12?
+        kernel.append(ins)
+      return instrs[-1].dest
 
-    def const_addr(uop:UOp, offset=0):
-      return f"c[0x0][{hex(param_cbank + uop.arg[0] * 8 + offset)}]"
+    def to_var(uop:UOp) -> Union[Register, str]:
+      if isinstance(var := vals[uop], Register) or "P" in var: return var
+      return to_pred(uop) if var.pred else to_reg(uop) # TODO: move to pred instead if PT/!PT?
 
-    def to_var(uop:UOp):
-      return var if (var := vals[uop]).startswith("R") or var.startswith("P") else to_reg(uop) # TODO: move to pred instead if PT/!PT
+    def to_reg(uop:UOp) -> Register:
+      if isinstance(var := vals[uop], Register) and not var.pred: return var
+      vals[uop] = d = new_reg()
+      return queue(uop, self.render_where(d, var, "0x1", vals[0], uop.dtype) if isinstance(var, Register) else self.render_mov(d, var, uop.dtype))
 
-    def to_reg(uop:UOp):
-      var = vals[uop]
-      if var.startswith("R"): return var
-      vals[uop] = dest = new_reg()
-      if var.startswith("P"):
-        render_where(uop, dest, var, "0x1", vals[0])
-      else:
-        render_mov(uop, dest, var, uop.dtype)
-      return dest
-
-    def render_glob_addr(idx:UOp, glob:UOp, pred=None):
+    def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
       if idx.uop is UOps.CONST:
         glob_addr = vals[glob]
-        if "R" not in glob_addr:
-          glob_addr = new_reg(byte_size=8)
-          queue(None, ControlCode(), f"IMAD.MOV.U32 {glob_addr}, RZ, RZ, {const_addr(glob)}")
-          addr_ext = f"R{int(glob_addr[1:]) + 1}"
-          queue(None, ControlCode(), f"IMAD.MOV.U32 {addr_ext}, RZ, RZ, {const_addr(glob, offset=4)}")
-          vals[glob] = glob_addr
-        glob_addr += ".64"
-        if idx and idx.arg != 0:
-          n = nregs(glob.dtype.itemsize)
-          offset = hex(idx.arg * n * 4) if idx.uop == UOps.CONST else vals[idx]
-          glob_addr += f"+{offset}"
-        return glob_addr
+        if not isinstance(glob_addr, Register):
+          vals[glob] = glob_addr = new_reg(byte_size=8)
+          queue(glob, Instruction("IMAD", glob_addr, ["RZ", "RZ", const_addr(glob)], mods=[".MOV", ".U32"]))
+          queue(glob, Instruction("IMAD", glob_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=[".MOV", ".U32"]))
+        addr_str = glob_addr.render() + ".64"
+        if idx.arg != 0:
+          addr_str += f"+{hex(idx.arg * nregs(glob.dtype.itemsize) * 4)}"
       else:
         if glob.dtype.itemsize not in vals:
-          vals[glob.dtype.itemsize] = dest = new_reg()
-          render_mov(None, dest, hex(glob.dtype.itemsize), dtypes.int)
-        dest = new_reg(byte_size=8)
-        prefix = f"@{pred} " if pred else ""
-        queue(None, ControlCode(), prefix + f"IMAD.WIDE {dest}, {vals[idx]}, {vals[glob.dtype.itemsize]}, {vals[glob]}")
-        dest += ".64"
-        return dest
+          vals[glob.dtype.itemsize] = queue(glob, self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
+        glob_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=".WIDE", pred=pred))
+        addr_str = glob_addr.render() + ".64"
+      return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
 
-    def render_mov(uop, dest, src, dtype, pred=None):
-      if uop:
-        vals[uop] = dest
-      if dtypes.is_float(dtype) and not src.startswith("R") and not src.startswith("0x"):
-        src = render_val(float(src), dtype)
-      n = nregs(dtype.itemsize)
-      queue(uop, ControlCode(), f"{f'@{pred} ' if pred else ''}MOV{f'.{n*32}' if n > 1 else ''} {dest}, {src}")
-
-    def render_where(uop, dest, pred, val_t, val_f):
-      render_mov(uop, dest, val_f, uop.dtype)
-      render_mov(uop, dest, val_t, uop.dtype, pred)
-
-    def render_log2(uop:UOp, dest:str, src:str):
-      p0 = new_pred()
-      buf0, buf1, buf2, buf3 = [new_reg() for _ in range(4)]
-      queue(uop, ControlCode(), f"FSETP.GEU.AND {p0}, PT, {src}, 1.175494350822287508e-38, PT")
-      queue(uop, ControlCode(), f"@!{p0} FMUL {src}, {src}, 8388608")
-      queue(uop, ControlCode(), f"IADD3 {dest}, {src}, -0x3f3504f3, RZ")
-      queue(uop, ControlCode(), f"LOP3.LUT {buf0}, {dest}, 0xff800000, RZ, 0xc0, !PT")
-      queue(uop, ControlCode(), f"IADD3 {dest}, {src}, -{buf0}, RZ")
-      queue(uop, ControlCode(), f"I2FP.F32.S32 {buf0}, {buf0}")
-      queue(uop, ControlCode(), f"FADD {buf1}, {dest}, -1")
-      queue(uop, ControlCode(), f"FSEL {dest}, RZ, -23, {p0}")
-      queue(uop, ControlCode(), f"ISETP.GE.U32.AND {p0}, PT, {src}, 0x7f800000, PT")
-      queue(uop, ControlCode(), f"MOV {buf2}, 0x3dc6b27f")
-      queue(uop, ControlCode(), f"FFMA {buf3}, {buf1}, {buf2}, -0.16845393180847167969")
-      params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
-                "0.28857114911079406738", "-0.36067417263984680176", "0.48089820146560668945", "-0.72134751081466674805"]
-      for p in params: queue(uop, ControlCode(), f"FFMA {buf3}, {buf1}, {buf3}, {p}")
-      for _ in range(2): queue(uop, ControlCode(), f"FMUL {buf3}, {buf1}, {buf3}")
-      queue(uop, ControlCode(), f"FFMA {buf3}, {buf1}, 1.4426950216293334961, {buf3}")
-      queue(uop, ControlCode(), f"FFMA {dest}, {buf0}, 1.1920928955078125e-07, {dest}")
-      queue(uop, ControlCode(), f"@{p0} MOV {buf0}, 0x7f800000")
-      queue(uop, ControlCode(), f"FADD {dest}, {dest}, {buf3}")
-      queue(uop, ControlCode(), f"@{p0} FFMA {dest}, {src}, {buf0}, +INF")
-      queue(uop, ControlCode(), f"FSETP.NEU.AND {p0}, PT, {src}, RZ, PT")
-      queue(uop, ControlCode(), f"FSEL {dest}, {dest}, -INF, {p0}")
-
-    vals[0] = "RZ"
+    vals[0] = Register(-1)
     vals[float("inf")] = "INF"
     vals[float("-inf")] = "-INF"
-    queue(None, ControlCode(), "ULDC.64 UR4, c[0x0][0x118]") # load explicit memory desc
+    vals["DESC"] = queue(None, Instruction("ULDC", Register(idx=4, uniform=True), ["c[0x0][0x118]"], mods=[".64"])) # load explicit memory descriptor
+
     for u in uops:
-      print(u)
       uop, dtype, vin, arg = u.uop, u.dtype, u.vin, u.arg
       if uop is UOps.SPECIAL:
-        vals[u] = dest = new_reg()
-        src = (self.gid if arg[1][:3] == "gid" else self.tid)[arg[0]]
-        queue(u, ControlCode(write=new_barrier()), f"S2R {dest}, {src}")
+        vals[u] = queue(u, ins := Instruction("S2R", new_reg(), [(self.gid if arg[1][:3] == "gid" else self.tid)[arg[0]]]))
+        ins.ctrl.write = new_barrier()
       elif uop is UOps.CONST:
-        if arg in vals:
-          vals[u] = vals[arg]
-        elif dtypes.is_float(dtype):
-          vals[u] = str(arg)
-        elif dtype is dtypes.bool:
-          vals[u] = "PT" if arg else "!PT"
-        else:
-          vals[u] = render_val(arg, dtype)
+        vals[u] = vals[arg] if arg in vals else render_value(arg, dtype)
       elif uop is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
       elif uop is UOps.LOAD:
         if vin[0].uop is UOps.DEFINE_GLOBAL:
-          pred = vals[vin[2]] if len(vin) == 4 else None
-          glob_addr = render_glob_addr(vin[1], vin[0], pred=pred)
-          vals[u] = dest = new_reg(dtype.itemsize)
-          n = nregs(dtype.itemsize)
-          size_mod = f".{n*32}" if n > 1 else ''
-          queue(u, ControlCode(write=new_barrier()), f"{f'@{pred} ' if pred else ''}LDG.E{size_mod} {dest}, desc[UR4][{glob_addr}]") # explicit memory desc
-          if pred:
-            render_mov(u, dest, vals[vin[3]], dtype, "!"+pred)
+          pred = vals[vin[2]] if len(vin) > 3 else None
+          vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=[".E"], pred=pred))
+          ins.ctrl.write = new_barrier()
+          if (n := nregs(dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
+          if pred: queue(u, self.render_mov(vals[u], vals[vin[3]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
       elif uop is UOps.STORE:
         if vin[0].uop is UOps.DEFINE_GLOBAL:
-          glob_addr = render_glob_addr(vin[1], vin[0])
-          mods = [".E"]
-          if vin[2].dtype.itemsize > 4: mods.append(f".{vin[2].dtype.itemsize * 8}")
-          queue(u, ControlCode(), f"STG{''.join(mods)} desc[UR4][{glob_addr}], {to_reg(vin[2])}")  # explicit memory descriptor
+          queue(u, ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=[".E"]))
+          if (n := nregs(vin[2].dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
         else:
           raise NotImplementedError
       elif uop is UOps.CAST:
         if dtypes.is_int(vin[0].dtype):
           if dtypes.is_float(dtype):
-            assert vin[0].dtype.count == 1, f"can't cast int to {vin[0].dtype}"
-            vals[u] = dest = new_reg(dtype.itemsize)
-            queue(u, ControlCode(), f"I2F.{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{vin[0].dtype.itemsize * 8} {dest}, {vals[u.vin[0]]}")
+            vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.vin[0]]]))
+            if (n := nregs(vin[0].dtype.itemsize)) > 1 or dtypes.is_unsigned(vin[0].dtype):
+              ins.mods.append(f".{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
           else:
             raise NotImplementedError
-        elif all(dtypes.is_float(v.dtype) for v in vin) and dtype.count > 1:
-          srcs = [vals[v] for v in vin]
-          if not is_contiguous(srcs):
-            dest = new_reg(dtype.itemsize)
-            print(f"{dtype.itemsize=}")
+        elif dtypes.is_float(vin[0].dtype) and dtype.count > 1:
+          if not is_contiguous(srcs := [vals[v] for v in vin]):
+            vals[u] = dest = new_reg(dtype.itemsize)
             n = nregs(vin[0].dtype.itemsize)
-            idx = int(dest[1:])
-            for s in srcs:
-              render_mov(u, f"R{idx}", s, vin[0].dtype)
-              idx += n
-            vals[u] = dest
+            queue(u, [self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)])
           else:
             vals[u] = srcs[0]
         elif vin[0].dtype is dtypes.bool:
-          render_where(u, new_reg(dtype.itemsize), vals[vin[0]], render_val(1, dtype), render_val(0, dtype))
+          vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]], render_binary(1, dtype), render_binary(0, dtype), dtype))
         else:
           raise NotImplementedError
       elif uop is UOps.GEP:
-        src = vals[vin[0]]
-        assert src.startswith("R"), f"GEP only supported on registers. src: {src}"
-        vals[u] = f"R{int(src[1:]) + arg}"
+        vals[u] = vals[vin[0]].offset(arg)
       elif uop is UOps.ALU:
         srcs = [vals[v] for v in vin]
-        assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}"
+        assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
-          assert 2 <= len(srcs) <= 3, f"too many arguments for bool mul: {len(srcs)}"
-          vals[u] = dest = new_pred()
           if len(srcs) == 2: srcs.append("PT")
-          queue(u, ControlCode(), f"PLOP3.LUT {dest}, PT, {', '.join(srcs)}, {', '.join(self.plop['&'])}")
+          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.plop['&']), mods=".LUT"))
         elif arg in [BinaryOps.MUL, BinaryOps.ADD, BinaryOps.SUB]:
-          assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}"
-          vals[u] = dest = new_reg()
+          assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           if dtype is dtypes.int:
-            if arg is BinaryOps.MUL:
-              srcs.append(vals[0])
-            elif arg in [BinaryOps.ADD, BinaryOps.SUB]:
-              srcs[1:1] = [unity()]
-            else:
-              raise NotImplementedError
-          elif not srcs[0].startswith("R"):
-            assert len(srcs) == 2
-            if srcs[1].startswith("R"): srcs = srcs[::-1]
+            if arg is BinaryOps.MUL: srcs.append(vals[0])
+            elif arg in [BinaryOps.ADD, BinaryOps.SUB]: srcs[1:1] = [unity()]
+            else: raise NotImplementedError
+          elif not isinstance(srcs[0], Register):
+            if isinstance(srcs[1], Register): srcs = srcs[::-1]
             else: srcs[0] = to_reg(vin[0])
-          if arg is BinaryOps.SUB:
-            srcs[-1] = f"-{srcs[-1]}"
-          queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}")
+          if arg is BinaryOps.SUB: srcs[-1] = srcs[-1].negate() if isinstance(srcs[-1], Register) else f"-{srcs[-1]}"
+          vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(dtype.itemsize), srcs))
         elif arg is BinaryOps.MAX:
-          vals[u] = dest = new_reg(vin[0].dtype.itemsize)
-          srcs = [vals[v] for v in vin]
-          assert len(srcs) == 2, f"too many min/max operands: {len(src)}"
-          queue(u, ControlCode(), f"{self.alu[arg][dtype]} {dest}, {', '.join(srcs)}, !PT")
+          assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
+          vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
-          assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}"
-          srcs = [to_var(v) for v in vin]
+          assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           if dtypes.is_int(vin[0].dtype) or dtypes.is_float(vin[0].dtype):
             vals[u] = dest = new_pred()
-            type_mod = f".U32" if dtypes.is_unsigned(dtype) else ""
-            queue(u, ControlCode(), f"ISETP.{self.setp_mod[arg]}{type_mod}.AND {dest}, PT, {', '.join(srcs)}, PT")
-            for i in range(1, nregs(vin[0].dtype.itemsize)): # 64bit+ (long)
-              srcs = [f"{s[0]}{int(s[1:]) + i}" for s in srcs]
-              queue(u, ControlCode(), f"ISETP.{self.setp_mod[arg]}{type_mod}.AND.EX {dest}, PT, {', '.join(srcs)}, PT, {dest}")
+            for i in range(0, nregs(vin[0].dtype.itemsize)): # 64bit+ (long)
+              assert arg is BinaryOps.CMPNE or i == 0, f"64bit+ only supported for CMPNE. {arg=}"
+              srcs = [to_reg(v).offset(i) for v in vin]
+              queue(u, ins := Instruction("ISETP", dest, ["PT"] + srcs + ["PT"], mods=[f".{self.setp_mod[arg]}"]))
+              if dtypes.is_unsigned(dtype): ins.mods.append(".U32")
+              ins.mods.append(".AND")
+              if i > 0:
+                ins.mods.append(".EX")
+                ins.srcs.append(dest)
           elif vin[0].dtype is dtypes.bool:
-            vals[u] = dest = new_pred()
-            queue(u, ControlCode(), f"PLOP3.LUT {dest}, PT, {', '.join(srcs)}, PT, {', '.join(self.plop['^'])}")
+            vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + ["PT"] + list(self.plop['^']), mods=".LUT"))
           else:
             raise NotImplementedError
         elif arg is TernaryOps.WHERE:
-          render_where(u, new_reg(dtype.itemsize), *[vals[v] for v in vin])
+          vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), *[vals[v] for v in vin], dtype))
         elif arg is UnaryOps.LOG2:
-          assert dtype is dtypes.float, f"log2 not supported for {dtype}"
-          vals[u] = dest = new_reg()
-          render_log2(u, dest, vals[vin[0]])
+          assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
+          vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), *[new_reg() for _ in range(4)]))
         else:
           raise NotImplementedError
       else:
         raise NotImplementedError
 
-    queue(None, ControlCode(), "EXIT ;")
-    sass_src = "\n".join([f"{' '*6}{c.render()}{' '*9}/*{hex(a)[2:]:>04}*/{' '*19}{i}" for c,a,i in kernel])
+    queue(None, Instruction("EXIT", None, []))
+    sass_src = "\n".join([ins.render().replace("/*ADDR*/", f"/*{hex(i*16)[2:]:>04}*/") for i,ins in enumerate(kernel)])
     return attach_sections(sass_src, self.cuda_renderer.render(name, uops), reg_cnt)
 
 sass_matcher = PatternMatcher([

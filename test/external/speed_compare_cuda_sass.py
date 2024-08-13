@@ -51,9 +51,10 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [2, 5, 6, 7, 9, 10, 11, 12, 13, 16, 17, 19, 21, 23, 28, 29]
-  for num,ast in list(enumerate(ast_strs))[getenv("START", 0):getenv("END", len(ast_strs))]:
-    if getenv("TEST", 0) and num not in impl:
+  impl = [2, 5, 6, 7, 9, 10, 11, 12, 13, 16, 17, 19, 21, 23, 28, 29, 31, 33, 37, 39]
+  start, end = getenv("START", 0), getenv("END", len(ast_strs))
+  for num,ast in enumerate(ast_strs):
+    if (getenv("TEST", 0) and num not in impl) or not (start <= num < end):
       continue
 
     # cuda compile
