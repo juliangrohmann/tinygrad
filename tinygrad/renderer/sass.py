@@ -125,9 +125,10 @@ class SASSRenderer(Renderer):
   # language
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
-  plop = {
-    "&": ("0x80", "0x0"), # a & b & c
-    "^": ("0x28", "0x0",) # (a ^ b) & c
+  lop = {
+    "&": ("0xc0", "0x0"), # a & b & (c | ~c)
+    "&3": ("0x80", "0x0"), # a & b & c
+    "^&": ("0x28", "0x0",) # (a ^ b) & c
   }
   setp_mod = {
     BinaryOps.CMPLT: "LT",
@@ -184,12 +185,20 @@ class SASSRenderer(Renderer):
           ins.srcs.append(dest)
       return ret
     elif dtype is dtypes.bool:
-      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.plop['^']), mods=".LUT")]
+      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.lop['^&']), mods=".LUT")]
     else:
       raise NotImplementedError
 
   def render_bra(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
     return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), Instruction("BRA", None, [f"`({label})"], pred=pred)]
+
+  def render_div(self, dest:Register, src_l:Register, src_r:Register, buf:Register, dtype:DType):
+    return [Instruction("MUFU", dest, [src_r], mods=[".RCP"]), # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
+            Instruction("FFMA", buf, [dest, src_r, "-1"]),
+            Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=[".FTZ"]),
+            Instruction("FFMA", dest, [dest, buf, dest]),
+            Instruction("FMUL", dest, [dest, src_l])]
+
 
   def render_log2(self, dest:Register, src:Register, pred:Register, *bufs:List[Register]) -> List[Instruction]:
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
@@ -288,7 +297,7 @@ class SASSRenderer(Renderer):
 
     def to_var(uop:UOp) -> Union[Register, str]:
       return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop) # TODO: move to pred instead if PT/!PT?
-    
+
     def to_reg(uop:UOp) -> Register:
       if isinstance(var := vals[uop], Register) and not var.pred: return var
       vals[uop] = d = new_reg()
@@ -391,10 +400,12 @@ class SASSRenderer(Renderer):
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
           if len(srcs) == 2: srcs.append("PT")
-          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.plop['&']), mods=".LUT"))
+          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods=".LUT"))
         elif arg in [BinaryOps.MUL, BinaryOps.ADD, BinaryOps.SUB]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))
+        elif arg is BinaryOps.DIV:
+          vals[u] = queue(u, self.render_div(new_reg(dtype.itemsize), *srcs, new_reg(dtype.itemsize), dtype))
         elif arg is BinaryOps.MAX:
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
           vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
@@ -407,7 +418,7 @@ class SASSRenderer(Renderer):
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), *[vals[v] for v in vin], dtype))
         elif arg is UnaryOps.LOG2:
           assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
-          vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), *[new_reg() for _ in range(4)]))
+          vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), *[new_reg(dtype.itemsize) for _ in range(4)]))
         else:
           raise NotImplementedError
       else:
