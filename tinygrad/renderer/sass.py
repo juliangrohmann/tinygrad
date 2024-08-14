@@ -184,7 +184,7 @@ class SASSRenderer(Renderer):
           ins.srcs.append(dest)
       return ret
     elif dtype is dtypes.bool:
-      return [Instruction("PLOP3", new_pred(), ["PT"] + srcs + ["PT"] + list(self.plop['^']), mods=".LUT")]
+      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.plop['^']), mods=".LUT")]
     else:
       raise NotImplementedError
 
@@ -401,7 +401,7 @@ class SASSRenderer(Renderer):
           vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
-          vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_reg(v) for v in vin], vin[0].dtype))
+          vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_var(v) for v in vin], vin[0].dtype))
         elif arg is TernaryOps.WHERE:
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), *[vals[v] for v in vin], dtype))
         elif arg is UnaryOps.LOG2:
