@@ -287,9 +287,8 @@ class SASSRenderer(Renderer):
       return instrs[-1].dest
 
     def to_var(uop:UOp) -> Union[Register, str]:
-      if isinstance(var := vals[uop], Register) or "P" in var: return var
-      return to_pred(uop) if var.pred else to_reg(uop) # TODO: move to pred instead if PT/!PT?
-
+      return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop) # TODO: move to pred instead if PT/!PT?
+    
     def to_reg(uop:UOp) -> Register:
       if isinstance(var := vals[uop], Register) and not var.pred: return var
       vals[uop] = d = new_reg()
@@ -399,6 +398,8 @@ class SASSRenderer(Renderer):
         elif arg is BinaryOps.MAX:
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
           vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
+        elif arg is UnaryOps.NEG:
+          vals[u] = queue(u, render_alu(BinaryOps.ADD, new_reg(dtype.itemsize), to_reg(vin[0]).negate(), vals[0], dtype))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_var(v) for v in vin], vin[0].dtype))
@@ -426,5 +427,6 @@ sass_matcher = PatternMatcher([
     # A, B -> MUL, C -> ADD               ===     A, B, C -> FMA
     # A, B -> CMPNE, CONST True -> CMPNE  ===     A, B -> CMPEQ
     # A, B -> CMP, C -> MUL               ===     A, B, C -> CMP.AND
+    # A -> NEG, B -> OP                   ===     -A, B -> OP
     # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
 ])
