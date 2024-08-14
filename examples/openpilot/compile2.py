@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os, sys, io, pathlib, json, struct
-from tqdm import tqdm
 import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
 
@@ -16,10 +15,11 @@ from extra.onnx import get_run_onnx
 from tinygrad import Tensor, Device, GlobalCounters, dtypes
 from tinygrad.dtype import ImageDType
 from tinygrad.device import Buffer
-from tinygrad.helpers import partition, Context, fetch, getenv, DEBUG
-from tinygrad.engine.realize import run_schedule, lower_schedule, ExecItem, CompiledRunner
-from tinygrad.engine.schedule import ScheduleItem, create_schedule, memory_planner
-from tinygrad.ops import LoadOps
+from tinygrad.helpers import partition, Context, fetch, getenv, DEBUG, tqdm
+from tinygrad.engine.realize import run_schedule, lower_schedule, ExecItem, CompiledRunner, memory_planner
+from tinygrad.engine.schedule import ScheduleItem, create_schedule
+from tinygrad.ops import MetaOps
+from tinygrad.tensor import _to_np_dtype
 Device.DEFAULT = "GPU"
 
 def get_schedule(onnx_data) -> Tuple[List[ScheduleItem], List[ScheduleItem]]:
@@ -48,8 +48,8 @@ def get_schedule(onnx_data) -> Tuple[List[ScheduleItem], List[ScheduleItem]]:
   schedule, schedule_independent = partition(schedule, lambda si: any(out in depends for out in si.outputs))
   print(f"{len(schedule)} schedule items depend on the input, {len(schedule_independent)} don't")
 
-  # confirm no loadops in the (non independent) schedule except for the ones that load the input buffers
-  assert all(si.ast[0].op not in LoadOps or out in input_lb for si in schedule for out in si.outputs), "has loadops, can't compile to Thneed"
+  # confirm no non-sink metaop in the (non independent) schedule except for the ones that load the input buffers
+  assert all(si.ast.op is MetaOps.KERNEL or out in input_lb for si in schedule for out in si.outputs), "has non SINK ops, can't compile to Thneed"
   return schedule, schedule_independent, inputs
 
 def test_vs_onnx(onnx_data, eis:Optional[List[ExecItem]], inputs:Dict[str, Tensor]):
@@ -93,7 +93,7 @@ def test_vs_onnx(onnx_data, eis:Optional[List[ExecItem]], inputs:Dict[str, Tenso
   output = eis[-1].bufs[0]
   for ei in eis: ei.run()
 
-  new_tinygrad_out = np.frombuffer(output.as_buffer(), dtype=output.dtype.np)
+  new_tinygrad_out = np.frombuffer(output.as_buffer(), dtype=_to_np_dtype(output.dtype))
   np.testing.assert_allclose(new_torch_out.reshape(new_tinygrad_out.shape), new_tinygrad_out, atol=1e-4, rtol=1e-2)
   print("semi-thneed self-test passed!")
 
@@ -105,7 +105,7 @@ if __name__ == "__main__":
   #exit(0)
 
   schedule, schedule_independent, inputs = get_schedule(onnx_data)
-  schedule, schedule_input = partition(schedule, lambda x: x.ast[0].op not in LoadOps)
+  schedule, schedule_input = partition(schedule, lambda x: x.ast.op is MetaOps.KERNEL)
   print(f"{len(schedule_input)} inputs")
 
   run_schedule(schedule_independent)

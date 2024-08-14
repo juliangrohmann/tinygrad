@@ -1,17 +1,11 @@
 from tinygrad import Device, dtypes
-from tinygrad.helpers import getenv, colored
+from tinygrad.helpers import getenv, colorize_float
 from extra.optimization.helpers import load_worlds, ast_str_to_lin
 from test.external.fuzz_linearizer import get_fuzz_rawbufs
 from tinygrad.engine.search import bufs_from_lin
 from tinygrad.engine.realize import CompiledRunner
+from tinygrad.tensor import _to_np_dtype
 import numpy as np
-
-# move to helpers?
-def colorize_float(x):
-  ret = f"{x:7.2f}x"
-  if x < 0.75: return colored(ret, 'green')
-  elif x > 1.15: return colored(ret, 'red')
-  else: return colored(ret, 'yellow')
 
 if __name__ == "__main__":
   ast_strs = load_worlds(filter_reduce=False, filter_novariable=True)
@@ -63,8 +57,8 @@ if __name__ == "__main__":
       failed = True
 
     if not failed and not has_bf16:
-      curesult = np.frombuffer(test_cubufs[0].as_buffer(), test_cubufs[0].dtype.np)
-      nvresult = np.frombuffer(test_nvbufs[0].as_buffer(), test_nvbufs[0].dtype.np)
+      curesult = np.frombuffer(test_cubufs[0].as_buffer(), _to_np_dtype(test_cubufs[0].dtype))
+      nvresult = np.frombuffer(test_nvbufs[0].as_buffer(), _to_np_dtype(test_nvbufs[0].dtype))
       np.testing.assert_allclose(curesult, nvresult, rtol=1e-2, atol=1e-2)
 
     average_tm_cuda += min(tm_cuda)

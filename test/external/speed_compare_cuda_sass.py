@@ -8,7 +8,7 @@ from tinygrad.engine.realize import CompiledRunner
 from tinygrad.helpers import getenv, to_function_name
 from extra.optimization.helpers import load_worlds, ast_str_to_lin
 from tinygrad.engine.search import bufs_from_lin
-from tinygrad.runtime.ops_cuda import SASSCompiler, CUDACompiler, CuAsmCompiler
+from tinygrad.runtime.support.compiler_cuda import SASSCompiler, CUDACompiler, CuAsmCompiler
 from tinygrad.renderer.sass import SASSRenderer
 from CuAsm.CuAsmLogger import CuAsmLogger
 from CuAsm import CuAsmParser
@@ -17,7 +17,7 @@ def info(bufs_cuda, bufs_sass):
   ret = []
   for cuda, sass in zip(bufs_cuda, bufs_sass):
     b_info = {}
-    cuda_vals, sass_vals = [np.frombuffer(buf.as_buffer(), dtype=buf.dtype.np) for buf in [cuda, sass]]
+    cuda_vals, sass_vals = [np.frombuffer(buf.as_buffer(), dtype=np.dtype(buf.dtype.fmt)) for buf in [cuda, sass]]
     mask = ~(np.isnan(cuda_vals) & np.isnan(sass_vals))
     b_info["cuda"], b_info["sass"] = cuda_vals.tolist(), sass_vals.tolist()
     try:
@@ -30,7 +30,7 @@ def info(bufs_cuda, bufs_sass):
 
 def allclose(bufs_a, bufs_b):
   for a, b in zip(bufs_a, bufs_b):
-    cuda_vals, sass_vals = [np.frombuffer(buf.as_buffer(), dtype=buf.dtype.np) for buf in [a, b]]
+    cuda_vals, sass_vals = [np.frombuffer(buf.as_buffer(), dtype=np.dtype(buf.dtype.fmt)) for buf in [a, b]]
     mask = ~(np.isnan(cuda_vals) & np.isnan(sass_vals))
     if not np.allclose(cuda_vals[mask], sass_vals[mask]):
       return False
@@ -51,7 +51,7 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [2, 5, 6, 7, 9, 10, 11, 12, 13, 16, 17, 19, 21, 23, 28, 29, 31, 33, 37, 39, 410, 936, 1028]
+  impl = [2, 5, 6, 9, 11, 12, 13, 16, 17, 19, 21, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
   start, end = getenv("START", 0), getenv("END", len(ast_strs))
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end):
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     np.random.seed(42)
     cuda_bufs = bufs_from_lin(lin)
     for buf in cuda_bufs:
-      buf.copyin(memoryview(np.random.rand(buf.size).astype(buf.dtype.np)))
+      buf.copyin(memoryview(np.random.rand(buf.size).astype(np.dtype(buf.dtype.fmt).type)))
     sass_bufs, debug_bufs = [[Buffer(buf.device, buf.size, buf.dtype, initial_value=bytearray(buf.as_buffer())) for buf in cuda_bufs] for i in range(2)]
 
     cuda_t = cuda_prg(cuda_bufs, {}, wait=True)

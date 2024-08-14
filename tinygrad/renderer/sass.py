@@ -8,10 +8,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
 from tinygrad.helpers import getenv, all_same
-from tinygrad.codegen.linearizer import UOps, UOp
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType
-from tinygrad.codegen.uops import UOpGraph, PatternMatcher, UPat
+from tinygrad.codegen.uops import PatternMatcher, UPat, UOps, UOp
+from tinygrad.codegen.uopgraph import UOpGraph
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
 from CuAsm import CubinFile, CuAsmParser
@@ -25,21 +25,17 @@ def render_value(x, dtype):
     return render_binary(x, dtype)
 
 def render_binary(x, dtype):
-  if dtypes.is_int(dtype):
-    return hex(x)
-  elif dtypes.is_float(dtype):
-    formats = {dtypes.double: "d", dtypes.float: "f", dtypes.half: "e"}
-    form = formats[dtype] if dtype in formats else "f"
-    return "0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{form}", x))
-  else:
-    raise NotImplementedError
+  formats = {dtypes.uint: "I", dtypes.int: "i", dtypes.double: "d", dtypes.float: "f", dtypes.half: "e"}
+  assert dtype in formats, f"unsupported binary dtype: {dtype}"
+  form = formats[dtype] if dtype in formats else "f"
+  return "0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{form}", x))
 
 def const_addr(uop:UOp, offset=0):
   param_cbank = int("160", 16) # TODO: make variable
-  return f"c[0x0][{hex(param_cbank + uop.arg[0] * 8 + offset)}]"
+  return f"c[0x0][{hex(param_cbank + uop.arg * 8 + offset)}]"
 
 def is_contiguous(srcs:List[Any]):
-  return all(isinstance(s, Register) and s.idx - srcs[0].idx == i for i,s in enumerate(srcs))
+  return all(isinstance(s, Register) and all_same([s.size for s in srcs]) and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 
 def nregs(byte_size):
   return (byte_size + 3) // 4
@@ -111,14 +107,24 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join(self.mods)} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*ADDR*/{' '*19}{ins} ;"
 
+sass_matcher = PatternMatcher([
+  # Shift left/right for int mul/div by 2
+  # A, B -> ADD, C -> ADD               ===     A, B, C -> ADD3
+  # A, B -> MUL, C -> ADD               ===     A, B, C -> FMA
+  # A, B -> CMPNE, CONST True -> CMPNE  ===     A, B -> CMPEQ
+  # A, B -> CMP, C -> MUL               ===     A, B, C -> CMP.AND
+  # A -> NEG, B -> OP                   ===     -A, B -> OP
+  # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
+])
+
 class SASSRenderer(Renderer):
   device = "CUDA"
   suffix = "SASS"
   global_max = [65535, 65535, 2147483647]
   local_max = [64, 1024, 1024]
   shared_max = 49152
-  tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2),(0,2),(1,2),(1,2),(0,2)], thread_local_sizes=[[2,2,2],[2,2],[2,2]], thread_local_aliases=[ [[0],[0],[5],[-2],[0],[-1,1,2,-3],[3,4]], [[3],[4],[0],[0],[5],[-1,1,2,-2],[0]], [[-1],[1],[5],[-2],[2],[0],[3,4]] ], dtype_in=di, dtype_out=do) for (di, do) in ([(dtypes.half, dtypes.float)])] # noqa: E501
-  is_64_bit = True # TODO: remove
+  tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2),(0,2),(1,2),(1,2),(1,2)], dtype_in=di, dtype_out=do) for (di, do) in ([(dtypes.half, dtypes.float)])] # noqa: E501
+  extra_matcher = sass_matcher
   def __init__(self, arch:str):
     self.tensor_cores = SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
     self.cuda_renderer = CUDARenderer(arch) # TODO: remove
@@ -126,9 +132,10 @@ class SASSRenderer(Renderer):
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
   lop = {
-    "&": ("0xc0", "0x0"), # a & b & (c | ~c)
-    "&3": ("0x80", "0x0"), # a & b & c
-    "^&": ("0x28", "0x0",) # (a ^ b) & c
+    "&": ("0xc0", "0x0"),   # a & b & (c | ~c)
+    "&3": ("0x80", "0x0"),  # a & b & c
+    "^&": ("0x28", "0x0",), # (a ^ b) & c
+    "~": ("0x0f", "0x0")    # ~a & (b | ~b) & (c | ~c)
   }
   setp_mod = {
     BinaryOps.CMPLT: "LT",
@@ -136,12 +143,6 @@ class SASSRenderer(Renderer):
   }
   alu = {
     BinaryOps.ADD: {
-      dtypes.int: "IMAD",
-      dtypes.half: "HADD2",
-      dtypes.float32: "FADD",
-      dtypes.float64: "DADD",
-    },
-    BinaryOps.SUB: {
       dtypes.int: "IMAD",
       dtypes.half: "HADD2",
       dtypes.float32: "FADD",
@@ -192,12 +193,11 @@ class SASSRenderer(Renderer):
   def render_bra(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
     return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), Instruction("BRA", None, [f"`({label})"], pred=pred)]
 
-  def render_div(self, dest:Register, src_l:Register, src_r:Register, buf:Register, dtype:DType):
-    return [Instruction("MUFU", dest, [src_r], mods=[".RCP"]), # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
-            Instruction("FFMA", buf, [dest, src_r, "-1"]),
+  def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType):
+    return [Instruction("MUFU", dest, [src], mods=[".RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
+            Instruction("FFMA", buf, [dest, src, "-1"]),
             Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=[".FTZ"]),
-            Instruction("FFMA", dest, [dest, buf, dest]),
-            Instruction("FMUL", dest, [dest, src_l])]
+            Instruction("FFMA", dest, [dest, buf, dest])]
 
 
   def render_log2(self, dest:Register, src:Register, pred:Register, *bufs:List[Register]) -> List[Instruction]:
@@ -226,8 +226,7 @@ class SASSRenderer(Renderer):
                 Instruction("FSEL",  dest,    [dest, "-INF",           pred])])
     return ins
 
-  def render(self, name:str, uops:UOpGraph) -> str:
-    uops.linearize(sass_matcher)
+  def render(self, name:str, uops:List[UOp]) -> str:
     attach_sections("", self.cuda_renderer.render(name, uops), 0) # TODO: remove (for writing debug src only)
 
     kernel:List[Instruction] = []
@@ -274,7 +273,7 @@ class SASSRenderer(Renderer):
       return vals[1]
 
     def wait_on_barriers(uop:UOp, ctrl:ControlCode):
-      for oper in uop.vin:
+      for oper in uop.src:
         if not oper in ctrl_codes:
           wait_on_barriers(oper, ctrl)
         else:
@@ -304,7 +303,7 @@ class SASSRenderer(Renderer):
       return queue(uop, self.render_where(d, var, "0x1", vals[0], uop.dtype) if isinstance(var, Register) else self.render_mov(d, var, uop.dtype))
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
-      if idx.uop is UOps.CONST:
+      if idx.op is UOps.CONST:
         glob_addr = vals[glob]
         if not isinstance(glob_addr, Register):
           vals[glob] = glob_addr = new_reg(byte_size=8)
@@ -324,12 +323,11 @@ class SASSRenderer(Renderer):
       srcs = [src_l, src_r]
       if dtype is dtypes.int:
         if arg is BinaryOps.MUL: srcs.append(vals[0])
-        elif arg in [BinaryOps.ADD, BinaryOps.SUB]:srcs[1:1] = [unity()]
+        elif arg is BinaryOps.ADD: srcs[1:1] = [unity()]
         else: raise NotImplementedError
       elif not isinstance(srcs[0], Register):
         if isinstance(srcs[1], Register): srcs = srcs[::-1]
         else: srcs[0] = to_reg(vin[0])
-      if arg is BinaryOps.SUB: srcs[-1] = srcs[-1].negate() if isinstance(srcs[-1], Register) else f"-{srcs[-1]}"
       return Instruction(self.alu[arg][dtype], dest, srcs)
 
     vals[0] = Register(-1)
@@ -338,79 +336,86 @@ class SASSRenderer(Renderer):
     vals["DESC"] = queue(None, Instruction("ULDC", Register(idx=4, uniform=True), ["c[0x0][0x118]"], mods=[".64"])) # load explicit memory descriptor
 
     for u in uops:
-      print(u)
-      uop, dtype, vin, arg = u.uop, u.dtype, u.vin, u.arg
-      if uop is UOps.SPECIAL:
-        vals[u] = queue(u, ins := Instruction("S2R", new_reg(), [(self.gid if arg[1][:3] == "gid" else self.tid)[arg[0]]]))
+      op, dtype, vin, arg = u.op, u.dtype, u.src, u.arg
+      print(f"{op=}, {arg=}, {dtype=}") # TODO: remove
+      for v in vin:
+        print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
+      if op is UOps.SPECIAL:
+        vals[u] = queue(u, ins := Instruction("S2R", new_reg(), [(self.gid if arg[0][:3] == "gid" else self.tid)[int(arg[0][-1])]]))
         ins.ctrl.write = new_barrier()
-      elif uop is UOps.CONST:
+      elif op is UOps.CONST:
         vals[u] = vals[arg] if arg in vals else render_value(arg, dtype)
-      elif uop is UOps.DEFINE_GLOBAL:
+      elif op is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
-      elif uop is UOps.DEFINE_ACC:
+      elif op is UOps.DEFINE_ACC:
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), render_value(arg[0], dtype), dtype))
-      elif uop is UOps.RANGE:
+      elif op is UOps.RANGE:
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
         queue(u, Instruction(label := f".LOOP_{new_loop()}", None, None, label=True))
         update = render_alu(BinaryOps.ADD, vals[u], vals[u], unity(), dtype)
         branch = self.render_bra(label, new_pred(), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
-      elif uop is UOps.PHI:
+      elif op is UOps.PHI:
         vals[u] = queue(u, self.render_mov(vals[vin[0]], vals[vin[1]], dtype))
-      elif uop is UOps.ENDRANGE:
+      elif op is UOps.ENDRANGE:
         queue(u, iter_stack.pop(-1))
-      elif uop is UOps.LOAD:
-        if vin[0].uop is UOps.DEFINE_GLOBAL:
-          pred = vals[vin[2]] if len(vin) > 3 else None
+      elif op is UOps.LOAD:
+        if vin[0].op is UOps.DEFINE_GLOBAL:
+          pred = vals[vin[3]] if len(vin) > 3 else None
           vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=[".E"], pred=pred))
           ins.ctrl.write = new_barrier()
           if (n := nregs(dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
-          if pred: queue(u, self.render_mov(vals[u], vals[vin[3]], dtype, pred=pred.negate()))
+          if pred: queue(u, self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
-      elif uop is UOps.STORE:
-        if vin[0].uop is UOps.DEFINE_GLOBAL:
+      elif op is UOps.STORE:
+        if vin[0].op is UOps.DEFINE_GLOBAL:
           queue(u, ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=[".E"]))
           if (n := nregs(vin[2].dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
         else:
           raise NotImplementedError
-      elif uop is UOps.CAST:
+      elif op is UOps.CAST:
         if dtypes.is_int(vin[0].dtype):
           if dtypes.is_float(dtype):
-            vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.vin[0]]]))
+            vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]]))
             if (n := nregs(vin[0].dtype.itemsize)) > 1 or dtypes.is_unsigned(vin[0].dtype):
               ins.mods.append(f".{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
           else:
             raise NotImplementedError
-        elif dtypes.is_float(vin[0].dtype) and dtype.count > 1:
-          if not is_contiguous(srcs := [vals[v] for v in vin]):
-            vals[u] = dest = new_reg(dtype.itemsize)
-            n = nregs(vin[0].dtype.itemsize)
-            queue(u, [self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)])
-          else:
-            vals[u] = srcs[0]
         elif vin[0].dtype is dtypes.bool:
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]], render_binary(1, dtype), render_binary(0, dtype), dtype))
         else:
           raise NotImplementedError
-      elif uop is UOps.GEP:
+      elif op is UOps.VECTORIZE:
+        if not is_contiguous(srcs := [vals[v] for v in vin]):
+          vals[u] = dest = new_reg(dtype.itemsize)
+          n = nregs(vin[0].dtype.itemsize)
+          queue(u, [self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)])
+        else:
+          vals[u] = srcs[0]
+      elif op is UOps.GEP:
         vals[u] = vals[vin[0]].offset(arg)
-      elif uop is UOps.ALU:
+      elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
           if len(srcs) == 2: srcs.append("PT")
           vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods=".LUT"))
-        elif arg in [BinaryOps.MUL, BinaryOps.ADD, BinaryOps.SUB]:
+        elif arg in [BinaryOps.MUL, BinaryOps.ADD]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))
-        elif arg is BinaryOps.DIV:
-          vals[u] = queue(u, self.render_div(new_reg(dtype.itemsize), *srcs, new_reg(dtype.itemsize), dtype))
+        elif arg is UnaryOps.RECIP:
+          vals[u] = queue(u, self.render_recip(new_reg(dtype.itemsize), vals[vin[0]], new_reg(dtype.itemsize), dtype))
         elif arg is BinaryOps.MAX:
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
           vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
         elif arg is UnaryOps.NEG:
-          vals[u] = queue(u, render_alu(BinaryOps.ADD, new_reg(dtype.itemsize), to_reg(vin[0]).negate(), vals[0], dtype))
+          if dtypes.is_int(dtype):
+            vals[u] = queue(u, Instruction("IADD3", new_reg(dtype.itemsize), [to_reg(vin[0]), to_reg(vin[0]).negate(), to_reg(vin[0]).negate()]))
+          elif dtypes.is_float(dtype):
+            vals[u] = queue(u, Instruction("FFMA", new_reg(dtype.itemsize), [to_reg(vin[0]), "-1.0", "RZ"]))
+          elif dtype is dtypes.bool:
+            vals[u] = queue(u, Instruction("PLOP3", new_pred(), [vals[vin[0]], "PT", "PT"], mods=".LUT"))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_var(v) for v in vin], vin[0].dtype))
@@ -431,13 +436,3 @@ class SASSRenderer(Renderer):
     queue(None, Instruction(".L_END", None, None, label=True))
     sass_src = "\n".join([ins.render().replace("/*ADDR*/", f"/*{hex(i*16)[2:]:>04}*/") for i,ins in enumerate(kernel)]) + '\n'
     return attach_sections(sass_src, self.cuda_renderer.render(name, uops), reg_cnt)
-
-sass_matcher = PatternMatcher([
-    # Shift left/right for int mul/div by 2
-    # A, B -> ADD, C -> ADD               ===     A, B, C -> ADD3
-    # A, B -> MUL, C -> ADD               ===     A, B, C -> FMA
-    # A, B -> CMPNE, CONST True -> CMPNE  ===     A, B -> CMPEQ
-    # A, B -> CMP, C -> MUL               ===     A, B, C -> CMP.AND
-    # A -> NEG, B -> OP                   ===     -A, B -> OP
-    # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
-])

@@ -1,5 +1,6 @@
 __pycache__
 .venv/
+.venv-*/
 .vscode
 .DS_Store
 notebooks
@@ -51,5 +52,7 @@ quickstart.py
 .hypothesis
 weights
 *.lprof
+comgr_*
 *.pkl
 site/
+master_schedule.py
