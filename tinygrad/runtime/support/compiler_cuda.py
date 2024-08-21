@@ -3,7 +3,7 @@ from typing import Callable
 from tinygrad.helpers import to_char_p_p, colored, init_c_var, getenv
 import tinygrad.runtime.autogen.nvrtc as nvrtc
 from tinygrad.device import Compiler, CompileError
-from CuAsm import CubinFile, CuAsmParser, CuAsmLogger
+from CuAsm import CuAsmParser
 
 PTX = getenv("PTX")  # this shouldn't be here, in fact, it shouldn't exist
 
@@ -78,11 +78,11 @@ class NVPTXCompiler(PTXCompiler):
     jitlink_check(nvrtc.nvJitLinkDestroy(handle))
     return data
 
-class SASSCompiler(Compiler):
+class CuAsmCompiler(Compiler):
   def __init__(self, arch:str):
     self.arch = arch
     self.version = "7.8" if arch >= "sm_89" else "7.5"
-    super().__init__(f"compile_sass_{self.arch}")
+    super().__init__(f"compile_cuasm_{self.arch}")
   def compile(self, src:str) -> bytes:
     fn = (pathlib.Path(tempfile.gettempdir()) / f"cuasm_{hashlib.md5(src.encode()).hexdigest()}").as_posix()
     with open(fn + ".cuasm", "w") as f: f.write(src)
@@ -97,31 +97,3 @@ class SASSCompiler(Compiler):
     cap.saveAsCubin(ret)
     return bytes(ret.getbuffer())
 
-class CuAsmCompiler(Compiler):
-  def __init__(self, arch:str):
-    self.arch = arch
-    self.version = "7.8" if arch >= "sm_89" else "7.5"
-    super().__init__(f"compile_cuasm_{self.arch}")
-  def compile(self, src:str) -> bytes:
-    print("cuasm compile")
-    fn = (pathlib.Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(src.encode()).hexdigest()}").as_posix()
-    with open(fn + ".cu", "w") as f: f.write(src)
-    subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn + ".cu"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    CubinFile(fn + ".cubin").saveAsCuAsm(fn + ".cuasm")
-    ret = io.BytesIO()
-    cap = CuAsmParser()
-    cap.parse(fn + ".cuasm")
-    cap.saveAsCubin(ret)
-    if out_dir := getenv("WRITE_SRC", ""):
-      out_dir = pathlib.Path(out_dir)
-      out_dir.mkdir(parents=True, exist_ok=True)
-      out_fn = out_dir / "debug"
-      with open(str(out_fn) + ".cubin", "wb") as f:
-        f.write(ret.getbuffer())
-      with open(str(fn) + ".cuasm") as src:
-        with open(str(out_fn) + ".cuasm", "w") as f:
-          f.write(src.read())
-      with open(str(fn) + ".cu") as src:
-        with open(str(out_fn) + ".cu", "w") as f:
-          f.write(src.read())
-    return bytes(ret.getbuffer())

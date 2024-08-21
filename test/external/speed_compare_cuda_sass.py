@@ -1,6 +1,8 @@
 import json
 from collections import defaultdict
 from io import BytesIO
+from copy import deepcopy
+from pathlib import Path
 import numpy as np
 from tinygrad import Device
 from tinygrad.device import Buffer
@@ -8,7 +10,10 @@ from tinygrad.engine.realize import CompiledRunner
 from tinygrad.helpers import getenv, to_function_name
 from extra.optimization.helpers import load_worlds, ast_str_to_lin
 from tinygrad.engine.search import bufs_from_lin
-from tinygrad.runtime.support.compiler_cuda import SASSCompiler, CUDACompiler, CuAsmCompiler
+from tinygrad.runtime.support.compiler_cuda import CUDACompiler, CuAsmCompiler
+from tinygrad.runtime.support.parser_sass import SASSCompiler
+from tinygrad.runtime.support.elf import elf_loader, make_elf
+import tinygrad.runtime.autogen.libc as libc
 from tinygrad.renderer.sass import SASSRenderer
 from CuAsm.CuAsmLogger import CuAsmLogger
 from CuAsm import CuAsmParser
@@ -46,7 +51,7 @@ if __name__ == "__main__":
   sass = SASSRenderer(dev.arch)
 
   single = getenv("NUM", -1)
-  debug_src = getenv("DEBUG_SRC", "")
+  debug_src, debug_cubin = getenv("DEBUG_SRC", ""), getenv("DEBUG_CUBIN", "")
   if single != -1: ast_strs = ast_strs[single:single+1]
 
   result = defaultdict(list)
@@ -65,7 +70,7 @@ if __name__ == "__main__":
 
     # sass compile # TODO: keep trying
     # try:
-    dev.compiler = SASSCompiler(dev.arch)
+    dev.compiler = CuAsmCompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=sass if not debug_src else dev.renderer)
     lin.hand_coded_optimizations()
     raw_prg = lin.to_program()
@@ -86,12 +91,29 @@ if __name__ == "__main__":
 
     cuda_t = cuda_prg(cuda_bufs, {}, wait=True)
 
-    if debug_src:
-      parser = CuAsmParser()
-      parser.parse(debug_src)
-      cubin = BytesIO()
-      parser.saveAsCubin(cubin)
-      debug_prg = CompiledRunner(raw_prg, precompiled=bytes(cubin.getbuffer()))
+    if debug_src or debug_cubin:
+      if not debug_cubin:
+        parser = CuAsmParser()
+        parser.parse(debug_src)
+        parser.saveAsCubin(cubin_buf := BytesIO())
+        cubin = cubin_buf.getbuffer()
+      else:
+        with open(debug_cubin, "rb") as f: blob = f.read();
+        _, sections, _ = elf_loader(blob)
+        header = libc.Elf64_Ehdr.from_buffer_copy(blob)
+        prog_hdr = (libc.Elf64_Phdr * header.e_phnum).from_buffer_copy(blob[header.e_phoff:])
+        for s in sections: s.header.sh_addr = 0
+
+        sections = [s for s in sections if not "debug_frame" in s.name]
+        cubin = bytes(make_elf(header, deepcopy(sections), deepcopy(prog_hdr)))
+        print(debug_cubin)
+        with open(Path(debug_cubin).with_suffix(".hex"), "wb") as f: f.write(cubin)
+
+        # for i,(a,b) in enumerate(zip(cubin, blob)):
+        #   assert a == b, f"mismatch in blob at address {hex(i)}: {a=}, {b=}"
+        # assert cubin == blob
+
+      debug_prg = CompiledRunner(raw_prg, precompiled=cubin)
       print(f"debug: {debug_prg(debug_bufs, {}, wait=True)*1e6:7.2f} us")
       if allclose(cuda_bufs, debug_bufs):
         print("success")
