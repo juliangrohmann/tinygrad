@@ -6,6 +6,8 @@ import tinygrad.runtime.autogen.libc as libc
 
 @dataclass(frozen=True)
 class ElfSection: name:str; header:libc.Elf64_Shdr; content:bytes # noqa: E702
+@dataclass(frozen=True)
+class ElfSegment: header:libc.Elf64_Phdr; sections:List[ElfSection] # noqa: E702
 
 def elf_loader(blob:bytes, force_section_align:int=1) -> Tuple[memoryview, List[ElfSection], Any]:
   def _strtab(blob: bytes, idx: int) -> str: return blob[idx:blob.find(b'\x00', idx)].decode('utf-8')
@@ -38,7 +40,7 @@ def elf_loader(blob:bytes, force_section_align:int=1) -> Tuple[memoryview, List[
 
   return memoryview(image), sections, relocs
 
-def make_elf(header:libc.Elf64_Ehdr, sections:List[ElfSection], prog_headers:Optional[List[libc.Elf64_Phdr]]=None) -> memoryview:
+def make_elf(header:libc.Elf64_Ehdr, sections:List[ElfSection], segments:Optional[List[ElfSegment]]=None) -> memoryview:
   def _pad(n:int, align:int): return b'\0' * ((align - n % align) % align if align != 0 else 0)
 
   blob = bytearray()
@@ -46,28 +48,23 @@ def make_elf(header:libc.Elf64_Ehdr, sections:List[ElfSection], prog_headers:Opt
     if s.header.sh_type == libc.SHT_NOBITS: continue
     blob += _pad(len(blob) + header.e_ehsize, s.header.sh_addralign)
     s.header.sh_offset = header.e_ehsize + len(blob) if s.header.sh_name != 0 else 0
-    s.header.sh_size = len(s.content)
     blob += s.content
 
   blob += _pad(len(blob) + header.e_ehsize, 8)
   header.e_shoff = header.e_ehsize + len(blob)
-  header.e_shnum = len(sections)
   for s in sections:
     blob += bytearray(s.header)
 
-  if prog_headers:
-    prog_seg_st = header.e_phoff
+  if segments:
     blob += _pad(len(blob) + header.e_ehsize, 8)
     header.e_phoff = header.e_ehsize + len(blob)
-    segments = [(ph, [s.header for s in sections if ph.p_offset <= s.header.sh_offset < ph.p_offset + ph.p_memsz]) for ph in prog_headers]
-    for i, (ph, sh) in enumerate(segments):
-      if ph.p_offset == prog_seg_st:
-        ph.p_offset = header.e_phoff
-        ph.p_filesz = ph.p_memsz = header.e_phentsize * header.e_phnum
+    for seg in segments:
+      if not seg.sections:
+        seg.header.p_offset = header.e_phoff
+        seg.header.p_filesz = seg.header.p_memsz = header.e_phentsize * header.e_phnum
       else:
-        assert sh, f"no sections match program header at index {i}"
-        ph.p_offset = sh[0].sh_offset
-        ph.p_memsz = (sh[-1].sh_offset + sh[-1].sh_size - sh[0].sh_offset)
-        ph.p_filesz = ph.p_memsz - sum(s.sh_size for s in sh if s.sh_type == libc.SHT_NOBITS)
-      blob += bytearray(ph)
+        seg.header.p_offset = seg.sections[0].header.sh_offset
+        seg.header.p_memsz = (seg.sections[-1].header.sh_offset + seg.sections[-1].header.sh_size - seg.sections[0].header.sh_offset)
+        seg.header.p_filesz = seg.header.p_memsz - sum(s.header.sh_size for s in seg.sections if s.header.sh_type == libc.SHT_NOBITS)
+      blob += bytearray(seg.header)
   return memoryview(bytearray(header) + blob)
