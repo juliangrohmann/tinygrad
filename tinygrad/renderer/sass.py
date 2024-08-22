@@ -10,8 +10,7 @@ from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
 from tinygrad.helpers import getenv, all_same
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType
-from tinygrad.codegen.uops import PatternMatcher, UPat, UOps, UOp
-from tinygrad.codegen.uopgraph import UOpGraph
+from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
 from CuAsm import CubinFile, CuAsmParser
@@ -386,13 +385,6 @@ class SASSRenderer(Renderer):
         elif arg is BinaryOps.MAX:
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
           vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
-        elif arg is UnaryOps.NEG:
-          if dtypes.is_int(dtype):
-            vals[u] = queue(u, Instruction("IADD3", new_reg(dtype.itemsize), [to_reg(vin[0]), to_reg(vin[0]).negate(), to_reg(vin[0]).negate()]))
-          elif dtypes.is_float(dtype):
-            vals[u] = queue(u, Instruction("FFMA", new_reg(dtype.itemsize), [to_reg(vin[0]), "-1.0", "RZ"]))
-          elif dtype is dtypes.bool:
-            vals[u] = queue(u, Instruction("PLOP3", new_pred(), [vals[vin[0]], "PT", "PT"], mods=".LUT"))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_var(v) for v in vin], vin[0].dtype))

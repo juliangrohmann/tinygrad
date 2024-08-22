@@ -55,7 +55,7 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [2, 5, 6, 9, 11, 12, 13, 16, 17, 19, 21, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
+  impl = [2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
   start, end = getenv("START", 0), getenv("END", len(ast_strs))
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end):
@@ -109,7 +109,7 @@ if __name__ == "__main__":
       status = colored("mismatch", "red")
       result["mismatch"].append((num, info(cuda_bufs, debug_bufs)))
     print(f"{num:>5}/{len(ast_strs)} ({(num + 1) * 100.0 / len(ast_strs):.2f}%){' '*4}"
-          f"cuda: {cuda_t*1e6:7.2f} us{' '*4}sass: {debug_t*1e6:7.2f} us{' '*4}nodes: {len(lin.uops.uops):>3}{' '*4}{status}")
+          f"cuda: {cuda_t*1e6:7.2f} us{' '*4}sass: {debug_t*1e6:7.2f} us{' '*4}nodes: {len(lin.uops):>3}{' '*4}{status}")
 
   with open("results.json", "w") as f:
     json.dump(result, f)
