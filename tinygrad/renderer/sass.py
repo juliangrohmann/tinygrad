@@ -40,33 +40,6 @@ def is_contiguous(srcs:List[Any]):
 def nregs(byte_size):
   return (byte_size + 3) // 4
 
-def attach_sections(sass_src:str, cuda_src:str, reg_cnt:int): # TODO remove HACK: ELF headers/sections attached from nvcc compile
-  fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(cuda_src.encode()).hexdigest()}").as_posix()
-  with open(fn + ".cu", "w") as f: f.write(cuda_src)
-  subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn + ".cu"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-  CubinFile(fn + ".cubin").saveAsCuAsm(fn + "_cuda.cuasm")
-  if out_dir := getenv("WRITE_SRC", ""):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "nvcc.cuasm", "w") as f:
-      with open(fn + "_cuda.cuasm") as tempf: f.write(tempf.read())
-    with open(out_dir / "src.cu", "w") as f: f.write(cuda_src)
-  cuasm = ""
-  skip = False
-  with open(fn + "_cuda.cuasm") as f:
-    for line in f:
-      if not skip:
-        cuasm += line
-        if line.strip().startswith(".text."):
-          cuasm += sass_src + '\n'
-          skip = True
-      elif line.strip().startswith("//"):
-        cuasm += line
-        skip = False
-  cuasm = re.sub(r"(SHI_REGISTERS=)\d+", f"SHI_REGISTERS={reg_cnt + 2}", cuasm) # 3 registers used internally on sm_89
-  cuasm = re.sub(r"\.size( *)([^ ,]*).*", r".size\1\2,(.L_END - \2)", cuasm)
-  return cuasm
-
 @dataclass
 class Register:
   idx: int
@@ -101,11 +74,12 @@ class Instruction:
   mods: List[str] = field(default_factory=list)
   pred: Register = None
   label: bool = False
+  addr: int = None
   def render(self):
     if self.label: return f"  {self.op}:"
     operands = ', '.join(([self.dest.render()] if self.dest else []) + [s.render() if isinstance(s, Register) else s for s in self.srcs])
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join(self.mods)} {operands}"
-    return f"{' '*6}{self.ctrl.render()}{' '*9}/*ADDR*/{' '*19}{ins} ;"
+    return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
 sass_matcher = PatternMatcher([
   # Shift left/right for int mul/div by 2
@@ -227,8 +201,7 @@ class SASSRenderer(Renderer):
     return ins
 
   def render(self, name:str, uops:List[UOp]) -> str:
-    attach_sections("", self.cuda_renderer.render(name, uops), 0) # TODO: remove (for writing debug src only)
-
+    attr:Dict[str, int] = {"PARAM_COUNT": 0}
     kernel:List[Instruction] = []
     ctrl_codes:Dict[UOp, List[ControlCode]] = defaultdict(list)
     vals:Dict[Any, Union[Register,str]] = {}
@@ -330,6 +303,7 @@ class SASSRenderer(Renderer):
         else: srcs[0] = to_reg(vin[0])
       return Instruction(self.alu[arg][dtype], dest, srcs)
 
+    queue(None, Instruction(f".text.{name}", None, None, label=True))
     vals[0] = Register(-1)
     vals[float("inf")] = "INF"
     vals[float("-inf")] = "-INF"
@@ -337,16 +311,19 @@ class SASSRenderer(Renderer):
 
     for u in uops:
       op, dtype, vin, arg = u.op, u.dtype, u.src, u.arg
-      print(f"{op=}, {arg=}, {dtype=}") # TODO: remove
-      for v in vin:
-        print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
+      if getenv("PRINT_UOPS", 0): # TODO: remove
+        print(f"{op=}, {arg=}, {dtype=}")
+        for v in vin:
+          print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
       if op is UOps.SPECIAL:
-        vals[u] = queue(u, ins := Instruction("S2R", new_reg(), [(self.gid if arg[0][:3] == "gid" else self.tid)[int(arg[0][-1])]]))
+        vals[u] = queue(u, ins := Instruction("S2R", new_reg(), [(self.tid if (tid := arg[0][:3] == "lid") else self.gid)[dim := int(arg[0][-1])]]))
         ins.ctrl.write = new_barrier()
+        if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
         vals[u] = vals[arg] if arg in vals else render_value(arg, dtype)
       elif op is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
+        attr["PARAM_COUNT"] += 1
       elif op is UOps.DEFINE_ACC:
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), render_value(arg[0], dtype), dtype))
       elif op is UOps.RANGE:
@@ -432,7 +409,39 @@ class SASSRenderer(Renderer):
     queue(None, Instruction("EXIT", None, []))
     queue(None, Instruction(buf_lab := ".L_BUF", None, None, label=True))
     queue(None, Instruction("BRA", None, [f"`({buf_lab})"]))
-    for _ in range(10): queue(None, Instruction("NOP", None, []))
+    for _ in range(10): queue(None, Instruction("NOP", None, [])) # TODO: pad to multiple of 8
     queue(None, Instruction(".L_END", None, None, label=True))
-    sass_src = "\n".join([ins.render().replace("/*ADDR*/", f"/*{hex(i*16)[2:]:>04}*/") for i,ins in enumerate(kernel)]) + '\n'
-    return attach_sections(sass_src, self.cuda_renderer.render(name, uops), reg_cnt)
+
+    attr["SHI_REGISTERS"] = reg_cnt + 3 # two internal registers on sm >= 8x, and RZ
+    for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = i*16
+    if getenv("CUASM", 0):
+      return attach_sections(''.join(ins.render()+"\n" for ins in kernel[1:]), CUDARenderer("sm_89").render(name, uops), reg_cnt)
+    else:
+      return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+def attach_sections(sass_src:str, cuda_src:str, reg_cnt:int):
+  fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(cuda_src.encode()).hexdigest()}").as_posix()
+  with open(fn + ".cu", "w") as f: f.write(cuda_src)
+  subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn + ".cu"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+  CubinFile(fn + ".cubin").saveAsCuAsm(fn + "_cuda.cuasm")
+  if out_dir := getenv("WRITE_SRC", ""):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "nvcc.cuasm", "w") as f:
+      with open(fn + "_cuda.cuasm") as tempf: f.write(tempf.read())
+    with open(out_dir / "src.cu", "w") as f: f.write(cuda_src)
+  cuasm = ""
+  skip = False
+  with open(fn + "_cuda.cuasm") as f:
+    for line in f:
+      if not skip:
+        cuasm += line
+        if line.strip().startswith(".text."):
+          cuasm += sass_src + '\n'
+          skip = True
+      elif line.strip().startswith("//"):
+        cuasm += line
+        skip = False
+  cuasm = re.sub(r"(SHI_REGISTERS=)\d+", f"SHI_REGISTERS={reg_cnt + 2}", cuasm) # 3 registers used internally on sm_89
+  cuasm = re.sub(r"\.size( *)([^ ,]*).*", r".size\1\2,(.L_END - \2)", cuasm)
+  return cuasm

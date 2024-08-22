@@ -1,4 +1,4 @@
-import re
+import re, struct
 from collections import defaultdict
 
 addr_ops = {'BRA', 'BRX', 'BRXU', 'CALL', 'JMP', 'JMX', 'JMXU', 'RET', 'BSSY', 'SSY', 'CAL', 'PRET', 'PBK'}

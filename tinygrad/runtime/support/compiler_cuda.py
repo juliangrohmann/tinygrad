@@ -89,6 +89,8 @@ class SASSCompiler(CUDACompiler):
   def compile(self, src:str) -> bytes:
     def assemble(ctrl:int, key:str, vals:Sequence[int], modi:Sequence[str]) -> bytes:
       return ((self.compile_ctrl(ctrl) << 105) + self.compile_ins(key, vals, modi)).to_bytes(16, 'little') # sm >= 7x
+    if out := getenv("WRITE_SRC", ""):
+      with open(pathlib.Path(out) / "rendered.cuasm", "w") as f: f.write(src)
     parser = SASSParser(src)
     kernel = b''.join(assemble(*parser.parse(line)) for line in src.split('\n') if line.strip().startswith('['))
     (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
