@@ -58,6 +58,7 @@ if __name__ == "__main__":
   impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
   start, end, max_nodes = getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
+    print(f"{num=}")
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end):
       continue
 

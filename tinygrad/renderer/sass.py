@@ -176,14 +176,14 @@ class SASSRenderer(Renderer):
   def render_log2(self, dest:Register, src:Register, pred:Register, *bufs:List[Register]) -> List[Instruction]:
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
     ins = [Instruction("FSETP", pred,    ["PT", src, "1.175494350822287508e-38", "PT"], mods=[".GEU", ".AND"]),
-           Instruction("FMUL",  src,     [src, "8388608"],                              pred=pred.negate()),
+           Instruction("FMUL",  src,     [src, "8388608"], pred=pred.negate()),
            Instruction("IADD3", dest,    [src, "-0x3f3504f3", "RZ"]),
-           Instruction("LOP3",  bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"],     mods=[".LUT"]),
+           Instruction("LOP3",  bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"], mods=[".LUT"]),
            Instruction("IADD3", dest,    [src, bufs[0].negate(), "RZ"]),
            Instruction("I2FP",  bufs[0], [bufs[0]], mods=[".F32", ".S32"]),
            Instruction("FADD",  bufs[1], [dest, "-1"]),
            Instruction("FSEL",  dest,    ["RZ", "-23", pred]),
-           Instruction("ISETP", pred,    ["PT", src, "0x7f800000", "PT"],               mods=[".GE", ".U32", ".AND"]),
+           Instruction("ISETP", pred,    ["PT", src, "0x7f800000", "PT"], mods=[".GE", ".U32", ".AND"]),
            Instruction("MOV",   bufs[2], ["0x3dc6b27f"]),
            Instruction("FFMA",  bufs[3], [bufs[1], bufs[2], "-0.16845393180847167969"])]
     params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
@@ -192,11 +192,11 @@ class SASSRenderer(Renderer):
     for _ in range(2): ins.append(Instruction("FMUL", bufs[3], [bufs[1], bufs[3]]))
     ins.extend([Instruction("FFMA",  bufs[3], [bufs[1], "1.4426950216293334961", bufs[3]]),
                 Instruction("FFMA",  dest,    [bufs[0], "1.1920928955078125e-07", dest]),
-                Instruction("MOV",   bufs[0], ["0x7f800000"],          pred=pred),
+                Instruction("MOV",   bufs[0], ["0x7f800000"], pred=pred),
                 Instruction("FADD",  dest,    [dest, bufs[3]]),
-                Instruction("FFMA",  dest,    [src, bufs[0], "+INF"],  pred=pred),
+                Instruction("FFMA",  dest,    [src, bufs[0], "+INF"], pred=pred),
                 Instruction("FSETP", pred,    ["PT", src, "RZ", "PT"], mods=[".NEU", ".AND"]),
-                Instruction("FSEL",  dest,    [dest, "-INF",           pred])])
+                Instruction("FSEL",  dest,    [dest, "-INF", pred])])
     return ins
 
   def render(self, name:str, uops:List[UOp]) -> str:
