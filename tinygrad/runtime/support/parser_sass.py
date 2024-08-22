@@ -78,7 +78,6 @@ class SASSParser:
         if addr: self.labels[r.groups()[0]] = hex(addr + 16)
         elif not self.function_name and r.groups()[0].startswith(".text."): self.function_name = r.groups()[0].replace(".text.", "", 1)
         else: raise ValueError
-    self.ins_size = addr + 16
 
   def parse_attributes(self, src):
     c_size, c_base = 0, 0x160
