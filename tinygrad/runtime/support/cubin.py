@@ -4,12 +4,11 @@ from tinygrad.runtime.support.parser_sass import SASSParser
 from tinygrad.runtime.support.elf import ElfSection, ElfSegment, make_elf
 
 strtab_common_pre = (".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.FUNC", ".nv.info.FUNC", ".nv.shared.FUNC")
-strtab_common_post = (".nv.callgraph", ".nv.prototype", ".nv.rel.action")
+strtab_common_post = (".nv.prototype", ".nv.rel.action")
 strtab_names = strtab_common_pre + (".rel.nv.constant0.FUNC", ".nv.constant0.FUNC") + strtab_common_post + ("FUNC",)
 shstrtab_names = strtab_common_pre + (".nv.constant0.FUNC", ".rel.nv.constant0.FUNC") + strtab_common_post
-sym_names = (".text.FUNC", ".nv.constant0.FUNC", ".nv.callgraph", ".nv.rel.action", "FUNC")
-section_names = (".shstrtab", ".strtab", ".symtab", ".nv.info", ".nv.info.FUNC", ".nv.callgraph",
-                 ".nv.rel.action", ".nv.constant0.FUNC", ".text.FUNC")
+sym_names = (".text.FUNC", ".nv.constant0.FUNC", ".nv.rel.action", "FUNC")
+section_names = (".shstrtab", ".strtab", ".symtab", ".nv.info", ".nv.info.FUNC", ".nv.rel.action", ".nv.constant0.FUNC", ".text.FUNC") # TODO: is .nv.info needed?
 eiattr = {'EIATTR_CTAIDZ_USED': 0x0401, 'EIATTR_MAX_THREADS': 0x0504, 'EIATTR_PARAM_CBANK': 0x0a04, 'EIATTR_EXTERNS': 0x0f04, # TODO: make ' and " consistent
           'EIATTR_REQNTID': 0x1004, 'EIATTR_FRAME_SIZE': 0x1104, 'EIATTR_MIN_STACK_SIZE': 0x1204, 'EIATTR_BINDLESS_TEXTURE_BANK': 0x1502,
           'EIATTR_BINDLESS_SURFACE_BANK': 0x1602, 'EIATTR_KPARAM_INFO': 0x1704, 'EIATTR_CBANK_PARAM_SIZE': 0x1903, 'EIATTR_MAXREG_COUNT': 0x1b03,
@@ -36,7 +35,6 @@ def make_cubin(kernel:bytes, eiattr, parser:SASSParser, arch:str) -> memoryview:
              ".text.FUNC": build_kernel(kernel, parser.function_name, attr),
              ".nv.info": build_nv_info(attr),
              ".nv.info.FUNC": build_nv_info_func(parser.function_name, attr),
-             ".nv.callgraph": build_nv_callgraph(),
              ".nv.rel.action": build_nv_rel_action(),
              ".nv.constant0.FUNC": build_constant_memory(parser.function_name, parser.c_mem_sz)}
   sec_tab[".symtab"] = build_symtab(parser.function_name, sec_tab[".strtab"], sec_tab[".text.FUNC"])
@@ -105,11 +103,6 @@ def build_nv_info_func(function_name:str, attr:Dict[str, Union[List[List[int]], 
   sh = libc.Elf64_Shdr(sh_type=libc.SHT_LOPROC, sh_flags=0x40, sh_link=section_names.index(".symtab") + 1,
                        sh_info=section_names.index(".text.FUNC") + 1, sh_addralign=4) # TODO: sh_info is a guess, not documented
   return ElfSection(f".nv.info.{function_name}", sh, pack_eiattr_tab(nv_info_func_attr, attr))
-
-def build_nv_callgraph() -> ElfSection:
-  sh = libc.Elf64_Shdr(sh_type=libc.SHT_LOPROC + libc.SHT_PROGBITS, sh_link=section_names.index(".symtab") + 1, sh_addralign=4, sh_entsize=8)
-  content = b''.join(b'\0'*4 + ((1 << 8) - 1 - i).to_bytes(1, "little") + b'\xff'*3 for i in range(4))
-  return ElfSection(f".nv.callgraph", sh, content)
 
 def build_nv_rel_action() -> ElfSection:
   return ElfSection(f".nv.rel.action", libc.Elf64_Shdr(sh_type=libc.SHT_LOPROC + libc.SHT_DYNSYM, sh_addralign=8, sh_entsize=8), nv_rel_action)
