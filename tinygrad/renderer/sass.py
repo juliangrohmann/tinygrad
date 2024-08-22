@@ -324,7 +324,7 @@ class SASSRenderer(Renderer):
         vals[u] = const_addr(u)
         attr["PARAM_COUNT"] += 1
       elif op is UOps.DEFINE_ACC:
-        vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), render_value(arg[0], dtype), dtype))
+        vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
       elif op is UOps.RANGE:
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
         queue(u, Instruction(label := f".LOOP_{new_loop()}", None, None, label=True))

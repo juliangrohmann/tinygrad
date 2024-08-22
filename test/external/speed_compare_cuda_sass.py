@@ -55,8 +55,8 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
-  start, end = getenv("START", 0), getenv("END", len(ast_strs))
+  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
+  start, end, max_nodes = getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end):
       continue
@@ -66,6 +66,9 @@ if __name__ == "__main__":
     lin = ast_str_to_lin(ast, opts=dev.renderer)
     lin.hand_coded_optimizations()
     cuda_prg = CompiledRunner(lin.to_program())
+
+    if max_nodes != -1 and len(lin.uops) > max_nodes:
+      continue
 
     dev.compiler = SASSCompiler(dev.arch) if not getenv("CUASM", 0) else CuAsmCompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=sass if not is_debug else dev.renderer)
@@ -81,10 +84,13 @@ if __name__ == "__main__":
 
     if is_debug:
       if debug_cuasm:
-        parser = CuAsmParser()
-        parser.parse(debug_cuasm)
-        parser.saveAsCubin(cubin_buf := BytesIO())
-        cubin = bytes(cubin_buf.getbuffer())
+        if getenv("CUASM", 0):
+          parser = CuAsmParser()
+          parser.parse(debug_cuasm)
+          parser.saveAsCubin(cubin_buf := BytesIO())
+          cubin = bytes(cubin_buf.getbuffer())
+        else:
+          with open(debug_cuasm) as f: cubin = SASSCompiler(dev.arch).compile(f.read())
       else:
         with open(debug_cubin, "rb") as f: cubin = f.read();
 
