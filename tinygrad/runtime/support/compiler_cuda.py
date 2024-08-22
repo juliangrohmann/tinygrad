@@ -1,7 +1,9 @@
-import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, io
-from typing import Callable
+import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, io, json
+from typing import Callable, Sequence
 from tinygrad.helpers import to_char_p_p, colored, init_c_var, getenv
 import tinygrad.runtime.autogen.nvrtc as nvrtc
+from tinygrad.runtime.support.parser_sass import SASSParser
+from tinygrad.runtime.support.cubin import make_cubin
 from tinygrad.device import Compiler, CompileError
 from CuAsm import CuAsmParser
 
@@ -50,7 +52,8 @@ class CUDACompiler(Compiler):
   def __init__(self, arch:str, cache_key:str="cuda"):
     self.arch, self.compile_options = arch, [f'--gpu-architecture={arch}', "-I/usr/local/cuda/include", "-I/usr/include", "-I/opt/cuda/include/"]
     nvrtc_check(nvrtc.nvrtcVersion((nvrtcMajor := ctypes.c_int()), (nvrtcMinor := ctypes.c_int())))
-    if (nvrtcMajor.value, nvrtcMinor.value) >= (12, 4): self.compile_options.append("--minimal")
+    self.version = (nvrtcMajor.value, nvrtcMinor.value)
+    if self.version >= (12, 4): self.compile_options.append("--minimal")
     super().__init__(f"compile_{cache_key}_{self.arch}")
   def _compile_program(self, src:str, nvrtc_get_content:Callable, nvrtc_get_size:Callable) -> bytes:
     nvrtc_check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog := nvrtc.nvrtcProgram()), src.encode(), "<null>".encode(), 0, None, None))
@@ -77,6 +80,34 @@ class NVPTXCompiler(PTXCompiler):
     data = _get_bytes(handle, nvrtc.nvJitLinkGetLinkedCubin, nvrtc.nvJitLinkGetLinkedCubinSize, jitlink_check)
     jitlink_check(nvrtc.nvJitLinkDestroy(handle))
     return data
+
+class SASSCompiler(CUDACompiler):
+  def __init__(self, arch:str):
+    with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.ins_repo = json.load(f) # TODO: this probably shouldn't be json
+    super().__init__(arch, cache_key="sass")
+
+  def compile(self, src:str) -> bytes:
+    def assemble(ctrl:int, key:str, vals:Sequence[int], modi:Sequence[str]) -> bytes:
+      return ((self.compile_ctrl(ctrl) << 105) + self.compile_ins(key, vals, modi)).to_bytes(16, 'little') # sm >= 7x
+    parser = SASSParser(src)
+    kernel = b''.join(assemble(*parser.parse(line)) for line in src.split('\n') if line.strip().startswith('['))
+    (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
+    return bytes(make_cubin(kernel, attr, parser, self.arch))
+
+  def compile_ins(self, key:str, vals:Sequence[int], modi:Sequence[str]) -> int:
+    repo = self.ins_repo[key]
+    code = sum(v0 * vs for v0, vs in zip(repo["sol"][-len(vals):], vals))
+    code += sum(repo["sol"][repo["modi"][m]] for m in modi)
+    return code // repo["fac"]
+
+  def compile_ctrl(self, ctrl:str) -> int:
+    s_waitbar, s_readbar, s_writebar, s_yield, s_stall = tuple(ctrl.split(':')) # format: [B------:R-:W-:Y:S15]
+    c_waitbar = int(''.join('1' if c != '-' else '0' for c in s_waitbar[:0:-1]), 2)
+    c_readbar = int(s_readbar[1].replace('-', '7'))
+    c_writebar = int(s_writebar[1].replace('-','7'))
+    c_yield = int(s_yield != 'Y')
+    c_stall = int(s_stall[1:])
+    return sum(c << i for c,i in zip([c_waitbar, c_readbar, c_writebar, c_yield, c_stall], [11, 8, 5, 4, 0]))
 
 class CuAsmCompiler(Compiler):
   def __init__(self, arch:str):
