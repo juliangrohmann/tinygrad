@@ -93,8 +93,8 @@ sass_matcher = PatternMatcher([
 class SASSRenderer(Renderer):
   device = "CUDA"
   suffix = "SASS"
-  global_max = [65535, 65535, 2147483647]
-  local_max = [64, 1024, 1024]
+  global_max = (2147483647, 65535, 65535)
+  local_max = (1024, 1024, 64)
   shared_max = 49152
   tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2),(0,2),(1,2),(1,2),(1,2)], dtype_in=di, dtype_out=do) for (di, do) in ([(dtypes.half, dtypes.float)])] # noqa: E501
   extra_matcher = sass_matcher
@@ -163,8 +163,11 @@ class SASSRenderer(Renderer):
     else:
       raise NotImplementedError
 
-  def render_bra(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
-    return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), Instruction("BRA", None, [f"`({label})"], pred=pred)]
+  def render_iter(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
+    return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), *self.render_bra(label, pred)]
+
+  def render_bra(self, label:str, pred:Register) -> List[Instruction]:
+    return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
 
   def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType):
     return [Instruction("MUFU", dest, [src], mods=[".RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
@@ -173,30 +176,30 @@ class SASSRenderer(Renderer):
             Instruction("FFMA", dest, [dest, buf, dest])]
 
 
-  def render_log2(self, dest:Register, src:Register, pred:Register, *bufs:List[Register]) -> List[Instruction]:
+  def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]:
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
-    ins = [Instruction("FSETP", pred,    ["PT", src, "1.175494350822287508e-38", "PT"], mods=[".GEU", ".AND"]),
-           Instruction("FMUL",  src,     [src, "8388608"], pred=pred.negate()),
-           Instruction("IADD3", dest,    [src, "-0x3f3504f3", "RZ"]),
-           Instruction("LOP3",  bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"], mods=[".LUT"]),
-           Instruction("IADD3", dest,    [src, bufs[0].negate(), "RZ"]),
-           Instruction("I2FP",  bufs[0], [bufs[0]], mods=[".F32", ".S32"]),
-           Instruction("FADD",  bufs[1], [dest, "-1"]),
-           Instruction("FSEL",  dest,    ["RZ", "-23", pred]),
-           Instruction("ISETP", pred,    ["PT", src, "0x7f800000", "PT"], mods=[".GE", ".U32", ".AND"]),
-           Instruction("MOV",   bufs[2], ["0x3dc6b27f"]),
-           Instruction("FFMA",  bufs[3], [bufs[1], bufs[2], "-0.16845393180847167969"])]
+    ins = [Instruction("FSETP", pred, ["PT", src, "1.175494350822287508e-38", "PT"], mods=[".GEU", ".AND"]),
+           Instruction("FMUL", src, [src, "8388608"], pred=pred.negate()),
+           Instruction("IADD3", dest, [src, "-0x3f3504f3", "RZ"]),
+           Instruction("LOP3", bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"], mods=[".LUT"]),
+           Instruction("IADD3", dest, [src, bufs[0].negate(), "RZ"]),
+           Instruction("I2FP", bufs[0], [bufs[0]], mods=[".F32", ".S32"]),
+           Instruction("FADD", bufs[1], [dest, "-1"]),
+           Instruction("FSEL", dest, ["RZ", "-23", pred]),
+           Instruction("ISETP", pred, ["PT", src, "0x7f800000", "PT"], mods=[".GE", ".U32", ".AND"]),
+           Instruction("MOV", bufs[2], ["0x3dc6b27f"]),
+           Instruction("FFMA", bufs[3], [bufs[1], bufs[2], "-0.16845393180847167969"])]
     params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
               "0.28857114911079406738", "-0.36067417263984680176", "0.48089820146560668945", "-0.72134751081466674805"]
     for p in params: ins.append(Instruction("FFMA", bufs[3], [bufs[1], bufs[3], p]))
     for _ in range(2): ins.append(Instruction("FMUL", bufs[3], [bufs[1], bufs[3]]))
-    ins.extend([Instruction("FFMA",  bufs[3], [bufs[1], "1.4426950216293334961", bufs[3]]),
-                Instruction("FFMA",  dest,    [bufs[0], "1.1920928955078125e-07", dest]),
-                Instruction("MOV",   bufs[0], ["0x7f800000"], pred=pred),
-                Instruction("FADD",  dest,    [dest, bufs[3]]),
-                Instruction("FFMA",  dest,    [src, bufs[0], "+INF"], pred=pred),
-                Instruction("FSETP", pred,    ["PT", src, "RZ", "PT"], mods=[".NEU", ".AND"]),
-                Instruction("FSEL",  dest,    [dest, "-INF", pred])])
+    ins.extend([Instruction("FFMA", bufs[3], [bufs[1], "1.4426950216293334961", bufs[3]]),
+                Instruction("FFMA", dest, [bufs[0], "1.1920928955078125e-07", dest]),
+                Instruction("MOV", bufs[0], ["0x7f800000"], pred=pred),
+                Instruction("FADD", dest, [dest, bufs[3]]),
+                Instruction("FFMA", dest, [src, bufs[0], "+INF"], pred=pred),
+                Instruction("FSETP", pred, ["PT", src, "RZ", "PT"], mods=[".NEU", ".AND"]),
+                Instruction("FSEL", dest, [dest, "-INF", pred])])
     return ins
 
   def render(self, name:str, uops:List[UOp]) -> str:
@@ -234,11 +237,11 @@ class SASSRenderer(Renderer):
       return active_barriers[0]
 
     iter_stack = []
-    loop_cnt = 0
-    def new_loop():
-      nonlocal loop_cnt
-      loop_cnt += 1
-      return loop_cnt - 1
+    label_cnt = 0
+    def new_label():
+      nonlocal label_cnt
+      label_cnt += 1
+      return label_cnt - 1
 
     def unity() -> Register:
       if not 1 in vals: vals[1] = queue(None, self.render_mov(new_reg(), "0x1", dtypes.int))
@@ -327,9 +330,9 @@ class SASSRenderer(Renderer):
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
       elif op is UOps.RANGE:
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
-        queue(u, Instruction(label := f".LOOP_{new_loop()}", None, None, label=True))
+        queue(u, Instruction(label := f".LOOP_{new_label()}", None, None, label=True))
         update = render_alu(BinaryOps.ADD, vals[u], vals[u], unity(), dtype)
-        branch = self.render_bra(label, new_pred(), vals[u], to_reg(vin[1]), dtype)
+        branch = self.render_iter(label, new_pred(), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
         vals[u] = queue(u, self.render_mov(vals[vin[0]], vals[vin[1]], dtype))
@@ -340,7 +343,7 @@ class SASSRenderer(Renderer):
           pred = vals[vin[3]] if len(vin) > 3 else None
           vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=[".E"], pred=pred))
           ins.ctrl.write = new_barrier()
-          if (n := nregs(dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
+          if dtype.itemsize != 4: ins.mods.append(f".{'' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}")
           if pred: queue(u, self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
@@ -356,6 +359,11 @@ class SASSRenderer(Renderer):
             vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]]))
             if (n := nregs(vin[0].dtype.itemsize)) > 1 or dtypes.is_unsigned(vin[0].dtype):
               ins.mods.append(f".{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
+          else:
+            raise NotImplementedError
+        elif vin[0].dtype is dtypes.half:
+          if dtype is dtypes.float:
+            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=[".F32"]))
           else:
             raise NotImplementedError
         elif vin[0].dtype is dtypes.bool:
@@ -392,7 +400,7 @@ class SASSRenderer(Renderer):
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), *[vals[v] for v in vin], dtype))
         elif arg is UnaryOps.LOG2:
           assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
-          vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), *[new_reg(dtype.itemsize) for _ in range(4)]))
+          vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
         else:
           raise NotImplementedError
       else:

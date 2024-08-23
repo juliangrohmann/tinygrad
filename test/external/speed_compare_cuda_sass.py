@@ -1,4 +1,4 @@
-import json
+import json, tempfile, hashlib, subprocess, traceback
 from collections import defaultdict
 from io import BytesIO
 from copy import deepcopy
@@ -12,10 +12,11 @@ from extra.optimization.helpers import load_worlds, ast_str_to_lin
 from tinygrad.engine.search import bufs_from_lin
 from tinygrad.runtime.support.compiler_cuda import CUDACompiler, CuAsmCompiler, SASSCompiler
 from tinygrad.runtime.support.elf import elf_loader, make_elf
+from tinygrad.engine.graph import graph_uops
 import tinygrad.runtime.autogen.libc as libc
 from tinygrad.renderer.sass import SASSRenderer
 from CuAsm.CuAsmLogger import CuAsmLogger
-from CuAsm import CuAsmParser
+from CuAsm import CuAsmParser, CubinFile
 
 def info(bufs_cuda, bufs_sass):
   ret = []
@@ -49,17 +50,14 @@ if __name__ == "__main__":
   dev = Device["CUDA"]
   sass = SASSRenderer(dev.arch)
 
-  single = getenv("NUM", -1)
   is_debug = (debug_cuasm := getenv("DEBUG_CUASM", "")) or (debug_cubin := getenv("DEBUG_CUBIN", ""))
-  if single != -1: ast_strs = ast_strs[single:single+1]
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 410] # 29 (move 64+ bits), 39 (underflow uint?), 936 (char cast)
-  start, end, max_nodes = getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
+  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 114, 122, 130, 410]
+  single, start, end, max_nodes = getenv("NUM", -1), getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
-    print(f"{num=}")
-    if (getenv("TEST", 0) and num not in impl) or not (start <= num < end):
+    if (getenv("TEST", 0) and num not in impl) or not (start <= num < end) or (single != -1 and num != single):
       continue
 
     # cuda compile
@@ -68,13 +66,23 @@ if __name__ == "__main__":
     lin.hand_coded_optimizations()
     cuda_prg = CompiledRunner(lin.to_program())
 
-    if max_nodes != -1 and len(lin.uops) > max_nodes:
-      continue
-
     dev.compiler = SASSCompiler(dev.arch) if not getenv("CUASM", 0) else CuAsmCompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=sass if not is_debug else dev.renderer)
     lin.hand_coded_optimizations()
-    raw_prg = lin.to_program()
+    if max_nodes != -1 and len(lin.linearize().uops) > max_nodes: continue
+    if getenv("GRAPH_SASS_UOPS", 0): graph_uops(lin.linearize().uops)
+    if out_dir := getenv("WRITE_SRC", ""):
+      cuda_src = dev.renderer.render(to_function_name(lin.name), lin.uops)
+      fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(cuda_src.encode()).hexdigest()}").as_posix()
+      with open(fn_cu := Path(out_dir) / "src.cu", "w") as f: f.write(cuda_src)
+      subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+      CubinFile(fn + ".cubin").saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+    try:
+      raw_prg = lin.to_program()
+    except (AssertionError, NotImplementedError) as e:
+      print(colored(f"kernel {num}: renderer failure", "red"))
+      print(traceback.format_exc())
+      continue
 
     # init buffers
     np.random.seed(42)
