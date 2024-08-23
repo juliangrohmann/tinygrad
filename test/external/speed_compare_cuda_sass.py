@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 114, 122, 130, 410]
+  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 93, 114, 122, 130, 410]
   single, start, end, max_nodes = getenv("NUM", -1), getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end) or (single != -1 and num != single):
