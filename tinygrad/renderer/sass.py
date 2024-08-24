@@ -290,7 +290,7 @@ class SASSRenderer(Renderer):
           vals[glob.dtype.itemsize] = queue(glob, self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
         glob_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=".WIDE", pred=pred))
         addr_str = glob_addr.render() + ".64"
-      return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
+      return f"desc[{vals['DESC'].render()}][{addr_str}]" # explicit memory descriptor
 
     def glob_mods(dtype:DType):
       sig = '' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) or dtype.itemsize == 1 else 'S'
