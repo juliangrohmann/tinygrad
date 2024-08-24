@@ -104,7 +104,7 @@ if __name__ == "__main__":
         else:
           with open(debug_cuasm) as f: cubin = SASSCompiler(dev.arch).compile(f.read())
       else:
-        with open(debug_cubin, "rb") as f: cubin = f.read();
+        with open(debug_cubin, "rb") as f: cubin = f.read()
 
       debug_prg = CompiledRunner(raw_prg, precompiled=cubin)
       print(f"debug: {debug_prg(debug_bufs, {}, wait=True)*1e6:7.2f} us")
@@ -138,7 +138,7 @@ if __name__ == "__main__":
   with open("results.json", "w") as f:
     json.dump(result, f)
 
-  print(f"{len(result["success"])=}")
-  print(f"{result["compile_failure"]=}")
-  print(f"{result["runtime_failure"]=}")
-  print(f"{result["mismatch"]=}")
+  print(f"{len(result['success'])=}")
+  print(f"{result['compile_failure']=}")
+  print(f"{result['runtime_failure']=}")
+  print(f"{result['mismatch']=}")
