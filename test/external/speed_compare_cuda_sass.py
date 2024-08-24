@@ -8,6 +8,7 @@ from tinygrad import Device
 from tinygrad.device import Buffer
 from tinygrad.engine.realize import CompiledRunner
 from tinygrad.helpers import getenv, to_function_name, colored
+from tinygrad.dtype import dtypes
 from extra.optimization.helpers import load_worlds, ast_str_to_lin
 from tinygrad.engine.search import bufs_from_lin
 from tinygrad.runtime.support.compiler_cuda import CUDACompiler, CuAsmCompiler, SASSCompiler
@@ -54,7 +55,8 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 114, 122, 130, 410]
+  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 64, 93, 105, 114, 122, 130, 134, 139, 185, 198, 199, 200, 204, 215, 216, 226, 228,
+          231, 232, 336, 351, 372, 381, 396, 410, 426, 427, 429, 435, 469]
   single, start, end, max_nodes = getenv("NUM", -1), getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end) or (single != -1 and num != single):
@@ -79,7 +81,7 @@ if __name__ == "__main__":
       CubinFile(fn + ".cubin").saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
     try:
       raw_prg = lin.to_program()
-    except (AssertionError, NotImplementedError) as e:
+    except Exception as e:
       print(colored(f"kernel {num}: renderer failure", "red"))
       print(traceback.format_exc())
       continue
@@ -88,7 +90,8 @@ if __name__ == "__main__":
     np.random.seed(42)
     cuda_bufs = bufs_from_lin(lin)
     for buf in cuda_bufs:
-      buf.copyin(memoryview(np.random.rand(buf.size).astype(np.dtype(buf.dtype.fmt).type)))
+      gen = np.random.uniform if dtypes.is_float(buf.dtype) else np.random.randint
+      buf.copyin(memoryview((gen(-1000, 1000, size=buf.size).astype(np.dtype(buf.dtype.fmt).type))))
     debug_bufs = [Buffer(buf.device, buf.size, buf.dtype, initial_value=bytearray(buf.as_buffer())) for buf in cuda_bufs]
 
     if is_debug:
@@ -106,14 +109,19 @@ if __name__ == "__main__":
       debug_prg = CompiledRunner(raw_prg, precompiled=cubin)
       print(f"debug: {debug_prg(debug_bufs, {}, wait=True)*1e6:7.2f} us")
     else:
-      debug_prg = CompiledRunner(raw_prg)
+      try:
+        debug_prg = CompiledRunner(raw_prg)
+      except Exception as e:
+        print(colored(f"kernel {num}: assembler failure", "red"))
+        print(traceback.format_exc())
+        continue
 
     # run programs
     try:
       cuda_t, debug_t = cuda_prg(cuda_bufs, {}, wait=True), debug_prg(debug_bufs, {}, wait=True)
     except Exception as e:
       print(e)
-      print(colored("runtime failure", "red"))
+      print(colored(f"kernel {num}: runtime failure", "red"))
       result["runtime_failure"].append(num)
 
     # check if cuda and sass buffers match

@@ -23,11 +23,9 @@ def render_value(x, dtype):
   else:
     return render_binary(x, dtype)
 
-def render_binary(x, dtype):
-  formats = {dtypes.uint: "I", dtypes.int: "i", dtypes.double: "d", dtypes.float: "f", dtypes.half: "e"}
-  assert dtype in formats, f"unsupported binary dtype: {dtype}"
-  form = formats[dtype] if dtype in formats else "f"
-  return "0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{form}", x))
+def render_binary(x, dtype): # TODO: simplify
+  x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
+  return f"{'-' if neg else ''}0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{dtype.fmt}", x))
 
 def const_addr(uop:UOp, offset=0):
   param_cbank = int("160", 16) # TODO: make variable
@@ -294,16 +292,20 @@ class SASSRenderer(Renderer):
         addr_str = glob_addr.render() + ".64"
       return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
 
+    def glob_mods(dtype:DType):
+      sig = '' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) or dtype.itemsize == 1 else 'S'
+      return [f".{sig}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
+
     def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register, str], src_r:Union[Register, str], dtype:DType):
       srcs = [src_l, src_r]
-      if dtype is dtypes.int:
+      if dtypes.is_int(dtype):
         if arg is BinaryOps.MUL: srcs.append(vals[0])
         elif arg is BinaryOps.ADD: srcs[1:1] = [unity()]
         else: raise NotImplementedError
       elif not isinstance(srcs[0], Register):
         if isinstance(srcs[1], Register): srcs = srcs[::-1]
         else: srcs[0] = to_reg(vin[0])
-      return Instruction(self.alu[arg][dtype], dest, srcs)
+      return Instruction(self.alu[arg][dtypes.int if dtypes.is_int(dtype) else dtype], dest, srcs)
 
     queue(None, Instruction(f".text.{name}", None, None, label=True))
     vals[0] = Register(-1)
@@ -343,14 +345,14 @@ class SASSRenderer(Renderer):
           pred = vals[vin[3]] if len(vin) > 3 else None
           vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=[".E"], pred=pred))
           ins.ctrl.write = new_barrier()
-          if dtype.itemsize != 4: ins.mods.append(f".{'' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}")
+          ins.mods.extend(glob_mods(dtype))
           if pred: queue(u, self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
       elif op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_GLOBAL:
           queue(u, ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=[".E"]))
-          if (n := nregs(vin[2].dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
+          ins.mods.extend(glob_mods(vin[2].dtype))
         else:
           raise NotImplementedError
       elif op is UOps.CAST:
@@ -359,11 +361,21 @@ class SASSRenderer(Renderer):
             vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]]))
             if (n := nregs(vin[0].dtype.itemsize)) > 1 or dtypes.is_unsigned(vin[0].dtype):
               ins.mods.append(f".{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
+          elif dtypes.is_int(dtype):
+            vals[u] = vals[vin[0]]
           else:
             raise NotImplementedError
         elif vin[0].dtype is dtypes.half:
+          raise NotImplementedError
           if dtype is dtypes.float:
             vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=[".F32"]))
+          else:
+            raise NotImplementedError
+        elif dtypes.is_float(vin[0].dtype):
+          if dtypes.is_int(dtype):
+            if dtype.itemsize > 4: raise NotImplementedError
+            vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])]))
+            ins.mods.extend([f".{'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}", ".TRUNC", ".NTZ"])
           else:
             raise NotImplementedError
         elif vin[0].dtype is dtypes.bool:

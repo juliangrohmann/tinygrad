@@ -83,7 +83,7 @@ class NVPTXCompiler(PTXCompiler):
 
 class SASSCompiler(CUDACompiler):
   def __init__(self, arch:str):
-    with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.ins_repo = json.load(f) # TODO: this probably shouldn't be json
+    with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.ins_repo = json.load(f)
     super().__init__(arch, cache_key="sass")
 
   def compile(self, src:str) -> bytes:
