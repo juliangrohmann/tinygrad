@@ -89,15 +89,15 @@ class SASSCompiler(CUDACompiler):
     with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.cuasm_repo = json.load(f)
     super().__init__(arch, cache_key="sass")
 
-  def compile(self, src:str, cuasm=False) -> bytes:
-    def assemble(ctrl:int, key:str, pred, vals:Sequence[int], modi:Sequence[str], cuasm=False) -> bytes:
+  def compile(self, src:str, cuasm=False, inject=None) -> bytes:
+    def assemble(ctrl:int, key:str, pred, vals:Sequence[int], modi:Sequence[str], cuasm=True) -> bytes:
       return ((self.compile_ctrl(ctrl) << 105) + self.compile_ins(key, pred, vals, modi, cuasm=cuasm)).to_bytes(16, 'little') # sm >= 7x
     if out := getenv("WRITE_SRC", ""):
       with open(pathlib.Path(out) / "rendered.cuasm", "w") as f: f.write(src)
     parser = SASSParser(src)
 
     for line in src.split('\n'):
-      if line.strip().startswith('[') and not "ULDC" in line:
+      if line.strip().startswith('['): # and not "ULDC" in line:
         cuasm_code = self.compile_ins(*parser.parse(line, cuasm=True)[1:], cuasm=True)
         kuter_code = self.compile_ins(*parser.parse(line, cuasm=False)[1:], cuasm=False) + 2**101
         for i,c in enumerate(f"{cuasm_code:0128b}"): print(c, end="" if (i + 1) % 8 != 0 else " ")
@@ -107,6 +107,11 @@ class SASSCompiler(CUDACompiler):
         assert cuasm_code == kuter_code, "MISMATCH"
 
     kernel = b''.join(assemble(*parser.parse(line, cuasm=cuasm), cuasm=cuasm) for line in src.split('\n') if line.strip().startswith('['))
+    if inject:
+      kernel = bytearray(kernel)
+      kernel[:16] = inject
+      kernel = bytes(kernel)
+
     (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
     return bytes(make_cubin(kernel, attr, parser, self.arch))
 
