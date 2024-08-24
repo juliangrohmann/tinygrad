@@ -44,7 +44,7 @@ class SASSParser:
     solver_ins = InstructionParser.parseInstruction(ins)
     key, vals, modi = self.parse_ins(ins, addr)
     if cuasm: return ctrl, key, None, vals, modi
-    return ctrl, solver_ins.get_key(), int(solver_ins.predicate[-1]) if solver_ins.predicate else None, vals, solver_ins.modifiers
+    return ctrl, solver_ins.get_key(), int(solver_ins.predicate[-1]) if solver_ins.predicate else None, vals[1:], solver_ins.modifiers
 
   def parse_ins(self, ins:str, addr:str, cuasm=False):
     for k,v in const_tr.items():

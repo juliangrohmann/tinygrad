@@ -114,11 +114,13 @@ class SASSRenderer(Renderer):
   }
   alu = {
     BinaryOps.ADD: {
+      dtypes.int: "IMAD",
       dtypes.half: "HADD2",
       dtypes.float32: "FADD",
       dtypes.float64: "DADD",
     },
     BinaryOps.MUL: {
+      dtypes.int: "IMAD",
       dtypes.half: "HMUL2",
       dtypes.float32: "FMUL",
       dtypes.float64: "DMUL",
@@ -278,15 +280,15 @@ class SASSRenderer(Renderer):
         glob_addr = vals[glob]
         if not isinstance(glob_addr, Register):
           vals[glob] = glob_addr = new_reg(byte_size=8)
-          queue(glob, Instruction("IMAD", glob_addr, ["RZ", "RZ", const_addr(glob)]))
-          queue(glob, Instruction("IMAD", glob_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)]))
+          queue(glob, Instruction("IMAD", glob_addr, ["RZ", "RZ", const_addr(glob)], mods=[".MOV", ".U32"]))
+          queue(glob, Instruction("IMAD", glob_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=[".MOV", ".U32"]))
         addr_str = glob_addr.render() + ".64"
         if idx.arg != 0:
           addr_str += f"+{hex(idx.arg * nregs(glob.dtype.itemsize) * 4)}"
       else:
         if glob.dtype.itemsize not in vals:
           vals[glob.dtype.itemsize] = queue(glob, self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
-        glob_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], pred=pred))
+        glob_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=".WIDE", pred=pred))
         addr_str = glob_addr.render() + ".64"
       return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
 
@@ -294,15 +296,13 @@ class SASSRenderer(Renderer):
       sig = '' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) or dtype.itemsize == 1 else 'S'
       return [f".{sig}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
 
-    def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register], src_r:Union[Register, str], dtype:DType, pred=None):
-      assert isinstance(src_l, Register), "lhs operand of alu is not a register"
+    def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register, str], src_r:Union[Register, str], dtype:DType):
       srcs = [src_l, src_r]
       if dtypes.is_int(dtype):
         if arg is BinaryOps.MUL: srcs.append(vals[0])
         elif arg is BinaryOps.ADD: srcs[1:1] = [unity()]
         else: raise NotImplementedError
-        return Instruction("IMAD", dest, srcs, mods=[".X"] if pred else [".MOV"] if not isinstance(srcs[1], Register) else [])
-      if not isinstance(srcs[0], Register):
+      elif not isinstance(srcs[0], Register):
         if isinstance(srcs[1], Register): srcs = srcs[::-1]
         else: srcs[0] = to_reg(vin[0])
       return Instruction(self.alu[arg][dtypes.int if dtypes.is_int(dtype) else dtype], dest, srcs)
