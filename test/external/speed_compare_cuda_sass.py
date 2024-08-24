@@ -43,7 +43,7 @@ def allclose(bufs_a, bufs_b):
   return True
 
 if __name__ == "__main__":
-  CuAsmLogger.initLogger("/home/julian/projects/tinycorp/tinygrad/logs/debug.txt", file_level=15, stdout_level=40)
+  CuAsmLogger.initLogger(Path(__file__).parents[2] / "logs" / "debug.txt", file_level=15, stdout_level=40)
 
   ast_strs = load_worlds(filter_reduce=False, filter_novariable=True)
   # no bfloat16 for ptx at the moment
