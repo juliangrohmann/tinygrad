@@ -6,6 +6,7 @@ from tinygrad.runtime.support.parser_sass import SASSParser
 from tinygrad.runtime.support.cubin import make_cubin
 from tinygrad.device import Compiler, CompileError
 from CuAsm import CuAsmParser
+from instruction_solver import ISASpec
 
 PTX = getenv("PTX")  # this shouldn't be here, in fact, it shouldn't exist
 
@@ -83,24 +84,32 @@ class NVPTXCompiler(PTXCompiler):
 
 class SASSCompiler(CUDACompiler):
   def __init__(self, arch:str):
-    with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.ins_repo = json.load(f)
+    with open(pathlib.Path(__file__).parents[3] / "extra" / "assembly" / "sass" / f"isa.{arch}.json") as f:
+      self.ins_repo = ISASpec.from_json(f.read())
+    with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.cuasm_repo = json.load(f)
     super().__init__(arch, cache_key="sass")
 
-  def compile(self, src:str) -> bytes:
-    def assemble(ctrl:int, key:str, vals:Sequence[int], modi:Sequence[str]) -> bytes:
-      return ((self.compile_ctrl(ctrl) << 105) + self.compile_ins(key, vals, modi)).to_bytes(16, 'little') # sm >= 7x
+  def compile(self, src:str, cuasm=True) -> bytes:
+    def assemble(ctrl:int, key:str, pred, vals:Sequence[int], modi:Sequence[str], cuasm=False) -> bytes:
+      return ((self.compile_ctrl(ctrl) << 105) + self.compile_ins(key, pred, vals, modi, cuasm=cuasm)).to_bytes(16, 'little') # sm >= 7x
     if out := getenv("WRITE_SRC", ""):
       with open(pathlib.Path(out) / "rendered.cuasm", "w") as f: f.write(src)
     parser = SASSParser(src)
-    kernel = b''.join(assemble(*parser.parse(line)) for line in src.split('\n') if line.strip().startswith('['))
+    kernel = b''.join(assemble(*parser.parse(line, cuasm=cuasm), cuasm=cuasm) for line in src.split('\n') if line.strip().startswith('['))
     (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
     return bytes(make_cubin(kernel, attr, parser, self.arch))
 
-  def compile_ins(self, key:str, vals:Sequence[int], modi:Sequence[str]) -> int:
-    repo = self.ins_repo[key]
-    code = sum(v0 * vs for v0, vs in zip(repo["sol"][-len(vals):], vals))
-    code += sum(repo["sol"][repo["modi"][m]] for m in modi)
-    return code // repo["fac"]
+  def compile_ins(self, key:str, pred, vals:Sequence[int], modi:Sequence[str], cuasm=False) -> int:
+    if cuasm:
+      repo = self.cuasm_repo[key]
+      code = sum(v0 * vs for v0, vs in zip(repo["sol"][-len(vals):], vals))
+      code += sum(repo["sol"][repo["modi"][m]] for m in modi if m in repo["modi"])
+      return code // repo["fac"]
+
+    ins_spec = self.ins_repo.find_instruction(key, modifiers=modi)
+    print(f"{key=}, {pred=}, {vals=}, {modi=}, found={ins_spec is not None}")
+    code = ins_spec.encode(vals, modifiers=modi, predicate=pred if pred else 7)
+    return int.from_bytes(code, 'little') & 2**105 - 1
 
   def compile_ctrl(self, ctrl:str) -> int:
     s_waitbar, s_readbar, s_writebar, s_yield, s_stall = tuple(ctrl.split(':')) # format: [B------:R-:W-:Y:S15]

@@ -109,12 +109,12 @@ if __name__ == "__main__":
       debug_prg = CompiledRunner(raw_prg, precompiled=cubin)
       print(f"debug: {debug_prg(debug_bufs, {}, wait=True)*1e6:7.2f} us")
     else:
-      try:
-        debug_prg = CompiledRunner(raw_prg)
-      except Exception as e:
-        print(colored(f"kernel {num}: assembler failure", "red"))
-        print(traceback.format_exc())
-        continue
+      # try:
+      debug_prg = CompiledRunner(raw_prg)
+      # except Exception as e:
+      #   print(colored(f"kernel {num}: assembler failure", "red"))
+      #   print(traceback.format_exc())
+      #   continue
 
     # run programs
     try:
@@ -123,6 +123,7 @@ if __name__ == "__main__":
       print(e)
       print(colored(f"kernel {num}: runtime failure", "red"))
       result["runtime_failure"].append(num)
+      continue
 
     # check if cuda and sass buffers match
     if allclose(cuda_bufs, debug_bufs):

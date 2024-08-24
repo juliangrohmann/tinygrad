@@ -1,5 +1,6 @@
 import re, struct
 from collections import defaultdict
+from parser import InstructionParser
 
 addr_ops = {'BRA', 'BRX', 'BRXU', 'CALL', 'JMP', 'JMX', 'JMXU', 'RET', 'BSSY', 'SSY', 'CAL', 'PRET', 'PBK'}
 cast_ops = {'I2F', 'I2I', 'F2I', 'F2F', 'I2FP', 'I2IP', 'F2IP', 'F2FP', 'FRND'}
@@ -34,14 +35,18 @@ class SASSParser:
     self.parse_labels(src)
     self.parse_attributes(src)
 
-  def parse(self, line):
+  def parse(self, line, cuasm=False):
     r = text_pat.match(strip_comments(line).strip())
     ctrl, ins = r.groups()
-    addr = parse_ins_addr(line)
-    return ctrl, *self.parse_ins(ins, addr)
-
-  def parse_ins(self, ins:str, addr:str):
     ins = self.labels_to_addr(ins.strip())
+    # print(f"\n{ins=}")
+    addr = parse_ins_addr(line)
+    solver_ins = InstructionParser.parseInstruction(ins)
+    key, vals, modi = self.parse_ins(ins, addr)
+    if cuasm: return ctrl, key, None, vals, modi
+    return ctrl, solver_ins.get_key(), int(solver_ins.predicate[-1]) if solver_ins.predicate else None, vals, solver_ins.modifiers
+
+  def parse_ins(self, ins:str, addr:str, cuasm=False):
     for k,v in const_tr.items():
       ins = re.sub(k, v, ins)
 
