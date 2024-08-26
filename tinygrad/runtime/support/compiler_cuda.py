@@ -84,7 +84,7 @@ class NVPTXCompiler(PTXCompiler):
 
 class SASSCompiler(CUDACompiler):
   def __init__(self, arch:str):
-    with open(pathlib.Path(__file__).parents[3] / "extra" / "assembly" / "sass" / f"isa.{arch}.json") as f:
+    with open(pathlib.Path(__file__).parents[3] / "extra" / "assembly" / "sass" / f"isa.real.json") as f:
       self.ins_repo = ISASpec.from_json(f.read())
     with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.cuasm_repo = json.load(f)
     super().__init__(arch, cache_key="sass")
