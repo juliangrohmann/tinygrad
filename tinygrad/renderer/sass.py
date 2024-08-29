@@ -75,7 +75,7 @@ class Instruction:
   def render(self):
     if self.label: return f"  {self.op}:"
     operands = ', '.join(([self.dest.render()] if self.dest else []) + [s.render() if isinstance(s, Register) else s for s in self.srcs])
-    ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join(self.mods)} {operands}"
+    ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
 sass_matcher = PatternMatcher([
@@ -136,7 +136,7 @@ class SASSRenderer(Renderer):
     if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"):
       src = render_binary(float(src), dtype)
     ins = Instruction("MOV", dest, [src], pred=pred)
-    if(n := nregs(dtype.itemsize)) > 1: ins.mods.append(f".{n*32}")
+    if(n := nregs(dtype.itemsize)) > 1: ins.mods.append(f"{n*32}")
     return ins
 
   def render_where(self, dest, pred:Union[Register, str], src_t:Union[Register,str], src_f:Union[Register,str], dtype:DType) -> List[Instruction]:
@@ -149,15 +149,15 @@ class SASSRenderer(Renderer):
       for i in range(0, nregs(dtype.itemsize)): # 64bit+ (long)
         assert arg is BinaryOps.CMPNE or i == 0, f"64bit+ only supported for CMPNE. {arg=}"
         srcs = [s.offset(i) for s in srcs]
-        ret.append(ins := Instruction("ISETP", dest, ["PT"] + srcs + ["PT"], mods=[f".{self.setp_mod[arg]}"]))
-        if dtypes.is_unsigned(dtype): ins.mods.append(".U32")
-        ins.mods.append(".AND")
+        ret.append(ins := Instruction("ISETP", dest, ["PT"] + srcs + ["PT"], mods=[f"{self.setp_mod[arg]}"]))
+        if dtypes.is_unsigned(dtype): ins.mods.append("U32")
+        ins.mods.append("AND")
         if i > 0:
-          ins.mods.append(".EX")
+          ins.mods.append("EX")
           ins.srcs.append(dest)
       return ret
     elif dtype is dtypes.bool:
-      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.lop['^&']), mods=".LUT")]
+      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.lop['^&']), mods="LUT")]
     else:
       raise NotImplementedError
 
@@ -168,23 +168,23 @@ class SASSRenderer(Renderer):
     return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
 
   def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType):
-    return [Instruction("MUFU", dest, [src], mods=[".RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
+    return [Instruction("MUFU", dest, [src], mods=["RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
             Instruction("FFMA", buf, [dest, src, "-1"]),
-            Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=[".FTZ"]),
+            Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=["FTZ"]),
             Instruction("FFMA", dest, [dest, buf, dest])]
 
 
   def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]:
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
-    ins = [Instruction("FSETP", pred, ["PT", src, "1.175494350822287508e-38", "PT"], mods=[".GEU", ".AND"]),
+    ins = [Instruction("FSETP", pred, ["PT", src, "1.175494350822287508e-38", "PT"], mods=["GEU", "AND"]),
            Instruction("FMUL", src, [src, "8388608"], pred=pred.negate()),
            Instruction("IADD3", dest, [src, "-0x3f3504f3", "RZ"]),
-           Instruction("LOP3", bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"], mods=[".LUT"]),
+           Instruction("LOP3", bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"], mods=["LUT"]),
            Instruction("IADD3", dest, [src, bufs[0].negate(), "RZ"]),
-           Instruction("I2FP", bufs[0], [bufs[0]], mods=[".F32", ".S32"]),
+           Instruction("I2FP", bufs[0], [bufs[0]], mods=["F32", "S32"]),
            Instruction("FADD", bufs[1], [dest, "-1"]),
            Instruction("FSEL", dest, ["RZ", "-23", pred]),
-           Instruction("ISETP", pred, ["PT", src, "0x7f800000", "PT"], mods=[".GE", ".U32", ".AND"]),
+           Instruction("ISETP", pred, ["PT", src, "0x7f800000", "PT"], mods=["GE", "U32", "AND"]),
            Instruction("MOV", bufs[2], ["0x3dc6b27f"]),
            Instruction("FFMA", bufs[3], [bufs[1], bufs[2], "-0.16845393180847167969"])]
     params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
@@ -196,7 +196,7 @@ class SASSRenderer(Renderer):
                 Instruction("MOV", bufs[0], ["0x7f800000"], pred=pred),
                 Instruction("FADD", dest, [dest, bufs[3]]),
                 Instruction("FFMA", dest, [src, bufs[0], "+INF"], pred=pred),
-                Instruction("FSETP", pred, ["PT", src, "RZ", "PT"], mods=[".NEU", ".AND"]),
+                Instruction("FSETP", pred, ["PT", src, "RZ", "PT"], mods=["NEU", "AND"]),
                 Instruction("FSEL", dest, [dest, "-INF", pred])])
     return ins
 
@@ -277,24 +277,24 @@ class SASSRenderer(Renderer):
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
       if idx.op is UOps.CONST:
-        glob_addr = vals[glob]
-        if not isinstance(glob_addr, Register):
-          vals[glob] = glob_addr = new_reg(byte_size=8)
-          queue(glob, Instruction("IMAD", glob_addr, ["RZ", "RZ", const_addr(glob)], mods=[".MOV", ".U32"]))
-          queue(glob, Instruction("IMAD", glob_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=[".MOV", ".U32"]))
-        addr_str = glob_addr.render() + ".64"
+        g_addr = vals[glob]
+        if not isinstance(g_addr, Register):
+          vals[glob] = g_addr = new_reg(byte_size=8)
+          queue(glob, Instruction("IMAD", g_addr, ["RZ", "RZ", const_addr(glob)], mods=["MOV", "U32"]))
+          queue(glob, Instruction("IMAD", g_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=["MOV", "U32"]))
+        addr_str = g_addr.render() + ".64"
         if idx.arg != 0:
           addr_str += f"+{hex(idx.arg * nregs(glob.dtype.itemsize) * 4)}"
       else:
         if glob.dtype.itemsize not in vals:
           vals[glob.dtype.itemsize] = queue(glob, self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
-        glob_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=".WIDE", pred=pred))
-        addr_str = glob_addr.render() + ".64"
+        g_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods="WIDE", pred=pred))
+        addr_str = g_addr.render() + ".64"
       return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
 
     def glob_mods(dtype:DType):
       sig = '' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) or dtype.itemsize == 1 else 'S'
-      return [f".{sig}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
+      return [f"{sig}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
 
     def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register, str], src_r:Union[Register, str], dtype:DType):
       srcs = [src_l, src_r]
@@ -311,7 +311,7 @@ class SASSRenderer(Renderer):
     vals[0] = Register(-1)
     vals[float("inf")] = "INF"
     vals[float("-inf")] = "-INF"
-    vals["DESC"] = queue(None, Instruction("ULDC", Register(idx=4, uniform=True), ["c[0x0][0x118]"], mods=[".64"])) # load explicit memory descriptor
+    vals["DESC"] = queue(None, Instruction("ULDC", Register(idx=4, uniform=True), ["c[0x0][0x118]"], mods=["64"])) # load explicit memory descriptor
 
     for u in uops:
       op, dtype, vin, arg = u.op, u.dtype, u.src, u.arg
@@ -343,7 +343,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.LOAD:
         if vin[0].op is UOps.DEFINE_GLOBAL:
           pred = vals[vin[3]] if len(vin) > 3 else None
-          vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=[".E"], pred=pred))
+          vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"], pred=pred))
           ins.ctrl.write = new_barrier()
           ins.mods.extend(glob_mods(dtype))
           if pred: queue(u, self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
@@ -351,7 +351,7 @@ class SASSRenderer(Renderer):
           raise NotImplementedError
       elif op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_GLOBAL:
-          queue(u, ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=[".E"]))
+          queue(u, ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=["E"]))
           ins.mods.extend(glob_mods(vin[2].dtype))
         else:
           raise NotImplementedError
@@ -360,7 +360,7 @@ class SASSRenderer(Renderer):
           if dtypes.is_float(dtype):
             vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]]))
             if (n := nregs(vin[0].dtype.itemsize)) > 1 or dtypes.is_unsigned(vin[0].dtype):
-              ins.mods.append(f".{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
+              ins.mods.append(f"{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
           elif dtypes.is_int(dtype):
             vals[u] = vals[vin[0]]
           else:
@@ -368,14 +368,14 @@ class SASSRenderer(Renderer):
         elif vin[0].dtype is dtypes.half:
           raise NotImplementedError
           if dtype is dtypes.float:
-            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=[".F32"]))
+            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=["F32"]))
           else:
             raise NotImplementedError
         elif dtypes.is_float(vin[0].dtype):
           if dtypes.is_int(dtype):
             if dtype.itemsize > 4: raise NotImplementedError
             vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])]))
-            ins.mods.extend([f".{'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}", ".TRUNC", ".NTZ"])
+            ins.mods.extend([f"{'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}", "TRUNC", "NTZ"])
           else:
             raise NotImplementedError
         elif vin[0].dtype is dtypes.bool:
@@ -396,7 +396,7 @@ class SASSRenderer(Renderer):
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
           if len(srcs) == 2: srcs.append("PT")
-          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods=".LUT"))
+          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods="LUT"))
         elif arg in [BinaryOps.MUL, BinaryOps.ADD]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))

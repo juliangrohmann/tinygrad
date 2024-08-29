@@ -11,7 +11,7 @@ from tinygrad.helpers import getenv, to_function_name, colored
 from tinygrad.dtype import dtypes
 from extra.optimization.helpers import load_worlds, ast_str_to_lin
 from tinygrad.engine.search import bufs_from_lin
-from tinygrad.runtime.support.compiler_cuda import CUDACompiler, CuAsmCompiler, SASSCompiler
+from tinygrad.runtime.support.compiler_cuda import CUDACompiler, SASSCompiler
 from tinygrad.runtime.support.elf import elf_loader, make_elf
 from tinygrad.engine.graph import graph_uops
 import tinygrad.runtime.autogen.libc as libc
@@ -51,7 +51,7 @@ if __name__ == "__main__":
   dev = Device["CUDA"]
   sass = SASSRenderer(dev.arch)
 
-  is_debug = (debug_cuasm := getenv("DEBUG_CUASM", "")) or (debug_cubin := getenv("DEBUG_CUBIN", ""))
+  is_debug = (debug_sass := getenv("DEBUG_SASS", "")) or (debug_cubin := getenv("DEBUG_CUBIN", ""))
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     lin.hand_coded_optimizations()
     cuda_prg = CompiledRunner(lin.to_program())
 
-    dev.compiler = SASSCompiler(dev.arch) if not getenv("CUASM", 0) else CuAsmCompiler(dev.arch)
+    dev.compiler = SASSCompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=sass if not is_debug else dev.renderer)
     lin.hand_coded_optimizations()
     if max_nodes != -1 and len(lin.linearize().uops) > max_nodes: continue
@@ -95,17 +95,10 @@ if __name__ == "__main__":
     debug_bufs = [Buffer(buf.device, buf.size, buf.dtype, initial_value=bytearray(buf.as_buffer())) for buf in cuda_bufs]
 
     if is_debug:
-      if debug_cuasm:
-        if getenv("CUASM", 0):
-          parser = CuAsmParser()
-          parser.parse(debug_cuasm)
-          parser.saveAsCubin(cubin_buf := BytesIO())
-          cubin = bytes(cubin_buf.getbuffer())
-        else:
-          with open(debug_cuasm) as f: cubin = SASSCompiler(dev.arch).compile(f.read())
+      if debug_sass:
+        with open(debug_sass) as f: cubin = SASSCompiler(dev.arch).compile(f.read())
       else:
         with open(debug_cubin, "rb") as f: cubin = f.read();
-
       debug_prg = CompiledRunner(raw_prg, precompiled=cubin)
       print(f"debug: {debug_prg(debug_bufs, {}, wait=True)*1e6:7.2f} us")
     else:

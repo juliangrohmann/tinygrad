@@ -34,7 +34,7 @@ class OpCodeSpec:
   code:int; enc:List[Dict]; cmods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,Dict[str,int]] # noqa: E702
   @classmethod
   def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,Dict[str,int]]):
-    return cls(code, [Encoding(**p) for p in enc], cmods, op_mods, vmods)
+    return cls(code, [Encoding(**p) for p in enc], cmods, op_mods, {int(k):v for k,v in vmods.items()})
 
 class InstructionSpec:
   def __init__(self, specs:Sequence[OpCodeSpec]):
@@ -53,8 +53,7 @@ class SASSAssembler:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
     predicate, values = values[0], values[1:]
     inst, seen = self.isa[key], defaultdict(int)
-    cmods = [mod for mod in op_mods if mod in inst.code_mods]
-    spec = inst.specs[frozenset(cmods)]
+    spec = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
     code = set_bits(predicate, 12, 4)
     for enc in spec.enc:
       if enc.type == EncodingType.CONSTANT:

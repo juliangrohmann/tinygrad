@@ -2,7 +2,7 @@ import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, io, json
 from typing import Callable, Sequence
 from tinygrad.helpers import to_char_p_p, colored, init_c_var, getenv
 import tinygrad.runtime.autogen.nvrtc as nvrtc
-from tinygrad.runtime.support.assembler_sass import SASSParser
+from tinygrad.runtime.support.assembler_sass import SASSParser, SASSAssembler
 from tinygrad.runtime.support.cubin import make_cubin
 from tinygrad.device import Compiler, CompileError
 from CuAsm import CuAsmParser
@@ -83,30 +83,14 @@ class NVPTXCompiler(PTXCompiler):
 
 class SASSCompiler(CUDACompiler):
   def __init__(self, arch:str):
-    with open(pathlib.Path(__file__).parent / f"sass.{arch}.json") as f: self.ins_repo = json.load(f)
+    with open(pathlib.Path(__file__).parent / f"isa.sm_89.json") as f:
+      self.assembler = SASSAssembler(json.load(f))
     super().__init__(arch, cache_key="sass")
 
-  def compile(self, src:str) -> bytes:
-    def assemble(ctrl:int, key:str, vals:Sequence[int], modi:Sequence[str]) -> bytes:
-      return ((self.compile_ctrl(ctrl) << 105) + self.compile_ins(key, vals, modi)).to_bytes(16, 'little') # sm >= 7x
-    if out := getenv("WRITE_SRC", ""):
-      with open(pathlib.Path(out) / "rendered.cuasm", "w") as f: f.write(src)
-    parser = SASSParser(src)
-    kernel = b''.join(assemble(*parser.parse(line)) for line in src.split('\n') if line.strip().startswith('['))
+  def compile(self, src:str, cuasm=False, inject=None) -> bytes:
+    parser, kernel = SASSParser(src), bytearray()
+    for line in src.split('\n'):
+      if line.strip().startswith('['):
+        kernel += self.assembler.assemble(*parser.parse(line))
     (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
     return bytes(make_cubin(kernel, attr, parser, self.arch))
-
-  def compile_ins(self, key:str, vals:Sequence[int], modi:Sequence[str]) -> int:
-    repo = self.ins_repo[key]
-    code = sum(v0 * vs for v0, vs in zip(repo["sol"][-len(vals):], vals))
-    code += sum(repo["sol"][repo["modi"][m]] for m in modi)
-    return code // repo["fac"]
-
-  def compile_ctrl(self, ctrl:str) -> int:
-    s_waitbar, s_readbar, s_writebar, s_yield, s_stall = tuple(ctrl.split(':')) # format: [B------:R-:W-:Y:S15]
-    c_waitbar = int(''.join('1' if c != '-' else '0' for c in s_waitbar[:0:-1]), 2)
-    c_readbar = int(s_readbar[1].replace('-', '7'))
-    c_writebar = int(s_writebar[1].replace('-','7'))
-    c_yield = int(s_yield != 'Y')
-    c_stall = int(s_stall[1:])
-    return sum(c << i for c,i in zip([c_waitbar, c_readbar, c_writebar, c_yield, c_stall], [11, 8, 5, 4, 0]))
