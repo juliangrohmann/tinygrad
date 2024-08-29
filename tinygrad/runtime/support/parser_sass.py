@@ -9,16 +9,10 @@ const_tr = {r'(?<!\.)\bRZ\b': 'R255', r'\bURZ\b': 'UR63', r'\bPT\b': 'P7', r'\bU
 pre_mod = {'!': 'cNOT', '-': 'cNEG', '|': 'cABS', '~': 'cINV'}
 float_fmt = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)}
 ins_pat = re.compile(r'(?P<Pred>@!?U?P\w\s+)?\s*(?P<Op>[\w\.\?]+)(?P<Operands>.*)')
-idx_pat = re.compile(r'\b(?P<Label>R|UR|P|UP|B|SB|SBSET|SR)(?P<Index>\d+)$')
-mod_pat = re.compile(r'^(?P<PreModi>[~\-\|!]*)(?P<Main>.*?)\|?(?P<PostModi>(\.\w+)*)\|?$')
 text_pat = re.compile(r'\[([\w:-]+)\](.*)')
 ins_addr = re.compile(r'/\*([\da-fA-F]{4})\*/')
 reg_imme_addr = re.compile(r'(?P<R>R\d+)\s*(?P<II>-?0x[0-9a-fA-F]+)')
-desc_addr = re.compile(r'desc\[(?P<URIndex>UR\d+)\](?P<Addr>\[.*\])$')
-float_imme = re.compile(r'^(?P<Value>((-?\d+)(\.\d*)?((e|E)[-+]?\d+)?)|([+-]?INF)|([+-]NAN)|-?(0[fF][0-9a-fA-F]+))(?P<ModiSet>(\.[a-zA-Z]\w*)*)$')
 const_mem = re.compile(r'c\[(?P<Bank>0x\w+)\]\[(?P<Addr>[+-?\w\.]+)\]')
-ur_const_mem = re.compile(r'cx\[(?P<URBank>UR\w+)\]\[(?P<Addr>[+-?\w\.]+)\]')
-imme_modi = re.compile(r'^(?P<Value>.*?)(?P<ModiSet>(\.[a-zA-Z]\w*)*)$')
 insig_whitespace = re.compile(r'((?<=[\w\?]) (?![\w\?]))|((?<![\w\?]) (?=[\w\?]))|((?<![\w\?]) (?![\w\?]))')
 whitespace = re.compile(r'\s+')
 cpp_comment = re.compile(r'//.*$') # cpp style line comments TODO: needed?
@@ -36,34 +30,12 @@ class SASSParser:
 
   def parse(self, line):
     r = text_pat.match(strip_comments(line).strip())
+    print(line)
     ctrl, ins = r.groups()
-    addr = parse_ins_addr(line)
-    return ctrl, *self.parse_ins(ins, addr)
-
-  def parse_ins(self, ins:str, addr:str):
     ins = self.labels_to_addr(ins.strip())
-    for k,v in const_tr.items():
-      ins = re.sub(k, v, ins)
-
-    # TODO: translate scoreboard for DEPBAR?
-    ins = whitespace.sub(' ', ins)
-    ins = insig_whitespace.sub('', ins) # TODO: needed?
-    ins = ins.strip(' {};')
-    r = ins_pat.match(ins)
-
-    vals = [parse_pred(r.group('Pred'))]
-    op_full = r.group('Op')
-    op_toks = op_full.split('.')
-    key = op_toks[0]
-    modi = ['0_' + m for m in op_toks]
-    if len(operands := preprocess_operands(r.group('Operands'), op_toks[0])):
-      for i, operand in enumerate(operands.split(',')):
-        optype, opval, opmodi = parse_operands(operand, op_full)
-        key += '_' + optype
-        vals.extend(opval)
-        modi.extend([('%d_' % (i + 1)) + m for m in opmodi])
-      special_fixup(op_full, key, vals, modi, addr)
-    return key, vals, modi
+    addr = parse_inst_addr(line)
+    key, vals, op_mods, vmods = parse_inst(ins, addr=addr)
+    return ctrl, key, vals, op_mods, vmods
 
   def labels_to_addr(self, s):
     r = ins_label.search(s)
@@ -72,7 +44,7 @@ class SASSParser:
   def parse_labels(self, src):
     addr = None
     for line in src.split('\n'):
-      if a := parse_ins_addr(line):
+      if a := parse_inst_addr(line):
         addr = a
       if r := def_label.match(line.strip()):
         if addr: self.labels[r.groups()[0]] = hex(addr + 16)
@@ -98,123 +70,77 @@ class SASSParser:
         offset = 8 if "IMAD.WIDE" in ins else 4 # HACK TODO: write addr range from renderer instead
         c_size = max(int(c_match.group("Addr"), 16) + offset - c_base, c_size) # TODO: remove and write attribute from renderer like SHI_REGISTERS
       if ins.startswith("EXIT"):
-        self.eiattr["EIATTR_EXIT_INSTR_OFFSETS"].append([parse_ins_addr(line)])
+        self.eiattr["EIATTR_EXIT_INSTR_OFFSETS"].append([parse_inst_addr(line)])
     self.eiattr["EIATTR_PARAM_CBANK"].append([".nv.constant0.FUNC", (c_size << 16) + c_base])
     self.eiattr["EIATTR_CBANK_PARAM_SIZE"].append(c_size)
     self.eiattr["EIATTR_MAX_THREADS"].append(block_dims)
     self.eiattr["EIATTR_MAXREG_COUNT"].append(255)
     self.c_mem_sz = c_base + c_size
 
-def parse_ins_addr(s:str):
-  if m := ins_addr.search(s):
-    return int(m.groups()[0], 16)
-  return None
+def parse_inst(ins:str, addr:int=None):
+  for k,v in const_tr.items():
+    ins = re.sub(k, v, ins)
+  # TODO: translate scoreboard for DEPBAR?
+  ins = insig_whitespace.sub('', whitespace.sub(' ', ins)).strip(' {};') # TODO: needed?
+  r = ins_pat.match(ins)
+  op_toks = r.group('Op').split('.')
+  op, op_mods = op_toks[0], op_toks[1:]
+  keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
+  if addr is not None and op in addr_ops and keys[-1] == "I" and 'ABS' not in op:
+    vals[-1] -= addr - 16
+  print(op)
+  print(keys)
+  return '_'.join([op] + keys), [parse_pred(r.group('Pred'))] + vals, op_mods, dict(vmods)
 
-def parse_operands(operand, op_full): # TODO: refactor
-  op, modi = strip_modi(operand)
-  if op[0] == '[':
-    return parse_addr(op)
-  if idx_pat.match(op) is not None:
-    optype, opval, tmodi = parse_indexed_tok(op)
-    opmodi = modi
-    opmodi.extend(tmodi)
-  elif op.startswith('c['):
-    optype, opval, opmodi = parse_const_memory(op)
-    opmodi.extend(modi)
-  elif op.startswith('0x'):
-    optype = 'II'
-    op, modi = strip_imme_modi(operand)
-    opval, opmodi = parse_int_imme(op)
-    opmodi.extend(modi)
-  elif float_imme.match(operand) is not None:
-    optype = 'FI'
-    op, modi = strip_imme_modi(operand)
-    opval, opmodi = parse_float_imme(op, op_full)
-    opmodi.extend(modi)
-  elif op.startswith('desc'):
-    optype, opval, opmodi = parse_desc_addr(op)
-    opmodi.extend(modi)
-  elif op.startswith('cx['):
-    optype, opval, opmodi = parse_ur_const_mem(op)
-    opmodi.extend(modi)
-  else:
-    return 'L', [], [operand]
-  return optype, opval, opmodi
+def parse_ctrl(ctrl:str):
+  s_wait, s_read, s_write, s_yield, s_stall = tuple(ctrl.split(':'))
+  wait = int(''.join('1' if c != '-' else '0' for c in s_wait[:0:-1]), 2)
+  read = int(s_read[1].replace('-', '7'))
+  write = int(s_write[1].replace('-','7'))
+  yield_ = int(s_yield != 'Y')
+  stall = int(s_stall[1:])
+  return wait, read, write, yield_, stall
 
-def parse_const_memory(s):
-  opmain, opmodi = strip_modi(s)
-  r = const_mem.match(opmain)
-  atype, aval, amodi = parse_addr(r.group('Addr'))
-  return 'c' + atype, [int(r.group('Bank'), 16)] + aval, opmodi + amodi
+def parse_inst_addr(s:str):
+  return int(m.groups()[0], 16) if (m := ins_addr.search(s)) else None
 
-def parse_addr(s): # TODO: refactor
-  ss = re.sub(r'(?<![\[\+])-0x', '+-0x', s)
-  ss = ss.strip('[]').split('+')
+def parse_operands(operands:Sequence[str]):
+  parsed = [parse_token(tok) for tok in operands]
+  idx_mods = defaultdict(list)
+  for i, (keys, vals, mods) in enumerate(parsed):
+    for j, v in mods.items(): idx_mods[i + j].extend(v)
+  return flatten(p[0] for p in parsed), flatten(p[1] for p in parsed), idx_mods
 
-  pdict = {}
-  for ts in ss:
-    if not len(ts):
-      continue
-    if '0x' in ts:
-      pdict['I'] = ('I', *parse_int_imme(ts))
-    else:
-      ttype, tval, tmodi = parse_indexed_tok(ts)
-      tmodi = [(ttype + '.' + m) for m in tmodi]
-      pdict[ttype] = (ttype, tval, tmodi)
+def parse_token(token):
+  for parser, regex in token_formats:
+    if r := regex.match(token): return parser(*r.groupdict().values())
+  raise ValueError(f"Unexpected token: \"{token}\"")
 
-  optype = 'A'
-  opval = []
-  opmodi = []
-  for key in ['R', 'UR', 'I']:
-    if key in pdict:
-      optype += key
-      opval.extend(pdict[key][1])
-      opmodi.extend(pdict[key][2])
-  if not 'I' in pdict:
-    optype += 'I'
-    opval.append(0)
-  return optype, opval, opmodi
+def parse_const_memory(prefix, bank, addr):
+  bk, bv, mods = parse_addr(prefix, bank)
+  ak, av, am = parse_addr('', addr)
+  mods.update({len(bv) + i: v for i,v in am.items()})
+  return [''.join(bk + ak)], bv + av, mods
 
-def parse_desc_addr(s):
-  r = desc_addr.match(s)
-  opval = parse_indexed_tok(r.group('URIndex'))[1]
-  atype, aval, amodi = parse_addr(r.group('Addr'))
-  return 'd' + atype, opval + aval, amodi
+def parse_addr(prefix:str, addr:str):
+  operands = re.split(r'[-+]', addr.strip('[]'))
+  keys, vals, mods = parse_operands(operands)
+  return [f"{prefix}[{''.join(keys)}]"], vals, mods
 
-def parse_ur_const_mem(s):
-  opmain = strip_modi(s)[0]
-  r = ur_const_mem.match(opmain)
-  btype, opval, opmodi = parse_indexed_tok(r.group('URBank'))
-  atype, aval, amodi = parse_addr(r.group('Addr'))
-  return 'cx' + atype, opval + aval, [btype + '_' + m for m in opmodi] + amodi
+def parse_int(value):
+  return ["I"], [int(value, 16)], {}
 
-def parse_int_imme(s):
-  return [i := int(s, 16)], ([] if i >= 0 else ['NegIntImme'])
+def parse_float(value):
+  return ["FI"], [int(val[2:], 16) if value.startswith('0f') else float(value)], {}
 
-def parse_float_imme(s, op_full):
-  if op_full[0] in {'H', 'F', 'D'}: prec = op_full[0]
-  else: prec = 'D' if '64' in op_full else 'H' if '16' in op_full else 'F'
-  nbits = 32 if op_full.split('.')[0].endswith('32I') else -1
-  return [convert_float_imme(s, prec, nbits)], [] # TODO: return first val only
+def parse_indexed_token(prefix, label, index, post_mods): # TODO: how to encode negative registers?
+  mods = [c for c in post_mods.split('.') if len(c)] + [pre_mod[c] for c in prefix]
+  return [label], [int(index)], {0: mods} if mods else {}
 
 def parse_pred(s):
   if not s: return 7
-  v = parse_indexed_tok(s.strip('@! '))[1]
+  v = parse_token(s.strip('@ '))[1]
   return v[0] + 8 if '!' in s else v[0]
-
-def parse_indexed_tok(s):
-  tmain, modi = strip_modi(s)
-  r = idx_pat.match(tmain)
-  return r.group('Label'), [int(r.group('Index'))], modi
-
-def strip_modi(s):
-  r = mod_pat.match(s)
-  return r.group('Main'), [pre_mod[c] for c in r.group('PreModi')] + [c for c in r.group('PostModi').split('.') if len(c)]
-
-def strip_imme_modi(s):
-  r = imme_modi.match(s)
-  modis = r.group('ModiSet')
-  return r.group('Value'), [] if not modis else modis.lstrip('.').split('.')
 
 def strip_comments(s):
   s = cpp_comment.subn(' ', s)[0] # TODO: needed?
@@ -222,44 +148,27 @@ def strip_comments(s):
   s = re.subn(r'\s+', ' ', s)[0]
   return s.strip()
 
-def preprocess_operands(s, op):
+def split_operands(s, op):
   s = s.strip()
-  if op in addr_ops:
-    res = reg_imme_addr.search(s)
-    if res is not None:
-      s = s.replace(res.group(), res.group('R')+','+res.group('II'))
-  return s
+  if op in addr_ops and (res := reg_imme_addr.search(s)):
+    s = s.replace(res.group(), res.group('R')+','+res.group('II'))
+  return s.split(',') if s else []
 
-def convert_float_imme(fval, prec, nbits=-1):
-  val = fval.lower().strip()
-  if val.startswith('0f'): # TODO: remove if not used
-    v = int(val[2:], 16)
-    return v
-  else:
-    ifmt, ofmt, fullbits, keepbits = float_fmt[prec]
-    fb = struct.pack(ifmt, float(val))
-    ival = struct.unpack(ofmt, fb)[0]
-    trunc_bits = fullbits - max(nbits, keepbits)
-    if trunc_bits > 0:
-      ival >>= trunc_bits
-    return ival
+def encode_float(val, op, mods):
+  if op[0] in {'H', 'F', 'D'}: prec = op[0]
+  else: prec = 'D' if '64' in mods else 'H' if '16' in mods else 'F'
+  nbits = 32 if '32I' in mods else -1
+  ifmt, ofmt, fullbits, keepbits = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)}[prec]
+  fb = struct.pack(ifmt, float(val))
+  ival = struct.unpack(ofmt, fb)[0]
+  trunc_bits = fullbits - max(nbits, keepbits)
+  return ival >> trunc_bits if trunc_bits > 0 else ival
 
-def special_fixup(op_full, key, vals, modi, addr):
-  op = op_full.split('.')[0]
-  if op in {'PLOP3', 'UPLOP3'}: # immLut for PLOP3 is encoded with seperating 5+3 bits
-    vals[-2] = (vals[-2] & 7) + ((vals[-2] & 0xf8) << 5)
-  elif op in cast_ops:
-    if '64' in op_full:
-      modi.append('0_CVT64')
-  elif op in addr_ops:
-    if key.endswith('_II'):
-      if 'ABS' not in op_full:
-        vals[-1] = vals[-1] - addr - 16
-        if vals[-1] < 0:
-          modi.append('0_NegAddrOffset')
-  if op in pos_dep_ops:
-    counter = 0
-    for i,m in enumerate(modi):
-      if m.startswith('0_') and m[2:] in c_PosDepModis[op]:
-        modi[i] += '@%d' % counter
-        counter += 1
+token_formats = (
+  (parse_indexed_token, re.compile(r'(?P<Prefix>[!\-|~]?)(?P<Label>R|UR|P|UP|B|SB|SBSET|SR)(?P<Index>\d+)(?P<PostMod>(\.\w+)*)')),
+  (parse_const_memory, re.compile(r'(?P<Prefix>\w*)\[(?P<Bank>[\w\.]+)\]\[(?P<Addr>[+-?\w\.]+)\]')),
+  (parse_addr, re.compile(r'(?P<Prefix>\w*)\[(?P<Addr>[^\]]+)\]$')),
+  (parse_int, re.compile(f'(?P<Value>[-+]?0x[0-9a-fA-F]+)')),
+  (parse_float, re.compile(r'^(?P<Value>((-?\d+)(\.\d*)?((e|E)[-+]?\d+)?)|([+-]?INF)|([+-]NAN)|-?(0[fF][0-9a-fA-F]+))'
+                           r'(\.[a-zA-Z]\w*)*$')),
+)
