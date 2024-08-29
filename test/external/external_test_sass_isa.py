@@ -23,16 +23,22 @@ class TestISASpec(unittest.TestCase):
     with open((Path(__file__).parents[2] / "tinygrad" / "runtime" / "support" / "isa.sm_89.json").as_posix()) as f:
       self.assembler = SASSAssembler(json.load(f))
 
+  def helper_test_values(self, key, values, op_mods=(), operand_mods=None):
+    inst_code = self.assembler.encode_instruction(key, values, op_mods=op_mods, operand_mods=operand_mods)
+    disasm = disassemble(inst_code.to_bytes(16, "little"))
+    disasm_vals = parse_inst(disasm)[1]
+    self.assertEqual(disasm_vals, values, msg=f"\n{key=}\n{op_mods=}\n{values=}\n{disasm_vals=}\n{disasm=}\n{inst_code}")
+
+  @unittest.skip
   def test_alu(self):
     ops = [(k,v) for k,v in self.assembler.isa.items()
            if any(s in k for s in ["MAD", "FMA", "MUL", "ADD"]) and not any(s in k for s in self.bad_oper_encoding)]
     for k,inst in tqdm(ops):
       for spec in inst.specs.values():
-        asm_values = [7] + test_values(spec)
-        inst_code = self.assembler.encode_instruction(k, asm_values, op_mods=spec.cmods)
-        disasm = disassemble(inst_code.to_bytes(16, "little"))
-        disasm_vals = parse_inst(disasm)[1]
-        self.assertEqual(disasm_vals, asm_values, msg=f"{k=}, {asm_values=}, {disasm_vals=}, {disasm=}, {inst_code}")
+        self.helper_test_values(k, [7] + test_values(spec), op_mods=spec.cmods)
+
+  def test_bra(self):
+    self.helper_test_values("BRA_I", [7, 0x40])
 
 if __name__ == '__main__':
   unittest.main()

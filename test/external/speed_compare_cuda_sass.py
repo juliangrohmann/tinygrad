@@ -74,11 +74,16 @@ if __name__ == "__main__":
     if max_nodes != -1 and len(lin.linearize().uops) > max_nodes: continue
     if getenv("GRAPH_SASS_UOPS", 0): graph_uops(lin.linearize().uops)
     if out_dir := getenv("WRITE_SRC", ""):
-      cuda_src = dev.renderer.render(to_function_name(lin.name), lin.uops)
-      fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(cuda_src.encode()).hexdigest()}").as_posix()
+      cuda_src = dev.renderer.render(to_function_name(lin.name), lin.linearize().uops)
+      sass_src = sass.render(to_function_name(lin.name), lin.uops)
+      with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
+      with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(SASSCompiler(dev.arch).compile(sass_src))
       with open(fn_cu := Path(out_dir) / "src.cu", "w") as f: f.write(cuda_src)
-      subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", fn + ".cubin", fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-      CubinFile(fn + ".cubin").saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
+        tmp.close()
+        subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      # subprocess.run(["nvdisasm", tmp.name, "--binary", "SM89"])
     try:
       raw_prg = lin.to_program()
     except Exception as e:

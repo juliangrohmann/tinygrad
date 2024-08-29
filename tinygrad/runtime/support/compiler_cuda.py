@@ -87,7 +87,7 @@ class SASSCompiler(CUDACompiler):
       self.assembler = SASSAssembler(json.load(f))
     super().__init__(arch, cache_key="sass")
 
-  def compile(self, src:str, cuasm=False, inject=None) -> bytes:
+  def compile(self, src:str) -> bytes:
     parser, kernel = SASSParser(src), bytearray()
     for line in src.split('\n'):
       if line.strip().startswith('['):
