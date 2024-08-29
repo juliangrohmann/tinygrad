@@ -1,6 +1,6 @@
 from typing import Sequence, List, Dict, Union
 import tinygrad.runtime.autogen.libc as libc
-from tinygrad.runtime.support.parser_sass import SASSParser
+from tinygrad.runtime.support.assembler_sass import SASSParser
 from tinygrad.runtime.support.elf import ElfSection, ElfSegment, make_elf
 
 strtab_common_pre = (".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.FUNC", ".nv.info.FUNC", ".nv.shared.FUNC")

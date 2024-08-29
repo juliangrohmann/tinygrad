@@ -2,7 +2,7 @@ import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, io, json
 from typing import Callable, Sequence
 from tinygrad.helpers import to_char_p_p, colored, init_c_var, getenv
 import tinygrad.runtime.autogen.nvrtc as nvrtc
-from tinygrad.runtime.support.parser_sass import SASSParser
+from tinygrad.runtime.support.assembler_sass import SASSParser
 from tinygrad.runtime.support.cubin import make_cubin
 from tinygrad.device import Compiler, CompileError
 from CuAsm import CuAsmParser
@@ -110,23 +110,3 @@ class SASSCompiler(CUDACompiler):
     c_yield = int(s_yield != 'Y')
     c_stall = int(s_stall[1:])
     return sum(c << i for c,i in zip([c_waitbar, c_readbar, c_writebar, c_yield, c_stall], [11, 8, 5, 4, 0]))
-
-class CuAsmCompiler(Compiler):
-  def __init__(self, arch:str):
-    self.arch = arch
-    self.version = "7.8" if arch >= "sm_89" else "7.5"
-    super().__init__(f"compile_cuasm_{self.arch}")
-  def compile(self, src:str) -> bytes:
-    fn = (pathlib.Path(tempfile.gettempdir()) / f"cuasm_{hashlib.md5(src.encode()).hexdigest()}").as_posix()
-    with open(fn + ".cuasm", "w") as f: f.write(src)
-    if out_dir := getenv("WRITE_SRC", ""):
-      out_dir = pathlib.Path(out_dir)
-      out_dir.mkdir(parents=True, exist_ok=True)
-      with open(out_dir / "rendered.cuasm", "w") as f:
-        f.write(src)
-    ret = io.BytesIO()
-    cap = CuAsmParser()
-    cap.parse(fn + ".cuasm")
-    cap.saveAsCubin(ret)
-    return bytes(ret.getbuffer())
-

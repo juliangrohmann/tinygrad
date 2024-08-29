@@ -1,5 +1,11 @@
-import re, struct
+import json, pathlib, struct, re
+from enum import Enum, auto
+from typing import List, Dict, Set, Sequence, FrozenSet, Union, Any
+from dataclasses import dataclass, asdict
 from collections import defaultdict
+from tinygrad.helpers import flatten
+from instruction_solver import ISASpec, EncodingRangeType
+from parser import InstructionParser
 
 addr_ops = {'BRA', 'BRX', 'BRXU', 'CALL', 'JMP', 'JMX', 'JMXU', 'RET', 'BSSY', 'SSY', 'CAL', 'PRET', 'PBK'}
 cast_ops = {'I2F', 'I2I', 'F2I', 'F2F', 'I2FP', 'I2IP', 'F2IP', 'F2FP', 'FRND'}
@@ -20,6 +26,62 @@ cc_comment = re.compile(r'\/\*.*?\*\/') # c style line comments TODO: needed?
 ins_label = re.compile(r'`\(([^\)]+)\)')
 def_label = re.compile(r'([a-zA-Z0-9._$@#]+?)\s*:\s*(.*)')
 
+class EncodingType(str, Enum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = auto(); OPERAND_MODIFIER = auto() # noqa: E702
+@dataclass(frozen=True)
+class Encoding: type:str; key:str; start:int; length:int; value:int; shift:int; offset:int; inverse:bool # noqa: E702
+@dataclass(frozen=True)
+class OpCodeSpec:
+  code:int; enc:List[Dict]; cmods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,Dict[str,int]] # noqa: E702
+  @classmethod
+  def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,Dict[str,int]]):
+    return cls(code, [Encoding(**p) for p in enc], cmods, op_mods, vmods)
+
+class InstructionSpec:
+  def __init__(self, specs:Sequence[OpCodeSpec]):
+    self.specs = {frozenset(s.cmods): s for s in specs}
+    self.code_mods = frozenset({mod for s in specs for mod in s.cmods}) # if mod and not "INVALID" in mod and not "??" in mod})
+
+class SASSAssembler:
+  def __init__(self, json_obj:Dict[str, Any]):
+    self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
+
+  def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None):
+    ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
+    return ((ctrl_code << 105) + inst_code).to_bytes(16, "little")
+
+  def encode_instruction(self, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None) -> int:
+    def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
+    predicate, values = values[0], values[1:]
+    inst, seen = self.isa[key], defaultdict(int)
+    cmods = [mod for mod in op_mods if mod in inst.code_mods]
+    spec = inst.specs[frozenset(cmods)]
+    code = set_bits(predicate, 12, 4)
+    for enc in spec.enc:
+      if enc.type == EncodingType.CONSTANT:
+        code += set_bits(enc.value, enc.start, enc.length)
+      elif enc.type == EncodingType.OPERAND:
+        value = encode_float(v, key, op_mods) if isinstance(v := values[enc.value], float) else v
+        value = value >> (seen[enc.value] + enc.shift)
+        if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.value == enc.value)
+        if enc.offset: value -= offset
+        if enc.inverse: value ^= 2 ** enc.length - 1
+        code += set_bits(value, enc.start + seen[enc.value], enc.length)
+        seen[enc.value] += enc.length
+      elif enc.type == EncodingType.MODIFIER:
+        code += sum(set_bits(spec.op_mods[enc.value][mod], enc.start, enc.length) for mod in op_mods if mod in spec.op_mods[enc.value])
+      elif enc.type == EncodingType.OPERAND_MODIFIER:
+        if operand_mods and enc.value in operand_mods:
+          code += sum(set_bits(spec.vmods[enc.value][mod], enc.start, enc.length) for mod in operand_mods[enc.value])
+      else:
+        raise ValueError(f"Unknown encoding type: {enc.type}")
+    return code
+
+  def encode_control_code(self, wait:int, read:int, write:int, yield_:int, stall:int) -> int:
+    return sum(c << i for c,i in zip([wait, read, write, yield_, stall], [11, 8, 5, 4, 0]))
+
+  def to_json(self) -> str:
+    return json.dumps({key: [asdict(spec) for spec in inst.specs.values()] for key,inst in self.isa.items()})
+
 class SASSParser:
   def __init__(self, src:str):
     self.function_name, self.param_cnt, self.c_mem_sz = None, None, None
@@ -30,11 +92,11 @@ class SASSParser:
 
   def parse(self, line):
     r = text_pat.match(strip_comments(line).strip())
-    print(line)
     ctrl, ins = r.groups()
     ins = self.labels_to_addr(ins.strip())
     addr = parse_inst_addr(line)
     key, vals, op_mods, vmods = parse_inst(ins, addr=addr)
+    assert key == (ref_key := InstructionParser.parseInstruction(ins).get_key()), f"key mismatch: parsed={key}\tkuter={ref_key}" # TODO: remove
     return ctrl, key, vals, op_mods, vmods
 
   def labels_to_addr(self, s):
@@ -88,8 +150,6 @@ def parse_inst(ins:str, addr:int=None):
   keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
   if addr is not None and op in addr_ops and keys[-1] == "I" and 'ABS' not in op:
     vals[-1] -= addr - 16
-  print(op)
-  print(keys)
   return '_'.join([op] + keys), [parse_pred(r.group('Pred'))] + vals, op_mods, dict(vmods)
 
 def parse_ctrl(ctrl:str):
