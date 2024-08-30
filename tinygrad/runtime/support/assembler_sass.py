@@ -47,7 +47,7 @@ class SASSAssembler:
 
   def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
-    return ((ctrl_code << 105) | inst_code).to_bytes(16, "little")
+    return (((ctrl_code << 105) | inst_code) | 1 << 101).to_bytes(16, "little")
 
   def encode_instruction(self, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None) -> int:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
@@ -67,7 +67,17 @@ class SASSAssembler:
         code += set_bits(value, enc.start + seen[enc.value], enc.length)
         seen[enc.value] += enc.length
       elif enc.type == EncodingType.MODIFIER:
-        code += sum(set_bits(spec.op_mods[enc.value][mod], enc.start, enc.length) for mod in op_mods if mod in spec.op_mods[enc.value])
+        mod_key = valid_mods[0] if (valid_mods := [m for m in op_mods if m in spec.op_mods[enc.value]]) else ''
+        if "FMUL" in key:
+          print(f"{spec.op_mods[enc.value]}")
+          print(f"{mod_key=}")
+        if mod_key in spec.op_mods[enc.value]:
+          encoded = set_bits(spec.op_mods[enc.value][mod_key], enc.start, enc.length)
+          if "FMUL" in key:
+            print(f"{spec.op_mods[enc.value][mod_key]=}")
+            print(f"{encoded=}, {enc.start=}, {enc.length=}")
+            print()
+          code += encoded
       elif enc.type == EncodingType.OPERAND_MODIFIER:
         if operand_mods and enc.value in operand_mods:
           code += sum(set_bits(spec.vmods[enc.value][mod], enc.start, enc.length) for mod in operand_mods[enc.value])
