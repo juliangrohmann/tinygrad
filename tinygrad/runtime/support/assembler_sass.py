@@ -32,19 +32,19 @@ class EncodingType(StrEnum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = aut
 class Encoding: type:str; key:str; start:int; length:int; value:int; idx:int; shift:int; inverse:bool # noqa: E702
 @dataclass(frozen=True)
 class OpCodeSpec:
-  code:int; enc:List[Dict]; cmods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
+  code:int; enc:List[Dict]; cmods:List[str]; all_mods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
   @classmethod
   def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,List[Dict[str,int]]]):
-    return cls(code, [Encoding(**p) for p in enc], cmods, op_mods, {int(k):v for k,v in vmods.items()})
+    return cls(code, [Encoding(**p) for p in enc], cmods, [m for g in op_mods for m in g.keys()], op_mods, {int(k):v for k,v in vmods.items()})
 
 class InstructionSpec:
   def __init__(self, specs:Sequence[OpCodeSpec]):
-    self.specs = {frozenset(s.cmods): s for s in specs}
+    self.specs = {key: [s for s in specs if frozenset(s.cmods) == key] for key in {frozenset(k.cmods) for k in specs}}
     self.code_mods = frozenset({mod for s in specs for mod in s.cmods}) # if mod and not "INVALID" in mod and not "??" in mod})
 
 class SASSAssembler:
   def __init__(self, json_obj:Dict[str, Any]):
-    self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
+    self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v], k) for k,v in json_obj.items()}
 
   def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
@@ -54,8 +54,10 @@ class SASSAssembler:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
     predicate, values = values[0], values[1:]
     inst, seen = self.isa[key], defaultdict(int)
-    spec = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
-    code = set_bits(predicate, 12, 4)
+    spec_group = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
+    valid_specs = [s for s in spec_group if all(m in s.all_mods for m in op_mods)]
+    assert len(valid_specs) == 1, f"ambiguous sass instruction: valid specs={len(valid_specs)}, {key=}, {op_mods=}"
+    spec, code = valid_specs[0], set_bits(predicate, 12, 4)
     for enc in spec.enc:
       if enc.type == EncodingType.CONSTANT:
         code += set_bits(enc.value, enc.start, enc.length)
@@ -81,7 +83,7 @@ class SASSAssembler:
     return sum(c << i for c,i in zip([wait, read, write, yield_, stall], [11, 8, 5, 4, 0]))
 
   def to_json(self) -> str:
-    return json.dumps({key: [asdict(spec) for spec in inst.specs.values()] for key,inst in self.isa.items()})
+    return json.dumps({key: [asdict(spec) for spec_group in inst.specs.values() for spec in spec_group] for key,inst in self.isa.items()})
 
 class SASSParser:
   def __init__(self, src:str):
