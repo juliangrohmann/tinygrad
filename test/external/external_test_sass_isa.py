@@ -1,9 +1,9 @@
 import unittest, tempfile, json, subprocess
 from pathlib import Path
 from tqdm import tqdm
-from tinygrad.runtime.support.assembler_sass import SASSAssembler, EncodingType, parse_inst
+from tinygrad.runtime.support.assembler_sass import SASSAssembler, EncodingType, parse_inst, sr_vals
 
-def test_values(spec):
+def helper_values(spec):
   enc = sorted([e for e in spec.enc if e.type == EncodingType.OPERAND], key=lambda x: x.value)
   values = [(i + 1 << e.shift) + e.offset for i,e in enumerate(enc)]
   values = [v if v < 2 ** e.length else (v - 2 ** e.length + 1) for v,e in zip(values, enc)]
@@ -26,7 +26,6 @@ class TestISASpec(unittest.TestCase):
   def helper_test_values(self, key, values, op_mods=(), operand_mods=None):
     inst_code = self.assembler.encode_instruction(key, values, op_mods=op_mods, operand_mods=operand_mods)
     disasm = disassemble(inst_code.to_bytes(16, "little"))
-    print(f"{disasm=}")
     disasm_vals = parse_inst(disasm)[1]
     self.assertEqual(disasm_vals, values, msg=f"\n{key=}\n{op_mods=}\n{values=}\n{disasm_vals=}\n{disasm=}\n{inst_code}")
 
@@ -35,7 +34,7 @@ class TestISASpec(unittest.TestCase):
            if any(s in k for s in ["MAD", "FMA", "MUL", "ADD"]) and not any(s in k for s in self.bad_oper_encoding)]
     for k,inst in tqdm(ops):
       for spec in inst.specs.values():
-        self.helper_test_values(k, [7] + test_values(spec), op_mods=spec.cmods)
+        self.helper_test_values(k, [7] + helper_values(spec), op_mods=spec.cmods)
 
   def test_bra(self):
     self.helper_test_values("BRA_I", [7, 48])
@@ -43,6 +42,10 @@ class TestISASpec(unittest.TestCase):
 
   def test_nop(self):
     self.helper_test_values("NOP", [0])
+
+  def test_s2r(self):
+    for v in sr_vals.values():
+      self.helper_test_values("S2R_R_SR", [7, 1, v])
 
 if __name__ == '__main__':
   unittest.main()

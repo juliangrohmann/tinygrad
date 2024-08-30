@@ -14,6 +14,7 @@ pos_dep_ops = {'HMMA', 'IMMA', 'I2IP', 'F2FP', 'I2I', 'F2F', 'IDP', 'TLD4', 'VAD
 const_tr = {r'(?<!\.)\bRZ\b': 'R255', r'\bURZ\b': 'UR63', r'\bPT\b': 'P7', r'\bUPT\b': 'UP7', r'\bQNAN\b': 'NAN'}
 pre_mod = {'!': 'cNOT', '-': 'cNEG', '|': 'cABS', '~': 'cINV'}
 float_fmt = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)}
+sr_vals = {"SR_LANEID": 0, "SR_TID": 32, "SR_TID.X": 33, "SR_TID.Y": 34, "SR_TID.Z": 35, "SR_CTAID.X": 37, "SR_CTAID.Y": 38, "SR_CTAID.Z": 39, "SR_NTID": 40}
 ins_pat = re.compile(r'(?P<Pred>@!?U?P\w\s+)?\s*(?P<Op>[\w\.\?]+)(?P<Operands>.*)')
 text_pat = re.compile(r'\[([\w:-]+)\](.*)')
 ins_addr = re.compile(r'/\*([\da-fA-F]{4})\*/')
@@ -194,6 +195,9 @@ def parse_int(value):
 def parse_float(value):
   return ["FI"], [int(val[2:], 16) if value.startswith('0f') else float(value)], {}
 
+def parse_special_reg(label):
+  return ["SR"], [sr_vals[label]], {}
+
 def parse_indexed_token(prefix, label, index, post_mods): # TODO: how to encode negative registers?
   mods = [c for c in post_mods.split('.') if len(c)] + [pre_mod[c] for c in prefix]
   return [label], [int(index)], {0: mods} if mods else {}
@@ -226,6 +230,7 @@ def encode_float(val, op, mods):
   return ival >> trunc_bits if trunc_bits > 0 else ival
 
 token_formats = (
+  (parse_special_reg, re.compile(r'(?P<Label>SR_[\w\.]+)')),
   (parse_indexed_token, re.compile(r'(?P<Prefix>[!\-|~]?)(?P<Label>R|UR|P|UP|B|SB|SBSET|SR)(?P<Index>\d+)(?P<PostMod>(\.\w+)*)')),
   (parse_const_memory, re.compile(r'(?P<Prefix>\w*)\[(?P<Bank>[\w\.]+)\]\[(?P<Addr>[+-?\w\.]+)\]')),
   (parse_addr, re.compile(r'(?P<Prefix>\w*)\[(?P<Addr>[^\]]+)\]$')),
