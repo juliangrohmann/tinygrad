@@ -92,6 +92,5 @@ class SASSCompiler(CUDACompiler):
     for line in src.split('\n'):
       if line.strip().startswith('['):
         kernel += self.assembler.assemble(*parser.parse(line))
-    with open(pathlib.Path(__file__).parents[3] / "debug_cuasm" / "rendered.bin", "rb") as f: kernel = f.read()
     (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
     return bytes(make_cubin(kernel, attr, parser, self.arch))
