@@ -75,7 +75,10 @@ if __name__ == "__main__":
     if getenv("GRAPH_SASS_UOPS", 0): graph_uops(lin.linearize().uops)
     if out_dir := getenv("WRITE_SRC", ""):
       cuda_src = dev.renderer.render(to_function_name(lin.name), lin.linearize().uops)
-      with open(fn_cu := Path(out_dir) / "src.cu", "w") as f: f.write(cuda_src)
+      with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
+      subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(), (Path(out_dir) / "nvcc.cu").as_posix()])
+      with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
+        subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f)
       with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
         tmp.close()
         subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -84,12 +87,8 @@ if __name__ == "__main__":
       with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
       elf = SASSCompiler(dev.arch).compile(sass_src)
       with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(elf)
-      inst_blob = [section for section in elf_loader(elf)[1] if section.name.startswith(".text")][0].content
-      with open(Path(out_dir) / "rendered.bin", "wb") as f: f.write(inst_blob)
       with open(Path(out_dir) / "rendered_cuobjdump.sass", "w") as f:
         subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f)
-      # with open(Path(out_dir) / "rendered_nvdisasm.sass", "w") as f: subprocess.run(["nvdisasm", "--cubin", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f)
-      # subprocess.run(["nvdisasm", tmp.name, "--binary", "SM89"])
     try:
       raw_prg = lin.to_program()
     except Exception as e:

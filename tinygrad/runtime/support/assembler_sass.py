@@ -1,5 +1,5 @@
 import json, pathlib, struct, re
-from enum import Enum, auto
+from enum import StrEnum, auto
 from typing import List, Dict, Set, Sequence, FrozenSet, Union, Any
 from dataclasses import dataclass, asdict
 from collections import defaultdict
@@ -27,14 +27,14 @@ cc_comment = re.compile(r'\/\*.*?\*\/') # c style line comments TODO: needed?
 ins_label = re.compile(r'`\(([^\)]+)\)')
 def_label = re.compile(r'([a-zA-Z0-9._$@#]+?)\s*:\s*(.*)')
 
-class EncodingType(str, Enum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = auto(); OPERAND_MODIFIER = auto() # noqa: E702
+class EncodingType(StrEnum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = auto(); OPERAND_MODIFIER = auto() # noqa: E702
 @dataclass(frozen=True)
-class Encoding: type:str; key:str; start:int; length:int; value:int; shift:int; offset:int; inverse:bool # noqa: E702
+class Encoding: type:str; key:str; start:int; length:int; value:int; idx:int; shift:int; inverse:bool # noqa: E702
 @dataclass(frozen=True)
 class OpCodeSpec:
-  code:int; enc:List[Dict]; cmods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,Dict[str,int]] # noqa: E702
+  code:int; enc:List[Dict]; cmods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
   @classmethod
-  def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,Dict[str,int]]):
+  def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,List[Dict[str,int]]]):
     return cls(code, [Encoding(**p) for p in enc], cmods, op_mods, {int(k):v for k,v in vmods.items()})
 
 class InstructionSpec:
@@ -60,20 +60,19 @@ class SASSAssembler:
       if enc.type == EncodingType.CONSTANT:
         code += set_bits(enc.value, enc.start, enc.length)
       elif enc.type == EncodingType.OPERAND:
-        value = encode_float(v, key, op_mods) if isinstance(v := values[enc.value], float) else v
-        if enc.offset: value -= enc.offset
-        if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.value == enc.value)
+        value = encode_float(v, key, op_mods) if isinstance(v := values[enc.idx], float) else v
+        if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.idx == enc.idx)
         if enc.inverse: value ^= 2 ** enc.length - 1
-        value = value >> (seen[enc.value] + enc.shift)
-        code += set_bits(value, enc.start + seen[enc.value], enc.length)
-        seen[enc.value] += enc.length
+        value = value >> (seen[enc.idx] + enc.shift)
+        code += set_bits(value, enc.start + seen[enc.idx], enc.length)
+        seen[enc.idx] += enc.length
       elif enc.type == EncodingType.MODIFIER:
         mod_key = valid_mods[0] if (valid_mods := [m for m in op_mods if m in spec.op_mods[enc.value]]) else ''
         if mod_key in spec.op_mods[enc.value]:
           code += set_bits(spec.op_mods[enc.value][mod_key], enc.start, enc.length)
       elif enc.type == EncodingType.OPERAND_MODIFIER:
-        if operand_mods and enc.value in operand_mods:
-          code += sum(set_bits(spec.vmods[enc.value][mod], enc.start, enc.length) for mod in operand_mods[enc.value])
+        if operand_mods and enc.idx in operand_mods and (valid := [m for m in operand_mods[enc.idx] if m in spec.vmods[enc.idx][enc.value]]):
+          code += set_bits(spec.vmods[enc.idx][enc.value][valid[0]], enc.start, enc.length)
       else:
         raise ValueError(f"Unknown encoding type: {enc.type}")
     return code
@@ -151,7 +150,7 @@ def parse_inst(ins:str, addr:int=None):
   op, op_mods = op_toks[0], op_toks[1:]
   keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
   if addr is not None and op in addr_ops and keys[-1] == "I" and 'ABS' not in op:
-    vals[-1] -= addr
+    vals[-1] -= addr - 16
   return '_'.join([op] + keys), [parse_pred(r.group('Pred')) if not op.startswith("NOP") else 0] + vals, op_mods, dict(vmods)
 
 def parse_ctrl(ctrl:str):

@@ -1,9 +1,9 @@
-import tempfile
+import tempfile, hashlib, subprocess, struct, re, dataclasses
 import hashlib
 import subprocess
 import struct
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
@@ -44,11 +44,13 @@ class Register:
   pred: bool = False
   uniform: bool = False
   negated: bool = False
+  mod: str = None
   def render(self):
     prefix = '-!'[self.pred] if self.negated else ''
-    return f"{prefix}{'U' if self.uniform else ''}{'RP'[self.pred]}{self.idx if self.idx != -1 else 'Z'}"
-  def offset(self, n): return Register(self.idx + n, size=self.size, pred=self.pred, uniform=self.uniform, negated=self.negated)
-  def negate(self): return Register(self.idx, size=self.size, pred=self.pred, uniform=self.uniform, negated=not self.negated)
+    return f"{prefix}{'U' if self.uniform else ''}{'RP'[self.pred]}{self.idx if self.idx != -1 else 'Z'}{f'.{self.mod}' if self.mod else ''}"
+  def offset(self, n): return dataclasses.replace(self, idx=self.idx + n)
+  def negate(self): return dataclasses.replace(self, negated=not self.negated)
+  def modify(self, mod): return dataclasses.replace(self, mod=mod)
 
 @dataclass
 class ControlCode:
@@ -366,9 +368,8 @@ class SASSRenderer(Renderer):
           else:
             raise NotImplementedError
         elif vin[0].dtype is dtypes.half:
-          raise NotImplementedError
           if dtype is dtypes.float:
-            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=["F32"]))
+            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0]).modify("H0_H0")], mods=["F32"]))
           else:
             raise NotImplementedError
         elif dtypes.is_float(vin[0].dtype):
