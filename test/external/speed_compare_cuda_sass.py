@@ -75,14 +75,20 @@ if __name__ == "__main__":
     if getenv("GRAPH_SASS_UOPS", 0): graph_uops(lin.linearize().uops)
     if out_dir := getenv("WRITE_SRC", ""):
       cuda_src = dev.renderer.render(to_function_name(lin.name), lin.linearize().uops)
-      sass_src = sass.render(to_function_name(lin.name), lin.uops)
-      with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
-      with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(SASSCompiler(dev.arch).compile(sass_src))
       with open(fn_cu := Path(out_dir) / "src.cu", "w") as f: f.write(cuda_src)
       with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
         tmp.close()
         subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      sass_src = sass.render(to_function_name(lin.name), lin.uops)
+      elf = SASSCompiler(dev.arch).compile(sass_src)
+      inst_blob = [section for section in elf_loader(elf)[1] if section.name.startswith(".text")][0].content
+      with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
+      with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(elf)
+      with open(Path(out_dir) / "rendered_cuobjdump.sass", "w") as f:
+        subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f)
+      with open(Path(out_dir) / "rendered.bin", "wb") as f: f.write(inst_blob)
+      # with open(Path(out_dir) / "rendered_nvdisasm.sass", "w") as f: subprocess.run(["nvdisasm", "--cubin", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f)
       # subprocess.run(["nvdisasm", tmp.name, "--binary", "SM89"])
     try:
       raw_prg = lin.to_program()
@@ -102,6 +108,7 @@ if __name__ == "__main__":
     if is_debug:
       if debug_sass:
         with open(debug_sass) as f: cubin = SASSCompiler(dev.arch).compile(f.read())
+        with open(Path(debug_sass).with_name("debug.cubin"), "wb") as f: f.write(cubin)
       else:
         with open(debug_cubin, "rb") as f: cubin = f.read();
       debug_prg = CompiledRunner(raw_prg, precompiled=cubin)

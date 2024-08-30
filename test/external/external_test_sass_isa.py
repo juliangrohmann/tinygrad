@@ -26,6 +26,7 @@ class TestISASpec(unittest.TestCase):
   def helper_test_values(self, key, values, op_mods=(), operand_mods=None):
     inst_code = self.assembler.encode_instruction(key, values, op_mods=op_mods, operand_mods=operand_mods)
     disasm = disassemble(inst_code.to_bytes(16, "little"))
+    print(f"{disasm=}")
     disasm_vals = parse_inst(disasm)[1]
     self.assertEqual(disasm_vals, values, msg=f"\n{key=}\n{op_mods=}\n{values=}\n{disasm_vals=}\n{disasm=}\n{inst_code}")
 
@@ -37,7 +38,11 @@ class TestISASpec(unittest.TestCase):
         self.helper_test_values(k, [7] + test_values(spec), op_mods=spec.cmods)
 
   def test_bra(self):
-    self.helper_test_values("BRA_I", [7, 0x40])
+    self.helper_test_values("BRA_I", [7, 48])
+    self.helper_test_values("BRA_I", [0, 48])
+
+  def test_nop(self):
+    self.helper_test_values("NOP", [0])
 
 if __name__ == '__main__':
   unittest.main()

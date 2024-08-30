@@ -47,7 +47,7 @@ class SASSAssembler:
 
   def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
-    return ((ctrl_code << 105) + inst_code).to_bytes(16, "little")
+    return ((ctrl_code << 105) | inst_code).to_bytes(16, "little")
 
   def encode_instruction(self, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None) -> int:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
@@ -64,7 +64,6 @@ class SASSAssembler:
         if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.value == enc.value)
         if enc.inverse: value ^= 2 ** enc.length - 1
         value = value >> (seen[enc.value] + enc.shift)
-        # print(f"{value=}, {enc.start=}, {enc.length=}, {enc.shift=}, {enc.offset=}, {enc.inverse=}")
         code += set_bits(value, enc.start + seen[enc.value], enc.length)
         seen[enc.value] += enc.length
       elif enc.type == EncodingType.MODIFIER:
@@ -149,8 +148,8 @@ def parse_inst(ins:str, addr:int=None):
   op, op_mods = op_toks[0], op_toks[1:]
   keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
   if addr is not None and op in addr_ops and keys[-1] == "I" and 'ABS' not in op:
-    vals[-1] -= addr - 16
-  return '_'.join([op] + keys), [parse_pred(r.group('Pred'))] + vals, op_mods, dict(vmods)
+    vals[-1] -= addr
+  return '_'.join([op] + keys), [parse_pred(r.group('Pred')) if not op.startswith("NOP") else 0] + vals, op_mods, dict(vmods)
 
 def parse_ctrl(ctrl:str):
   s_wait, s_read, s_write, s_yield, s_stall = tuple(ctrl.split(':'))
