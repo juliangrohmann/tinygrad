@@ -115,7 +115,6 @@ class SASSParser:
         else: raise ValueError
 
   def parse_attributes(self, src):
-    c_size, c_base = 0, 0x160
     block_dims = [1, 1, 1]
     for line in src.split('\n'):
       if dim_match := re.match(r"BLOCK_DIM_(\d)=(\d+)", line):
@@ -126,19 +125,16 @@ class SASSParser:
         n = int(param_match.groups()[0])
         for i in range(n-1, -1, -1):
           self.eiattr["EIATTR_KPARAM_INFO"].append([0, (8*i << 16) + i, 0x21f000])
+        self.eiattr["EIATTR_PARAM_CBANK"].append([".nv.constant0.FUNC", (8*n << 16) + 0x160])
+        self.eiattr["EIATTR_CBANK_PARAM_SIZE"].append(8*n)
+        self.c_mem_sz = 0x160 + 8*n
       text_match = text_pat.match(strip_comments(line).strip())
       if not text_match: continue
       ins = text_match.groups()[1].strip()
-      if c_match := const_mem.search(ins):
-        offset = 8 if "IMAD.WIDE" in ins else 4 # HACK TODO: write addr range from renderer instead
-        c_size = max(int(c_match.group("Addr"), 16) + offset - c_base, c_size) # TODO: remove and write attribute from renderer like SHI_REGISTERS
       if ins.startswith("EXIT"):
         self.eiattr["EIATTR_EXIT_INSTR_OFFSETS"].append([parse_inst_addr(line)])
-    self.eiattr["EIATTR_PARAM_CBANK"].append([".nv.constant0.FUNC", (c_size << 16) + c_base])
-    self.eiattr["EIATTR_CBANK_PARAM_SIZE"].append(c_size)
     self.eiattr["EIATTR_MAX_THREADS"].append(block_dims)
     self.eiattr["EIATTR_MAXREG_COUNT"].append(255)
-    self.c_mem_sz = c_base + c_size
 
 def parse_inst(ins:str, addr:int=None):
   for k,v in const_tr.items():
