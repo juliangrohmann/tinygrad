@@ -288,7 +288,7 @@ class SASSRenderer(Renderer):
       else:
         if glob.dtype.itemsize not in vals:
           vals[glob.dtype.itemsize] = queue(glob, self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
-        g_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), ["PT"] + [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods="WIDE", pred=pred)) # TODO: PT = operand hack, need better isa fuzzing
+        g_addr = queue(glob, Instruction("IMAD", new_reg(byte_size=8), [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=["WIDE"], pred=pred))
         addr_str = g_addr.render() + ".64"
       return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
 
