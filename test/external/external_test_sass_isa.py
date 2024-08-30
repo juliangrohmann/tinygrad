@@ -29,7 +29,6 @@ class TestISASpec(unittest.TestCase):
     disasm_vals = parse_inst(disasm)[1]
     self.assertEqual(disasm_vals, values, msg=f"\n{key=}\n{op_mods=}\n{values=}\n{disasm_vals=}\n{disasm=}\n{inst_code}")
 
-  @unittest.skip
   def test_alu(self):
     ops = [(k,v) for k,v in self.assembler.isa.items()
            if any(s in k for s in ["MAD", "FMA", "MUL", "ADD"]) and not any(s in k for s in self.bad_oper_encoding)]

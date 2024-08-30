@@ -60,11 +60,11 @@ class SASSAssembler:
         code += set_bits(enc.value, enc.start, enc.length)
       elif enc.type == EncodingType.OPERAND:
         value = encode_float(v, key, op_mods) if isinstance(v := values[enc.value], float) else v
-        value = value >> (seen[enc.value] + enc.shift)
+        if enc.offset: value -= enc.offset
         if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.value == enc.value)
-        if enc.offset: value -= offset
         if enc.inverse: value ^= 2 ** enc.length - 1
-        print(f"{value=}, {enc.start=}, {enc.length=}, {enc.shift=}, {enc.offset=}, {enc.inverse=}")
+        value = value >> (seen[enc.value] + enc.shift)
+        # print(f"{value=}, {enc.start=}, {enc.length=}, {enc.shift=}, {enc.offset=}, {enc.inverse=}")
         code += set_bits(value, enc.start + seen[enc.value], enc.length)
         seen[enc.value] += enc.length
       elif enc.type == EncodingType.MODIFIER:
