@@ -159,7 +159,7 @@ class SASSRenderer(Renderer):
           ins.srcs.append(dest)
       return ret
     elif dtype is dtypes.bool:
-      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.lop['^&']), mods="LUT")]
+      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.lop['^&']), mods=["LUT"])]
     else:
       raise NotImplementedError
 
@@ -282,8 +282,8 @@ class SASSRenderer(Renderer):
         g_addr = vals[glob]
         if not isinstance(g_addr, Register):
           vals[glob] = g_addr = new_reg(byte_size=8)
-          queue(glob, Instruction("IMAD", g_addr, ["RZ", "RZ", const_addr(glob)], mods=["MOV", "U32"]))
-          queue(glob, Instruction("IMAD", g_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=["MOV", "U32"]))
+          queue(glob, Instruction("IMAD", g_addr, ["RZ", "RZ", const_addr(glob)], mods=["U32"]))
+          queue(glob, Instruction("IMAD", g_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=["U32"]))
         addr_str = g_addr.render() + ".64"
         if idx.arg != 0:
           addr_str += f"+{hex(idx.arg * nregs(glob.dtype.itemsize) * 4)}"
@@ -361,8 +361,8 @@ class SASSRenderer(Renderer):
         if dtypes.is_int(vin[0].dtype):
           if dtypes.is_float(dtype):
             vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]]))
-            if (n := nregs(vin[0].dtype.itemsize)) > 1 or dtypes.is_unsigned(vin[0].dtype):
-              ins.mods.append(f"{'U' if dtypes.is_unsigned(vin[0].dtype) else 'S'}{n*32}")
+            # ins.mods.extend([])
+            # ins.mods.extend([f"{'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}", "TRUNC", "NTZ"])
           elif dtypes.is_int(dtype):
             vals[u] = vals[vin[0]]
           else:
@@ -374,7 +374,6 @@ class SASSRenderer(Renderer):
             raise NotImplementedError
         elif dtypes.is_float(vin[0].dtype):
           if dtypes.is_int(dtype):
-            if dtype.itemsize > 4: raise NotImplementedError
             vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])]))
             ins.mods.extend([f"{'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}", "TRUNC", "NTZ"])
           else:
@@ -397,7 +396,7 @@ class SASSRenderer(Renderer):
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg is BinaryOps.MUL and dtype is dtypes.bool:
           if len(srcs) == 2: srcs.append("PT")
-          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods="LUT"))
+          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods=["LUT"]))
         elif arg in [BinaryOps.MUL, BinaryOps.ADD]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))

@@ -32,10 +32,10 @@ class EncodingType(StrEnum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = aut
 class Encoding: type:str; key:str; start:int; length:int; value:int; idx:int; shift:int; inverse:bool # noqa: E702
 @dataclass(frozen=True)
 class OpCodeSpec:
-  code:int; enc:List[Dict]; cmods:List[str]; all_mods:List[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
+  enc:List[Dict]; cmods:List[str]; all_mods:FrozenSet[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
   @classmethod
   def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,List[Dict[str,int]]]):
-    return cls(code, [Encoding(**p) for p in enc], cmods, [m for g in op_mods for m in g.keys()], op_mods, {int(k):v for k,v in vmods.items()})
+    return cls([Encoding(**p) for p in enc], cmods, frozenset([m for g in op_mods for m in g.keys()] + cmods), op_mods, {int(k):v for k,v in vmods.items()})
 
 class InstructionSpec:
   def __init__(self, specs:Sequence[OpCodeSpec]):
@@ -44,7 +44,7 @@ class InstructionSpec:
 
 class SASSAssembler:
   def __init__(self, json_obj:Dict[str, Any]):
-    self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v], k) for k,v in json_obj.items()}
+    self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
 
   def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
@@ -56,7 +56,8 @@ class SASSAssembler:
     inst, seen = self.isa[key], defaultdict(int)
     spec_group = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
     valid_specs = [s for s in spec_group if all(m in s.all_mods for m in op_mods)]
-    assert len(valid_specs) == 1, f"ambiguous sass instruction: valid specs={len(valid_specs)}, {key=}, {op_mods=}"
+    assert len(valid_specs), (f"invalid sass instruction:\n{key=}, {values=}, {op_mods=}\n"
+                              f"spec group:\n{'\n'.join([f"{i}: {spec.all_mods}" for i,spec in enumerate(spec_group)])}")
     spec, code = valid_specs[0], set_bits(predicate, 12, 4)
     for enc in spec.enc:
       if enc.type == EncodingType.CONSTANT:
@@ -149,7 +150,7 @@ def parse_inst(ins:str, addr:int=None):
   keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
   if addr is not None and op in addr_ops and keys[-1] == "I" and 'ABS' not in op:
     vals[-1] -= addr - 16
-  return '_'.join([op] + keys), [parse_pred(r.group('Pred')) if not op.startswith("NOP") else 0] + vals, op_mods, dict(vmods)
+  return '_'.join([op] + keys), [parse_pred(r.group('Pred'))] + vals, op_mods, dict(vmods)
 
 def parse_ctrl(ctrl:str):
   s_wait, s_read, s_write, s_yield, s_stall = tuple(ctrl.split(':'))

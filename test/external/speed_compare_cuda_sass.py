@@ -79,6 +79,9 @@ if __name__ == "__main__":
       subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(), (Path(out_dir) / "nvcc.cu").as_posix()])
       with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
         subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f)
+      with open(Path(out_dir) / "nvcc.cubin", "rb") as f: cuda_blob = f.read()
+      cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
+      with open(Path(out_dir) / "nvcc.bin", "wb") as f: f.write(cuda_kernel)
       with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
         tmp.close()
         subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
