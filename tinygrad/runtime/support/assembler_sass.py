@@ -1,6 +1,6 @@
 import json, pathlib, struct, re
 from enum import StrEnum, auto
-from typing import List, Dict, Set, Sequence, FrozenSet, Union, Any
+from typing import List, Dict, Set, Sequence, FrozenSet, Union, Any, Optional
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 from tinygrad.helpers import flatten
@@ -46,12 +46,19 @@ class SASSAssembler:
   def __init__(self, json_obj:Dict[str, Any]):
     self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
 
-  def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None):
+  def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int, Sequence[str]]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
     return (((ctrl_code << 105) | inst_code) | 1 << 101).to_bytes(16, "little")
 
   def encode_instruction(self, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None) -> int:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
+    def choose_mod(explicit_mods, spec_mods):
+      valid_mods = [m for m in explicit_mods if m in spec_mods]
+      assert len(valid_mods) <= 1, f"ambiguous modifier for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {valid_mods=}, {spec_mods=}"
+      mod_key = valid_mods[0] if len(valid_mods) else ''
+      assert mod_key in spec_mods, f"default modifier not allowed for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {spec_mods=}, {spec.op_mods=}"
+      return mod_key
+
     predicate, values = values[0], values[1:]
     inst, seen = self.isa[key], defaultdict(int)
     spec_group = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
@@ -70,12 +77,11 @@ class SASSAssembler:
         code += set_bits(value, enc.start + seen[enc.idx], enc.length)
         seen[enc.idx] += enc.length
       elif enc.type == EncodingType.MODIFIER:
-        mod_key = valid_mods[0] if (valid_mods := [m for m in op_mods if m in spec.op_mods[enc.value]]) else ''
-        if mod_key in spec.op_mods[enc.value]:
-          code += set_bits(spec.op_mods[enc.value][mod_key], enc.start, enc.length)
+        code += set_bits(spec.op_mods[enc.value][choose_mod(op_mods, list(spec.op_mods[enc.value].keys()))], enc.start, enc.length)
       elif enc.type == EncodingType.OPERAND_MODIFIER:
-        if operand_mods and enc.idx in operand_mods and (valid := [m for m in operand_mods[enc.idx] if m in spec.vmods[enc.idx][enc.value]]):
-          code += set_bits(spec.vmods[enc.idx][enc.value][valid[0]], enc.start, enc.length)
+        mod_tab = spec.vmods[enc.idx][enc.value]
+        explicit_mods = operand_mods[enc.idx] if operand_mods and enc.idx in operand_mods else []
+        code += set_bits(spec.vmods[enc.idx][enc.value][choose_mod(explicit_mods, list(mod_tab.keys()))], enc.start, enc.length)
       else:
         raise ValueError(f"Unknown encoding type: {enc.type}")
     return code
@@ -149,7 +155,7 @@ def parse_inst(ins:str, addr:int=None):
   op, op_mods = op_toks[0], op_toks[1:]
   keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
   if addr is not None and op in addr_ops and keys[-1] == "I" and 'ABS' not in op:
-    vals[-1] -= addr - 16
+    vals[-1] -= addr + 16
   return '_'.join([op] + keys), [parse_pred(r.group('Pred'))] + vals, op_mods, dict(vmods)
 
 def parse_ctrl(ctrl:str):
