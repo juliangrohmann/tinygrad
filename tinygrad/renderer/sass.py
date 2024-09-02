@@ -363,6 +363,8 @@ class SASSRenderer(Renderer):
             if vin[0].dtype.itemsize != 4 or dtype.itemsize not in [4, 2] or dtypes.is_unsigned(vin[0].dtype):
               raise NotImplementedError
             vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]], mods=["S8", "U32"]))
+            if dtype.itemsize == 2:
+              ins.mods.extend(["F16"])
           elif dtypes.is_int(dtype):
             vals[u] = vals[vin[0]]
           else:
