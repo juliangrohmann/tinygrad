@@ -71,6 +71,7 @@ if __name__ == "__main__":
     dev.compiler = SASSCompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=sass if not is_debug else dev.renderer)
     lin.hand_coded_optimizations()
+
     if max_nodes != -1 and len(lin.linearize().uops) > max_nodes: continue
     if getenv("GRAPH_SASS_UOPS", 0): graph_uops(lin.linearize().uops)
     if out_dir := getenv("WRITE_SRC", ""):
@@ -86,7 +87,10 @@ if __name__ == "__main__":
         tmp.close()
         subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
-      sass_src = sass.render(to_function_name(lin.name), lin.uops)
+      if not debug_sass:
+        sass_src = sass.render(to_function_name(lin.name), lin.uops)
+      else:
+        with open(debug_sass) as f: sass_src = f.read()
       with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
       elf = SASSCompiler(dev.arch).compile(sass_src)
       with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(elf)

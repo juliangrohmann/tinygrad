@@ -360,10 +360,9 @@ class SASSRenderer(Renderer):
       elif op is UOps.CAST:
         if dtypes.is_int(vin[0].dtype):
           if dtypes.is_float(dtype):
-            if vin[0].dtype.itemsize != 4 or dtype.itemsize != 4:
+            if vin[0].dtype.itemsize != 4 or dtype.itemsize not in [4, 2] or dtypes.is_unsigned(vin[0].dtype):
               raise NotImplementedError
-            vals[u] = queue(u, ins := Instruction("I2FP", new_reg(dtype.itemsize), [vals[u.src[0]]], mods=["F32"]))
-            ins.mods.extend(["U32" if dtypes.is_unsigned(vin[0].dtype) else "U32"])
+            vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[u.src[0]]], mods=["S8", "U32"]))
           elif dtypes.is_int(dtype):
             vals[u] = vals[vin[0]]
           else:
