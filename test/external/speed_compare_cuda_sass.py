@@ -56,7 +56,9 @@ if __name__ == "__main__":
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
   impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 64, 93, 105, 114, 122, 130, 134, 139, 185, 198, 199, 200, 204, 215, 216, 226, 228,
-          231, 232, 336, 351, 372, 381, 396, 410, 426, 427, 429, 435, 469, 6413, 8429]
+          231, 232, 336, 351, 362, 372, 381, 384, 396, 410, 426, 427, 429, 435, 469, 617, 618, 746, 1022, 2013, 2357, 3009, 3019, 3285, 3231, 3593,
+          5389, 6071, 6413, 6933, 6971, 7014, 7469, 7874, 8429, 9059, 9274, 9358, 9986, 10696, 10814]
+  # inconsistent = [1150]
   single, start, end, max_nodes = getenv("NUM", -1), getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end) or (single != -1 and num != single):

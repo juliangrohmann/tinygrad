@@ -294,9 +294,12 @@ class SASSRenderer(Renderer):
         addr_str = g_addr.render() + ".64"
       return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
 
-    def glob_mods(dtype:DType):
-      sig = '' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) or dtype.itemsize == 1 else 'S'
-      return [f"{sig}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
+    def memory_mods(dtype:DType):
+      return [f"{'' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
+
+    def dtype_mods(dtype:DType):
+      sig = f"{'F' if dtypes.is_float(dtype) else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"
+      return [sig] if sig not in ["S32", "F32"] else []
 
     def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register, str], src_r:Union[Register, str], dtype:DType):
       srcs = [src_l, src_r]
@@ -347,41 +350,41 @@ class SASSRenderer(Renderer):
           pred = vals[vin[3]] if len(vin) > 3 else None
           vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"], pred=pred))
           ins.ctrl.write = new_barrier()
-          ins.mods.extend(glob_mods(dtype))
+          ins.mods.extend(memory_mods(dtype))
           if pred: queue(u, self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
       elif op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_GLOBAL:
           queue(u, ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=["E"]))
-          ins.mods.extend(glob_mods(vin[2].dtype))
+          ins.mods.extend(memory_mods(vin[2].dtype))
         else:
           raise NotImplementedError
       elif op is UOps.CAST:
         if dtypes.is_int(vin[0].dtype):
           if dtypes.is_float(dtype):
-            if vin[0].dtype.itemsize != 4 or dtype.itemsize not in [4, 2] or dtypes.is_unsigned(vin[0].dtype):
-              raise NotImplementedError
-            vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[vin[0]]], mods=["S8", "U32"]))
-            if dtype.itemsize == 2:
-              ins.mods.extend(["F16"])
+            vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[vin[0]]]))
+            if vin[0].dtype is not dtypes.char: ins.mods.extend(dtype_mods(vin[0].dtype))
+            elif dtype is dtypes.float: ins.mods.extend(["S16"]) # special case to match nvcc
+            if dtype is dtypes.half: ins.mods.extend(["F16"])
           elif dtypes.is_int(dtype):
-            if dtype == dtypes.long:
+            if dtype is dtypes.long:
               vals[u] = dest = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], vin[0].dtype))
               queue(u, Instruction("SHF", dest.offset(1), ["RZ", "0x1f", vals[vin[0]]], mods=["R", "S32", "HI"]))
             else:
               vals[u] = vals[vin[0]]
           else:
             raise NotImplementedError
-        elif vin[0].dtype is dtypes.half:
-          if dtype is dtypes.float:
-            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0]).modify("H0_H0")], mods=["F32"]))
-          else:
-            raise NotImplementedError
         elif dtypes.is_float(vin[0].dtype):
           if dtypes.is_int(dtype):
-            vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])]))
-            ins.mods.extend([f"{'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}", "TRUNC", "NTZ"])
+            vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["TRUNC"]))
+            if dtype.itemsize <= 4: ins.mods.extend(["NTZ"])
+            if vin[0].dtype.itemsize != 4 or dtype.itemsize > 4: ins.mods.extend(dtype_mods(dtype)) # special case to match nvcc
+            if vin[0].dtype is dtypes.half: ins.mods.extend(["F16"])
+          elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
+            vals[u] = queue(u, Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", vals[vin[0]]], mods=["F16", "F32", "PACK_AB"]))
+          elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
+            vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0]).modify("H0_H0")], mods=["F32"]))
           else:
             raise NotImplementedError
         elif vin[0].dtype is dtypes.bool:

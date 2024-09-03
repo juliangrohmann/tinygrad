@@ -48,7 +48,7 @@ class SASSAssembler:
 
   def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int, Sequence[str]]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
-    return (((ctrl_code << 105) | inst_code) | 1 << 101).to_bytes(16, "little")
+    return ((ctrl_code << 105) | inst_code).to_bytes(16, "little")
 
   def encode_instruction(self, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None) -> int:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
@@ -77,7 +77,9 @@ class SASSAssembler:
         code += set_bits(value, enc.start + seen[enc.idx], enc.length)
         seen[enc.idx] += enc.length
       elif enc.type == EncodingType.MODIFIER:
-        code += set_bits(spec.op_mods[enc.value][choose_mod(op_mods, list(spec.op_mods[enc.value].keys()))], enc.start, enc.length)
+        if not len(spec.op_mods[enc.value]): continue # TODO: remove empty mod entries from isa
+        chosen_mod = choose_mod(op_mods, list(spec.op_mods[enc.value].keys()))
+        code += set_bits(spec.op_mods[enc.value][chosen_mod], enc.start, enc.length)
       elif enc.type == EncodingType.OPERAND_MODIFIER:
         mod_tab = spec.vmods[enc.idx][enc.value]
         explicit_mods = operand_mods[enc.idx] if operand_mods and enc.idx in operand_mods else []
