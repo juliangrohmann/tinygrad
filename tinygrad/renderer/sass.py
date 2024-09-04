@@ -287,7 +287,7 @@ class SASSRenderer(Renderer):
     def to_reg(uop:UOp) -> Register:
       if isinstance(var := vals[uop], Register):
         return queue(uop, self.render_where(new_reg(), var.negate(), vals[0], "0x1", dtypes.int)) if var.pred else var
-      vals[uop] = dest = new_reg()
+      vals[uop] = dest = new_reg(uop.dtype.itemsize)
       return queue(uop, self.render_mov(dest, var, uop.dtype))
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
@@ -324,6 +324,9 @@ class SASSRenderer(Renderer):
         if isinstance(srcs[1], Register): srcs = srcs[::-1]
         else: srcs[0] = to_reg(vin[0])
       return Instruction(self.alu[arg][dtypes.int if dtypes.is_int(dtype) else dtype], dest, srcs)
+
+    def render_permute(dest, msb, lsb, byte_size):
+      return [Instruction("PRMT", dest.offset(i), [msb, "0x5410" if byte_size == 2 else "0x6420", lsb]) for i in range(dest.size)]
 
     queue(None, Instruction(f".text.{name}", None, None, label=True))
     vals[0] = Register(-1)
@@ -412,11 +415,19 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif op is UOps.VECTORIZE:
-        if not is_contiguous(srcs := [vals[v] for v in vin]):
+        if vin[0].dtype.itemsize < 4:
+          for nb in range(2, vin[0].dtype.itemsize - 1, -1):
+            vals[u] = dest = new_reg(len(vin)*2)
+            queue(u, flatten([render_permute(dest.offset(i), to_reg(vin[i*2]), to_reg(vin[i*2+1]), 2) for i in range(dest.size)]))
+            if vin[0].dtype.itemsize == 1:
+              vals[u] = dest = new_reg(len(vin))
+              queue(u, flatten([render_permute(dest.offset(i), dest.offset(0), dest.offset(1), 1) for i in range(dest.size)]))
+        elif not is_contiguous(srcs := [vals[v] for v in vin]):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
           queue(u, flatten([self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)]))
         else:
+          srcs[0].size = nregs(dtype.itemsize)
           vals[u] = srcs[0]
       elif op is UOps.GEP:
         vals[u] = vals[vin[0]].offset(arg)
