@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
-from tinygrad.helpers import getenv, all_same
+from tinygrad.helpers import getenv, all_same, flatten
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
@@ -85,6 +85,9 @@ sass_matcher = PatternMatcher([
    lambda root,x,y,z,k: UOp(root.op, dtypes.char, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
    lambda root: UOp(root.op, dtypes.char, root.src, root.arg).cast(dtypes.bool)),
+  # (UPat(UOps.CAST, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
+  #     src=(UPat(UOps.LOAD, name="x", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)])))),
+  #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
   (UPat(UOps.CAST, name="root", dtype=set([dt for dt in dtypes.fields().values() if dt.itemsize != 4]), src=(UPat(name="x", dtype=dtypes.bool))),
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   # Shift left/right for int mul/div by 2
@@ -144,9 +147,8 @@ class SASSRenderer(Renderer):
   def render_mov(self, dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None) -> Instruction:
     if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"):
       src = render_binary(float(src), dtype)
-    ins = Instruction("MOV", dest, [src], pred=pred)
-    if(n := nregs(dtype.itemsize)) > 1: ins.mods.append(f"{n*32}")
-    return ins
+    srcs = [src.offset(i) if src.size >= i + 1 else "RZ" for i in range(dest.size)] if isinstance(src, Register) else [src] + (dest.size - 1) * ["RZ"]
+    return [Instruction("MOV", dest.offset(i), [srcs[i]], pred=pred) for i in range(dest.size)]
 
   def render_where(self, dest, pred:Union[Register, str], src_t:Register, src_f:Union[Register,str], dtype:DType) -> List[Instruction]:
     return [Instruction("SEL" if dtypes.is_int(dtype) else "FSEL", dest, [src_t, src_f, pred])] # nvcc does float packed SEL here instead of FSEL
@@ -274,6 +276,9 @@ class SASSRenderer(Renderer):
         ctrl_codes[uop].append(ins.ctrl)
         ins.ctrl.yield_ |= ins.ctrl.stall >= 12 # TODO: is it 12?
         kernel.append(ins)
+      for ins in instrs:
+        if ins.dest is not None and ins.dest.idx % ins.dest.size == 0:
+          return ins.dest
       return instrs[-1].dest
 
     def to_var(uop:UOp) -> Union[Register, str]:
@@ -376,9 +381,9 @@ class SASSRenderer(Renderer):
             elif dtype is dtypes.float: ins.mods.extend(["S16"]) # NOTE: special case to match nvcc
             if dtype is dtypes.half: ins.mods.extend(["F16"])
           elif dtypes.is_int(dtype):
-            if dtype is dtypes.long:
+            if dtype.itemsize > 4:
               vals[u] = dest = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], vin[0].dtype))
-              queue(u, Instruction("SHF", dest.offset(1), ["RZ", "0x1f", vals[vin[0]]], mods=["R", "S32", "HI"]))
+              queue(u, Instruction("SHF", dest.offset(1), ["RZ", "0x1f", dest], mods=["R", "HI", "SU"[dtypes.is_unsigned(vin[0].dtype)] + "32"]))
             else:
               vals[u] = vals[vin[0]]
           elif dtype is dtypes.bool:
@@ -410,7 +415,7 @@ class SASSRenderer(Renderer):
         if not is_contiguous(srcs := [vals[v] for v in vin]):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
-          queue(u, [self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)])
+          queue(u, flatten([self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)]))
         else:
           vals[u] = srcs[0]
       elif op is UOps.GEP:
