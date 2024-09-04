@@ -81,6 +81,12 @@ class Instruction:
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
 sass_matcher = PatternMatcher([
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
+   lambda root,x,y,z,k: UOp(root.op, dtypes.char, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
+   lambda root: UOp(root.op, dtypes.char, root.src, root.arg).cast(dtypes.bool)),
+  (UPat(UOps.CAST, name="root", dtype=set([dt for dt in dtypes.fields().values() if dt.itemsize != 4]), src=(UPat(name="x", dtype=dtypes.bool))),
+   lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   # Shift left/right for int mul/div by 2
   # A, B -> ADD, C -> ADD               ===     A, B, C -> ADD3
   # A, B -> MUL, C -> ADD               ===     A, B, C -> FMA
@@ -88,6 +94,7 @@ sass_matcher = PatternMatcher([
   # A, B -> CMP, C -> MUL               ===     A, B, C -> CMP.AND
   # A -> NEG, B -> OP                   ===     -A, B -> OP
   # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
+  # A -> CAST(bool) -> CAST(num)        ===     A -> CAST(num) (results from LOAD/STORE: bool -> uchar cast)
 ])
 
 class SASSRenderer(Renderer):
@@ -141,8 +148,8 @@ class SASSRenderer(Renderer):
     if(n := nregs(dtype.itemsize)) > 1: ins.mods.append(f"{n*32}")
     return ins
 
-  def render_where(self, dest, pred:Union[Register, str], src_t:Union[Register,str], src_f:Union[Register,str], dtype:DType) -> List[Instruction]:
-    return [self.render_mov(dest, src_f, dtype), self.render_mov(dest, src_t, dtype, pred=pred)]
+  def render_where(self, dest, pred:Union[Register, str], src_t:Register, src_f:Union[Register,str], dtype:DType) -> List[Instruction]:
+    return [Instruction("SEL" if dtypes.is_int(dtype) else "FSEL", dest, [src_t, src_f, pred])] # nvcc does float packed SEL here instead of FSEL
 
   def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]:
     srcs = [src_l, src_r]
@@ -270,12 +277,13 @@ class SASSRenderer(Renderer):
       return instrs[-1].dest
 
     def to_var(uop:UOp) -> Union[Register, str]:
-      return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop) # TODO: move to pred instead if PT/!PT?
+      return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop)
 
     def to_reg(uop:UOp) -> Register:
-      if isinstance(var := vals[uop], Register) and not var.pred: return var
-      vals[uop] = d = new_reg()
-      return queue(uop, self.render_where(d, var, "0x1", vals[0], uop.dtype) if isinstance(var, Register) else self.render_mov(d, var, uop.dtype))
+      if isinstance(var := vals[uop], Register):
+        return queue(uop, self.render_where(new_reg(), var.negate(), vals[0], "0x1", dtypes.int)) if var.pred else var
+      vals[uop] = dest = new_reg()
+      return queue(uop, self.render_mov(dest, var, uop.dtype))
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
       if idx.op is UOps.CONST:
@@ -286,7 +294,7 @@ class SASSRenderer(Renderer):
           queue(glob, Instruction("IMAD", g_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=["U32"]))
         addr_str = g_addr.render() + ".64"
         if idx.arg != 0:
-          addr_str += f"+{hex(idx.arg * nregs(glob.dtype.itemsize) * 4)}"
+          addr_str += f"+{hex(idx.arg * glob.dtype.itemsize)}"
       else:
         if glob.dtype.itemsize not in vals:
           vals[glob.dtype.itemsize] = queue(glob, self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
@@ -365,7 +373,7 @@ class SASSRenderer(Renderer):
           if dtypes.is_float(dtype):
             vals[u] = queue(u, ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[vin[0]]]))
             if vin[0].dtype is not dtypes.char: ins.mods.extend(dtype_mods(vin[0].dtype))
-            elif dtype is dtypes.float: ins.mods.extend(["S16"]) # special case to match nvcc
+            elif dtype is dtypes.float: ins.mods.extend(["S16"]) # NOTE: special case to match nvcc
             if dtype is dtypes.half: ins.mods.extend(["F16"])
           elif dtypes.is_int(dtype):
             if dtype is dtypes.long:
@@ -373,22 +381,28 @@ class SASSRenderer(Renderer):
               queue(u, Instruction("SHF", dest.offset(1), ["RZ", "0x1f", vals[vin[0]]], mods=["R", "S32", "HI"]))
             else:
               vals[u] = vals[vin[0]]
-          else:
-            raise NotImplementedError
+          elif dtype is dtypes.bool:
+            vals[u] = queue(u, ins := Instruction(f"ISETP", dest := new_pred(), ["PT", src := to_reg(vin[0]), "RZ", "PT"], mods=["NE", "AND"]))
+            if vin[0].dtype is dtypes.long:
+              ins.mods.extend(["U32"])
+              vals[u] = queue(u, Instruction(f"ISETP", dest, ["PT", src.offset(1), "RZ", "PT", dest], mods=["NE", "AND", "EX"]))
         elif dtypes.is_float(vin[0].dtype):
           if dtypes.is_int(dtype):
             vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["TRUNC"]))
             if dtype.itemsize <= 4: ins.mods.extend(["NTZ"])
-            if vin[0].dtype.itemsize != 4 or dtype.itemsize > 4: ins.mods.extend(dtype_mods(dtype)) # special case to match nvcc
+            if vin[0].dtype.itemsize != 4 or dtype.itemsize > 4: ins.mods.extend(dtype_mods(dtype)) # NOTE: special case to match nvcc
             if vin[0].dtype is dtypes.half: ins.mods.extend(["F16"])
           elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
             vals[u] = queue(u, Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", vals[vin[0]]], mods=["F16", "F32", "PACK_AB"]))
           elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
             vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0]).modify("H0_H0")], mods=["F32"]))
-          else:
-            raise NotImplementedError
+          elif dtype is dtypes.bool:
+            if vin[0].dtype is dtypes.half:
+              vals[u] = queue(u, Instruction(f"LOP3", new_pred(), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", self.lop["&"][0], "!PT"], mods=["LUT"]))
+            else:
+              vals[u] = queue(u, Instruction(f"FSETP", new_pred(), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
         elif vin[0].dtype is dtypes.bool:
-          vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]], render_binary(1, dtype), render_binary(0, dtype), dtype))
+          vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]].negate(), vals[0], render_value(1, dtype), dtype))
         else:
           raise NotImplementedError
       elif op is UOps.VECTORIZE:
