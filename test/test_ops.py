@@ -2,7 +2,7 @@ import time, math, unittest
 import numpy as np
 from typing import List, Callable
 import torch
-from tinygrad.helpers import getenv, IMAGE, DEBUG, CI
+from tinygrad.helpers import getenv, IMAGE, DEBUG, CI, Context
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 import functools
@@ -344,6 +344,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,35), (45,35), (45,35)], lambda x,y,z: x.lerp(y,z))
     helper_test_op(None, lambda x,y,z: x.lerp(y,z), vals=[[1.,2.,3.], [4.,5.,6.], 0.5])
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_tril(self):
     helper_test_op([(3,3)], lambda x: x.tril())
     helper_test_op([(3,3)], lambda x: x.tril(1))
@@ -360,6 +361,8 @@ class TestOps(unittest.TestCase):
     helper_test_op([(5,0,3)], lambda x: x.tril())
     helper_test_op([(5,3,3)], lambda x: x.tril(1))
     helper_test_op(None, lambda x: x.tril(), vals=[[[True] * 3] * 3], forward_only=True)
+
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_triu(self):
     helper_test_op([(3,3)], lambda x: x.triu())
     helper_test_op([(3,3)], lambda x: x.triu(1))
@@ -446,7 +449,9 @@ class TestOps(unittest.TestCase):
     helper_test_op([(), ()], lambda x,y: x/y)
   def test_div_int(self):
     helper_test_op(None, lambda x,y: x/y, Tensor.div, forward_only=True, vals=np.array([[5, 6, 7],[1, 2, 3]], dtype=np.int32))
-    helper_test_op(None, lambda x: x/2, lambda x: x/2, forward_only=True, vals=np.array([[3, 4, 5]], dtype=np.int32))
+    helper_test_op(None, lambda x,y: x//y, forward_only=True, vals=np.array([[5, 6, 7],[1, 2, 3]], dtype=np.int32))
+    helper_test_op(None, lambda x: x/2, forward_only=True, vals=np.array([[3, 4, 5]], dtype=np.int32))
+    helper_test_op(None, lambda x: x//2, forward_only=True, vals=np.array([[3, 4, 5]], dtype=np.int32))
     torch_idiv, tiny_idiv = functools.partial(torch.div, rounding_mode="trunc"), functools.partial(Tensor.div, upcast=False)
     helper_test_op(None, torch_idiv, tiny_idiv, forward_only=True, vals=np.array([[5, -6, 7],[1, 2, 3]], dtype=np.int32))
     x = Tensor(2**64 - 1, dtype=dtypes.uint64).div(1, upcast=False)
@@ -666,6 +671,7 @@ class TestOps(unittest.TestCase):
 
   def test_small_cumsum(self):
     helper_test_op([(10)], lambda x: torch.cumsum(x, dim=0), lambda x: Tensor.cumsum(x, axis=0))
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "Qualcomm fails on this (both on GPU/QCOM backends)")
   def test_simple_cumsum(self):
     helper_test_op([(512)], lambda x: torch.cumsum(x, dim=0), lambda x: Tensor.cumsum(x, axis=0))
     helper_test_op([(1022)], lambda x: torch.cumsum(x, dim=0), lambda x: Tensor.cumsum(x, axis=0))
@@ -750,10 +756,28 @@ class TestOps(unittest.TestCase):
                                                 lambda a,b: Tensor.einsum('zqrs,tuqvr->zstuv', a,b), atol=1e-5)
     # bilinear transformation
     helper_test_op([(2,3),(5,3,7),(2,7)], lambda a,b,c: torch.einsum('ik,jkl,il->ij', [a,b,c]), lambda a,b,c: Tensor.einsum('ik,jkl,il->ij', [a,b,c]))
-    # test ellipsis # TODO: FIXME
-    with self.assertRaises(Exception):
-      helper_test_op([(16,29,256),(16,29,256)], lambda a,b: torch.einsum('...id, ...jd -> ...ij', [a,b]),
-                                                lambda a,b: Tensor.einsum('...id, ...jd -> ...ij', [a,b]))
+
+  @unittest.expectedFailure
+  def test_einsum_ellipsis(self):
+    """The expected behavior for einsum is described in the PyTorch docs: https://pytorch.org/docs/stable/generated/torch.einsum.html"""
+    # TODO: implement ellipsis support in einsum to pass these tests
+    # test ellipsis
+    helper_test_op([(3, 8, 9), (3, 8, 9)], lambda a, b: torch.einsum('...id, ...jd -> ...ij', [a, b]),
+               lambda a, b: Tensor.einsum('...id, ...jd -> ...ij', [a, b]))
+    # ellipsis will come first in the output before the subscript labels, if rhs is not specified
+    helper_test_op([(3, 8, 9), (3, 8, 9)], lambda a, b: torch.einsum('...id, ...jd', [a, b]),
+               lambda a, b: Tensor.einsum('...id, ...jd', [a, b]))
+    # multiple ellipsis in different operands with different shapes are allowed
+    helper_test_op([(2, 3, 4, 5), (5, 2, 4)], lambda a, b: torch.einsum('i...j,ji...->...', [a, b]),
+               lambda a, b: Tensor.einsum('i...j,ji...->...', [a, b]))
+    # multiple ellipsis in one operand are not allowed. This test shall raise an exception.
+    with self.assertRaises(RuntimeError):
+      helper_test_op([(2, 3, 4), (2, 3, 4)], lambda a, b: torch.einsum('...ik..., ...jk ->', [a, b]),
+                       lambda a, b: Tensor.einsum('...ik..., ...jk ->', [a, b]))
+    # multiple ellipsis must broadcast together. This test shall raise an exception.
+    with self.assertRaises(RuntimeError):
+      helper_test_op([(2, 3, 4, 5), (5, 2, 7)], lambda a, b: torch.einsum('i...j,ji...->...', [a, b]),
+                       lambda a, b: Tensor.einsum('i...j,ji...->...', [a, b]))
 
   def test_einsum_shape_check(self):
     a = Tensor.zeros(3,8,10,5)
@@ -838,6 +862,7 @@ class TestOps(unittest.TestCase):
   def test_small_gemm_eye(self):
     helper_test_op(None, lambda x,y: x.matmul(y), lambda x,y: x@y, vals=[np.eye(8).astype(np.float32), np.eye(8).astype(np.float32)])
   @unittest.skipIf(CI and Device.DEFAULT in ["NV", "LLVM", "GPU", "CUDA"], "not supported on these in CI")
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "Qualcomm fails on this (both on GPU/QCOM backends)")
   def test_gemm_fp16(self):
     helper_test_op([(64,64), (64,64)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
   def test_gemm(self):
@@ -878,6 +903,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=(0,2)))
     helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=(1,2)))
     helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=1))
+    helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=1, keepdim=True))
     helper_test_op([()], lambda x: x.sum())
     helper_test_op([()], lambda x: x.sum(0))
     helper_test_op([()], lambda x: x.sum(-1))
@@ -891,6 +917,16 @@ class TestOps(unittest.TestCase):
     helper_test_op([(4, 0)], lambda x: x.sum(axis=(1,)))
     helper_test_op([(4, 0)], lambda x: x.sum(axis=(0,1)))
 
+  def test_prod(self):
+    helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 3.0]])
+    with Context(NOOPT=1): helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 3.0]])
+    helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=3), lambda x: x.prod(axis=3))
+    helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=1), lambda x: x.prod(axis=1))
+    helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=1, keepdim=True), lambda x: x.prod(axis=1, keepdim=True))
+    helper_test_op([()], lambda x: x.prod())
+    helper_test_op([()], lambda x: x.prod(0))
+    helper_test_op([()], lambda x: x.prod(-1))
+
   def test_min(self):
     helper_test_op([(3,3)], lambda x: x.min())
     helper_test_op([(45,3)], lambda x: x.min())
@@ -903,25 +939,31 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3,4,5,6)], lambda x: x.max(axis=1)[0], lambda x: x.max(axis=1))
     helper_test_op([()], lambda x: x.max())
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_any(self):
     helper_test_op([(3,4,5,6)], lambda x: x.any(), forward_only=True)
     helper_test_op(None, lambda x: x.any(), vals=[[True, True]], forward_only=True)
     helper_test_op(None, lambda x: x.any(), vals=[[True, False]], forward_only=True)
     helper_test_op(None, lambda x: x.any(), vals=[[False, False]], forward_only=True)
     helper_test_op([()], lambda x: x.any(), forward_only=True)
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_any_axis(self):
     helper_test_op([(3,4,5,6)], lambda x: x.any(axis=(1,2)), forward_only=True)
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_any_zero_axis(self):
     helper_test_op([(1,0,3,0,5)], lambda x: x.any(axis=(1,3)), forward_only=True)
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_all(self):
     helper_test_op([(3,4,5,6)], lambda x: x.all(), forward_only=True)
     helper_test_op(None, lambda x: x.all(), vals=[[True, True]], forward_only=True)
     helper_test_op(None, lambda x: x.all(), vals=[[True, False]], forward_only=True)
     helper_test_op(None, lambda x: x.all(), vals=[[False, False]], forward_only=True)
     helper_test_op([()], lambda x: x.all(), forward_only=True)
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_all_axis(self):
     helper_test_op([(3,4,5,6)], lambda x: x.all(axis=(1,2)), forward_only=True)
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_all_zero_axis(self):
     helper_test_op([(1,0,3,0,5)], lambda x: x.all(axis=(1,3)), forward_only=True)
 
@@ -1396,6 +1438,7 @@ class TestOps(unittest.TestCase):
       lambda x,w: Tensor.conv2d(x,w).relu(), grad_rtol=1e-5)
 
   @unittest.skipIf(IMAGE>0, "no conv3d on images")
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "Qualcomm fails on this (both on GPU/QCOM backends)")
   def test_padded_conv3d(self):
     helper_test_op([(1,4,5,5,5), (4,4,3,3,3)],
       lambda x,w: torch.nn.functional.conv3d(x,w,padding=1).relu(),
@@ -1416,6 +1459,7 @@ class TestOps(unittest.TestCase):
       lambda x,w: torch.nn.functional.conv2d(x,w).relu(),
       lambda x,w: Tensor.conv2d(x,w).relu(), grad_rtol=1e-5)
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "Qualcomm fails on this (both on GPU/QCOM backends)")
   def test_nested_conv2d(self):
     helper_test_op([(1,32,9,9), (32,32,3,3), (32,32,3,3)],
       lambda x,w1,w2: torch.nn.functional.conv2d(torch.nn.functional.conv2d(x,w1).relu(), w2).relu(),
@@ -1638,12 +1682,14 @@ class TestOps(unittest.TestCase):
               lambda x,w: torch.nn.functional.conv2d(torch.nn.functional.pad(x, p),w).relu(),
               lambda x,w: Tensor.conv2d(x,w,padding=p).relu())
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "Qualcomm fails on this (both on GPU/QCOM backends)")
   def test_padded_conv2d_p21(self):
     bs,cin,H,W,padding = 4, 3, 3, 3, (2,1)
     helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
       lambda x,w: torch.nn.functional.conv2d(x,w,padding=padding).relu(),
       lambda x,w: Tensor.conv2d(x,w,padding=padding).relu())
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "Qualcomm fails on this (both on GPU/QCOM backends)")
   def test_padded_conv2d_p22(self):
     bs,cin,H,W,padding = 4, 3, 3, 3, (2,2)
     helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
@@ -1771,6 +1817,34 @@ class TestOps(unittest.TestCase):
         lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="linear", align_corners=True),
         lambda x: Tensor.interpolate(x, size=out_sz, mode="linear", align_corners=True))
 
+  def test_interpolate_nearest(self):
+    for in_sz, out_sz in [((52,),(29,)), ((29,),(52,))]:
+      helper_test_op([(2,3)+in_sz],
+        lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="nearest"),
+        lambda x: Tensor.interpolate(x, size=out_sz, mode="nearest"))
+    for in_sz, out_sz in [((52,40),(29,31)), ((52,29),(31,40)), ((29,31),(40,52))]:
+      helper_test_op([(2,3)+in_sz],
+        lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="nearest"),
+        lambda x: Tensor.interpolate(x, size=out_sz, mode="nearest"))
+    for in_sz, out_sz in [((5,2,8),(3,6,4))]:
+      helper_test_op([(2,3)+in_sz],
+        lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="nearest"),
+        lambda x: Tensor.interpolate(x, size=out_sz, mode="nearest"))
+
+  def test_interpolate_nearest_exact(self):
+    for in_sz, out_sz in [((52,),(29,)), ((29,),(52,))]:
+      helper_test_op([(2,3)+in_sz],
+        lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="nearest-exact"),
+        lambda x: Tensor.interpolate(x, size=out_sz, mode="nearest-exact"))
+    for in_sz, out_sz in [((52,40),(29,31)), ((52,29),(31,40)), ((29,31),(40,52))]:
+      helper_test_op([(2,3)+in_sz],
+        lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="nearest-exact"),
+        lambda x: Tensor.interpolate(x, size=out_sz, mode="nearest-exact"))
+    for in_sz, out_sz in [((5,2,8),(3,6,4))]:
+      helper_test_op([(2,3)+in_sz],
+        lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="nearest-exact"),
+        lambda x: Tensor.interpolate(x, size=out_sz, mode="nearest-exact"))
+
   def test_interpolate_bilinear(self):
     for in_sz, out_sz in [((52,40),(29,31)), ((52,29),(31,40)), ((29,31),(40,52))]:
       helper_test_op([(2,3)+in_sz],
@@ -1795,6 +1869,7 @@ class TestOps(unittest.TestCase):
         lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="trilinear", align_corners=True),
         lambda x: Tensor.interpolate(x, size=out_sz, mode="linear", align_corners=True), atol=1e-4)
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_cat(self):
     for dim in range(-2, 3):
       helper_test_op([(45,65,9), (45,65,9), (45,65,9)], lambda x,y,z: torch.cat((x,y,z), dim), lambda x,y,z: x.cat(y, z, dim=dim))
@@ -2045,6 +2120,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(32,10)], lambda x: x.masked_fill((x>0.1).detach(), -math.inf))
     helper_test_op([(32,10)], lambda x: x.masked_fill((x<0.1).detach(), -math.inf))
 
+  @unittest.skipIf(Device.DEFAULT == "QCOM", "OpenCL fails to compile this (both on GPU/QCOM backends)")
   def test_cast(self):
     helper_test_op([(3, 3)], lambda x: x.float())
     helper_test_op(None, lambda x: x.float(), vals=[[0, 1, 2, 3]], forward_only=True)
@@ -2060,12 +2136,23 @@ class TestOpsUint8(unittest.TestCase):
   def test_cast_relu(self):
     helper_test_op([(2,3,64,64)], lambda x: x.relu().type(torch.uint8), lambda x: x.relu().cast('uint8'), forward_only=True)
 
-  @unittest.skip('this is wrong output')
   def test_interpolate_bilinear(self):
     out_sz = (10, 10)
     helper_test_op([(2,3,64,64)],
       lambda x: torch.nn.functional.interpolate((10*x).relu().type(torch.uint8), size=out_sz, mode="bilinear"),
       lambda x: Tensor.interpolate((10*x).relu().cast('uint8'), size=out_sz, mode="linear"), forward_only=True)
+
+  def test_interpolate_nearest(self):
+    out_sz = (10, 10)
+    helper_test_op([(2,3,64,64)],
+      lambda x: torch.nn.functional.interpolate((10*x).relu().type(torch.uint8), size=out_sz, mode="nearest"),
+      lambda x: Tensor.interpolate((10*x).relu().cast('uint8'), size=out_sz, mode="nearest"), forward_only=True)
+
+  def test_interpolate_nearest_exact(self):
+    out_sz = (10, 10)
+    helper_test_op([(2,3,64,64)],
+      lambda x: torch.nn.functional.interpolate((10*x).relu().type(torch.uint8), size=out_sz, mode="nearest-exact"),
+      lambda x: Tensor.interpolate((10*x).relu().cast('uint8'), size=out_sz, mode="nearest-exact"), forward_only=True)
 
 if __name__ == '__main__':
   np.random.seed(1337)

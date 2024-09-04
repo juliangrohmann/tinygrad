@@ -459,7 +459,7 @@ class Tensor:
   # ***** creation helper functions *****
 
   @staticmethod
-  def full(shape:Tuple[sint, ...], fill_value:ConstType, **kwargs):
+  def full(shape:Tuple[sint, ...], fill_value:ConstType, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with the given value.
 
@@ -476,7 +476,7 @@ class Tensor:
     return Tensor(fill_value, **kwargs).reshape((1, )*len(new_shape := argfix(shape))).expand(new_shape)
 
   @staticmethod
-  def zeros(*shape, **kwargs):
+  def zeros(*shape, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with zeros.
 
@@ -493,7 +493,7 @@ class Tensor:
     return Tensor.full(argfix(*shape), 0.0, **kwargs)
 
   @staticmethod
-  def ones(*shape, **kwargs):
+  def ones(*shape, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with ones.
 
@@ -510,7 +510,7 @@ class Tensor:
     return Tensor.full(argfix(*shape), 1.0, **kwargs)
 
   @staticmethod
-  def arange(start, stop=None, step=1, **kwargs):
+  def arange(start, stop=None, step=1, **kwargs) -> Tensor:
     """
     Returns a 1-D tensor of size `ceil((stop - start) / step)` with values from `[start, stop)`, with spacing between values given by `step`.
 
@@ -542,7 +542,7 @@ class Tensor:
     return (Tensor.full((math.ceil((stop-start)/step),), step, dtype=dtype, **kwargs)._cumsum() + (start - step)).cast(dtype)
 
   @staticmethod
-  def eye(n:int, m:Optional[int]=None, **kwargs):
+  def eye(n:int, m:Optional[int]=None, **kwargs) -> Tensor:
     """
     Returns a 2-D tensor with `n` rows and `m` columns, with ones on the diagonal and zeros elsewhere.
 
@@ -560,7 +560,7 @@ class Tensor:
     if n < 0 or (m is not None and m < 0): raise ValueError(f"cannot have negative {n=}, {m=}")
     return Tensor.ones((n,1),**kwargs).pad((None,(0,n))).flatten().shrink(((0,n*n),)).reshape(n,n)._slice((None,(0,n if m is None else m)))
 
-  def full_like(self, fill_value:ConstType, **kwargs):
+  def full_like(self, fill_value:ConstType, **kwargs) -> Tensor:
     """
     Creates a tensor with the same shape as `self`, filled with the given value.
     If `dtype` is not specified, the dtype of `self` is used.
@@ -575,7 +575,7 @@ class Tensor:
     """
     return Tensor.full(self.shape, fill_value, dtype=kwargs.pop("dtype", self.dtype), device=kwargs.pop("device", self.device), **kwargs)
 
-  def zeros_like(self, **kwargs):
+  def zeros_like(self, **kwargs) -> Tensor:
     """
     Creates a tensor with the same shape as `self`, filled with zeros.
 
@@ -589,7 +589,7 @@ class Tensor:
     """
     return self.full_like(0, **kwargs)
 
-  def ones_like(self, **kwargs):
+  def ones_like(self, **kwargs) -> Tensor:
     """
     Creates a tensor with the same shape as `self`, filled with ones.
 
@@ -1330,7 +1330,7 @@ class Tensor:
 
   def sum(self, axis:Optional[Union[int, Sequence[int]]]=None, keepdim=False, acc_dtype:Optional[DTypeLike]=None):
     """
-    Sums the elements of the tensor along the specified axis or axes.
+    Returns the sum of the elements of the tensor along the specified axis or axes.
 
     You can pass in `axis` and `keepdim` keyword arguments to control the axis along
     which the maximum is computed and whether the reduced dimensions are retained.
@@ -1354,6 +1354,32 @@ class Tensor:
     """
     ret = self.cast(acc_dtype or sum_acc_dtype(self.dtype))._reduce(F.Sum, axis, keepdim)
     return ret.cast(self.dtype) if acc_dtype is None and self.dtype in (dtypes.float16, dtypes.bfloat16) else ret
+
+  def prod(self, axis:Optional[Union[int, Sequence[int]]]=None, keepdim=False, acc_dtype:Optional[DTypeLike]=None):
+    """
+    Returns the product of the elements of the tensor along the specified axis or axes.
+
+    You can pass in `axis` and `keepdim` keyword arguments to control the axis along
+    which the maximum is computed and whether the reduced dimensions are retained.
+
+    You can pass in `acc_dtype` keyword argument to control the data type of the accumulation.
+    If not specified, the accumulation data type is chosen based on the input tensor's data type.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([-1, -2, -3, 1, 2, 3]).reshape(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.prod().numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.prod(axis=0).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.prod(axis=1).numpy())
+    ```
+    """
+    return self.cast(acc_dtype or self.dtype)._reduce(F.Prod, axis, keepdim)
 
   def max(self, axis:Optional[Union[int, Sequence[int]]]=None, keepdim=False):
     """
@@ -2024,7 +2050,7 @@ class Tensor:
     """
     Downsamples or Upsamples to the input `size`, accepts 0 to N batch dimensions.
 
-    The interpolation algorithm is selected with `mode` which currently only supports `linear`.
+    The interpolation algorithm is selected with `mode` which currently only supports `linear`, `nearest` and `nearest-exact`.
     To run `bilinear` or `trilinear`, pass in a 2D or 3D size.
 
     ```python exec="true" source="above" session="tensor" result="python"
@@ -2036,15 +2062,20 @@ class Tensor:
     ```
     """
     assert isinstance(size, (tuple,list)) and all_int(size) and 0 < len(size) <= self.ndim, f"invalid {size=}"
-    assert mode == "linear", "only supports linear interpolate"
+    assert mode in ("linear", "nearest", "nearest-exact"), "only supports linear, nearest or nearest-exact interpolate"
+    assert not (align_corners and mode != "linear"), "align_corners option can only be set with the interpolating mode linear"
     x, expand = self, list(self.shape)
-    for i in range(-len(size), 0):
+    for i in range(-1,-len(size)-1,-1):
       scale = (self.shape[i] - int(align_corners)) / (size[i] - int(align_corners))
       arr, reshape = Tensor.arange(size[i], dtype=dtypes.float32, device=self.device), [1] * self.ndim
-      index = (scale*arr if align_corners else (scale*(arr+0.5))-0.5).clip(0, self.shape[i]-1)
       reshape[i] = expand[i] = size[i]
-      low, high, perc = [y.reshape(reshape).expand(expand) for y in (index.floor(), index.ceil(), index - index.floor())]
-      x = x.gather(i, low).lerp(x.gather(i, high), perc)
+      if mode == "linear":
+        index = (scale*arr if align_corners else (scale*(arr+0.5))-0.5).clip(0, self.shape[i]-1)
+        low, high, perc = [y.reshape(reshape).expand(expand) for y in (index.floor(), index.ceil(), index - index.floor())]
+        x = x.gather(i, low).lerp(x.gather(i, high), perc)
+      else:
+        index = (scale*(arr+0.5) if mode=="nearest-exact" else scale*arr).cast(dtypes.int32).reshape(reshape).expand(expand)
+        x = x.gather(i, index)
     return x.cast(self.dtype)
 
   # ***** unary ops *****
@@ -2236,6 +2267,9 @@ class Tensor:
     print(Tensor([1., 2., 3.]).lerp(Tensor([4., 5., 6.]), 0.5).numpy())
     ```
     """
+    if self.dtype == dtypes.uint8 and isinstance(weight, Tensor):
+      w_i = (weight * (1<<(W_PREC:=7)) + 0.5).cast(dtypes.int16)
+      return (self+(((end - self).cast(dtypes.int8) * w_i + (1<<W_PREC-1)).cast(dtypes.uint16) >> W_PREC)).cast(dtypes.uint8)
     return self + (end - self) * weight
 
   def square(self):
@@ -2822,6 +2856,7 @@ class Tensor:
   def __mul__(self, x) -> Tensor: return self.mul(x)
   def __pow__(self, x) -> Tensor: return self.pow(x)
   def __truediv__(self, x) -> Tensor: return self.div(x)
+  def __floordiv__(self, x) -> Tensor: return self.div(x, upcast=False)
   def __matmul__(self, x) -> Tensor: return self.matmul(x)
   def __and__(self, x) -> Tensor: return self.bitwise_and(x)
   def __or__(self, x) -> Tensor: return self.bitwise_or(x)
@@ -2834,6 +2869,7 @@ class Tensor:
   def __rmul__(self, x) -> Tensor: return self.mul(x, True)
   def __rpow__(self, x) -> Tensor: return self.pow(x, True)
   def __rtruediv__(self, x) -> Tensor: return self.div(x, True)
+  def __rfloordiv__(self, x) -> Tensor: return self.div(x, True, upcast=False)
   def __rmatmul__(self, x) -> Tensor: return self.matmul(x, True)
   def __rand__(self, x) -> Tensor: return self.bitwise_and(x, True)
   def __ror__(self, x) -> Tensor: return self.bitwise_or(x, True)
@@ -2844,6 +2880,7 @@ class Tensor:
   def __imul__(self, x) -> Tensor: return self.assign(self.mul(x))
   def __ipow__(self, x) -> Tensor: return self.assign(self.pow(x))
   def __itruediv__(self, x) -> Tensor: return self.assign(self.div(x))
+  def __ifloordiv__(self, x) -> Tensor: return self.assign(self.div(x, upcast=False))
   def __imatmul__(self, x) -> Tensor: return self.assign(self.matmul(x))
   def __iand__(self, x) -> Tensor: return self.assign(self.bitwise_and(x))
   def __ior__(self, x) -> Tensor: return self.assign(self.bitwise_or(x))
@@ -3174,10 +3211,10 @@ class Tensor:
     if self.requires_grad: raise RuntimeError("can't backprop through bitcast")
     dt = to_dtype(dtype)
     if (not isinstance(self.device, str) or not self.device.startswith("DISK")) and (ns:=dt.itemsize) != (os:=self.dtype.itemsize):
-      if not (self.shape[-1]*os) % ns == 0: raise RuntimeError("unsupported size in bitcast")
+      if (self.shape[-1]*os) % ns != 0: raise RuntimeError("unsupported size in bitcast")
       new_uint, old_uint = to_dtype(f"uint{8*ns}"), to_dtype(f"uint{8*os}")
       tmp = self.bitcast(old_uint)
-      if ns > os: return functools.reduce(Tensor.__add__, (tmp[...,i::ns//os].cast(new_uint) << 8*i*os for i in range(ns//os))).bitcast(dtype)
+      if ns > os: return functools.reduce(Tensor.add, (tmp[..., i::ns//os].cast(new_uint) << 8*i*os for i in range(ns//os))).bitcast(dtype)
       return Tensor.stack(*(tmp>>8*i*ns for i in range(os//ns)), dim=-1).flatten(-2).cast(new_uint).bitcast(dtype)
     return F.Cast.apply(self, dtype=dt, bitcast=True) if self.dtype != dt else self
 

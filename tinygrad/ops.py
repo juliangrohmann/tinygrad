@@ -5,7 +5,7 @@ from collections import defaultdict
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from tinygrad.dtype import ConstType, ImageDType, PtrDType, dtypes, DType
-from tinygrad.helpers import pretty_print, prod, getenv
+from tinygrad.helpers import pretty_print, prod, getenv, all_same
 from tinygrad.shape.symbolic import Variable, sint
 if TYPE_CHECKING:
   from tinygrad.shape.shapetracker import ShapeTracker
@@ -25,7 +25,7 @@ class TernaryOps(Enum):
   WHERE = auto(); MULACC = auto() # noqa: E702
 class ReduceOps(Enum):
   """A -> B (reduce)"""
-  SUM = auto(); MAX = auto(); WMMA = auto() # noqa: E702
+  SUM = auto(); PROD = auto(); MAX = auto() # noqa: E702
 class MetaOps(Enum):
   EMPTY = auto(); CONST = auto(); COPY = auto(); CONTIGUOUS = auto(); CUSTOM = auto(); ASSIGN = auto(); VIEW = auto() # noqa: E702
 Op = Union[UnaryOps, BinaryOps, ReduceOps, MetaOps, TernaryOps]
@@ -33,22 +33,225 @@ Op = Union[UnaryOps, BinaryOps, ReduceOps, MetaOps, TernaryOps]
 # do not preserve f(0) = 0
 UNSAFE_PAD_OPS = {UnaryOps.RECIP, UnaryOps.LOG2, UnaryOps.EXP2, BinaryOps.IDIV}
 
+REDUCE_ALU: Dict[ReduceOps, BinaryOps] = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.PROD:BinaryOps.MUL, ReduceOps.MAX:BinaryOps.MAX}
+
+# https://en.wikipedia.org/wiki/Identity_element
+def identity_element(op:BinaryOps, dt:DType): return dtypes.as_const({BinaryOps.ADD:0, BinaryOps.MUL:1, BinaryOps.MAX:dtypes.min(dt)}[op], dt)
+
 # the order of these UOps controls the order of the toposort
 class UOps(Enum):
-  # ops that aren't rendered
-  SINK = auto(); EXT = auto(); EXPAND = auto(); CONTRACT = auto(); SHAPETRACKER = auto()  # noqa: E702
-  DEFINE_GLOBAL = auto(); DEFINE_VAR = auto(); DEFINE_LOCAL = auto(); DEFINE_ACC = auto() # noqa: E702
-  CONST = auto(); SPECIAL = auto() # noqa: E702
-  NOOP = auto(); GEP = auto() # noqa: E702
+  # uops that aren't rendered
+  SINK = auto()
+  """
+  Holds `UOps.STORE`. SINK defines the AST for a Kernel.
+
+  - **`dtype`**: `None`
+  - **`src`**: `Tuple[UOp, ...]`, Only global STOREs are allowed.
+  - **`arg`**: `Optional[KernelInfo]`
+
+  NOTE: `ScheduleItem` ASTs do not have the `KernelInfo` arg, `Kernel` inserts this to the SINK later.
+  """
+  EXT = auto()
+  """
+  Holds a single MetaOp. EXT UOps do not need a Kernel.
+
+  - **`dtype`**: Output DType
+  - **`src`**: `Tuple[]`
+  - **`arg`**: (`MetaOps.CUSTOM | MetaOps.COPY | MetaOps.EMPTY | MetaOps.VIEW`, LazyBuffer arg)
+  """
+  EXPAND = auto()
+  CONTRACT = auto()
+  SHAPETRACKER = auto()
+  """
+  Defines the ShapeTracker for a buffer UOp `UOps.LOAD`, `UOps.STORE` or `UOps.CONST`.
+
+  - **`dtype`**: `None`
+  - **`src`**: `Tuple[]`
+  - **`arg`**: `ShapeTracker`
+  """
+  SWIZZLE = auto()
+  """
+  Swizzle inserts a movement op between a UOp and its children. Because movement ops (reshape, expand, shrink, permute, pad) are not allowed in an AST,
+  the scheduler rewrites SWIZZLE by pushing its ShapeTracker through reduceops or elementwise ops to the edges of the graph.
+
+  Example:
+  ```python
+  a = Tensor.empty(32, 32)
+  first_reduce = a.sum()
+  output = (a + first_reduce).sum()
+  ```
+  `first_reduce` must broadcast to `(32, 32)` before ADD. We UOp this as:
+
+  ```
+  UOp(UOps.ALU, dtypes.int, arg=BinaryOps.ADD, src=(
+    UOp(UOps.SWIZZLE, dtypes.int, arg=ShapeTracker(views=(View(shape=(32, 32), strides=(0, 0), offset=0, mask=None, contiguous=False),)), src=(
+      UOp(UOps.REDUCE_AXIS, dtypes.int, arg=(BinaryOps.ADD, (0, 1)), src=(
+        UOp(UOps.LOAD, dtypes.int, arg=None, src=(
+          x3:=UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.int), arg=1, src=()),
+          UOp(UOps.SHAPETRACKER, None, arg=ShapeTracker(views=(View(shape=(32, 32), strides=(32, 1), offset=0, mask=None, contiguous=True),)), src=()),)),)),)),
+    UOp(UOps.LOAD, dtypes.int, arg=None, src=(
+       x3,
+      UOp(UOps.SHAPETRACKER, None, arg=ShapeTracker(views=(View(shape=(32, 32), strides=(32, 1), offset=0, mask=None, contiguous=True),)), src=()),)),))
+  ```
+
+  The scheduler rewrites this by pushing the expand in SWIZZLE through the reduce, to the LOAD:
+
+  ```diff
+  UOp(UOps.ALU, dtypes.int, arg=BinaryOps.ADD, src=(
+  -   UOp(UOps.SWIZZLE, dtypes.int, arg=ShapeTracker(views=(View(shape=(32, 32), strides=(0, 0), offset=0, mask=None, contiguous=False),)), src=(
+  -     UOp(UOps.REDUCE_AXIS, dtypes.int, arg=(BinaryOps.ADD, (0, 1)), src=(
+  -       UOp(UOps.LOAD, dtypes.int, arg=None, src=(
+  -         x3:=UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.int), arg=1, src=()),
+  -         UOp(UOps.SHAPETRACKER, None, arg=ShapeTracker(views=(View(shape=(32, 32), strides=(32, 1), offset=0, mask=None, contiguous=True),)), src=()),)),)),)),
+  +   UOp(UOps.REDUCE_AXIS, dtypes.int, arg=(BinaryOps.ADD, (2, 3)), src=(
+  +     UOp(UOps.LOAD, dtypes.int, arg=None, src=(
+  +       x2:=UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.int), arg=1, src=()),
+  +       UOp(UOps.SHAPETRACKER, None, arg=ShapeTracker(views=(View(shape=(32, 32, 32, 32), strides=(0, 0, 32, 1), offset=0, mask=None, contiguous=False),)), src=()),)),)),
+    UOp(UOps.LOAD, dtypes.int, arg=None, src=(
+  -      x3,
+  -     UOp(UOps.SHAPETRACKER, None, arg=ShapeTracker(views=(View(shape=(32, 32), strides=(32, 1), offset=0, mask=None, contiguous=True),)), src=()),)),))
+  +      x2,
+  +     UOp(UOps.SHAPETRACKER, None, arg=ShapeTracker(views=(View(shape=(32, 32, 1, 1), strides=(32, 1, 0, 0), offset=0, mask=None, contiguous=True),)), src=()),)),))
+
+  ```
+
+  NOTE: Pushing a SWIZZLE through a reduce changes the axis.
+
+  NOTE: Pushing a SWIZZLE changes the output shape of that UOp. We have to reshape every other adjacent node. eg. reshape of the second LOAD to `(32, 32, 1, 1)` above.
+
+  - **`dtype`**: Output DType
+  - **`src`**: `Tuple[UOp]`, a single UOp to swizzle.
+  - **`arg`**: ShapeTracker
+  """ # noqa E501
+  DEFINE_GLOBAL = auto()
+  DEFINE_VAR = auto()
+  DEFINE_LOCAL = auto()
+  DEFINE_ACC = auto()
+  CONST = auto()
+  """
+  Defines a single scalar constant value.
+
+  - **`dtype`**: The scalar DType of the value.
+
+  - **`src`**:
+    The scheduler creates a CONST with a single SHAPETRACKER UOp src: `Tuple[UOp]`.
+
+    The Lowerer replaces the SHAPETRACKER with an empty src.
+    It uses the ShapeTracker valid to create a `WHERE` UOp mask with sources: `(The actual CONST UOp, CONST 0, 0.0 or False)`
+
+  - **`arg`**: The value.
+  """
+  SPECIAL = auto()
+  NOOP = auto()
+  GEP = auto()
   # math ops
-  CAST = auto(); BITCAST = auto(); VECTORIZE = auto() # noqa: E702
-  ALU = auto(); REDUCE = auto(); REDUCE_AXIS = auto(); WMMA = auto() # noqa: E702
+  CAST = auto()
+  """
+  - **`dtype`**: The casted scalar DType
+  - **`src`**: `Tuple[UOp]`
+  - **`arg`**: `None`
+  """
+  BITCAST = auto()
+  """
+  - **`dtype`**: The bitcasted scalar DType
+  - **`src`**: `Tuple[UOp]`
+  - **`arg`**: `None`
+  """
+  VECTORIZE = auto()
+  """
+  - **`dtype`**: The upcasted vector DType
+  - **`src`**: `Tuple[UOp, ...]`
+  - **`arg`**: `None`
+
+  NOTE: Length of sources must match `dtype.count`
+  """
+  ALU = auto()
+  """
+  - **`dtype`**: Output DType
+  - **`src`**: `Tuple[UOp] | Tuple[UOp, UOp] | Tuple[UOp, UOp, UOp]`
+  - **`arg`**: `UnaryOps | BinaryOps | TernaryOps`
+  """
+  REDUCE = auto()
+  REDUCE_AXIS = auto()
+  """
+  - **`dtype`**: Output DType
+  - **`src`**: Input to reduce `Tuple[UOp]`
+  - **`arg`**: `(BinaryOps.ADD | BinaryOps.MUL | BinaryOps.MAX, Tuple[int, ...])`
+  """
+  WMMA = auto()
   # memory/assignment ops
-  LOAD = auto(); STORE = auto(); PHI = auto() # noqa: E702
+  LOAD = auto()
+  """
+  - **`dtype`**: Output DType
+  - **`src`**:
+
+    The scheduler and Kernel create LOADs with a SHAPETRACKER uop in src.
+
+    - Normal LOAD: `Tuple[UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_GLOBAL`.
+      - SHAPETRACKER UOp.
+
+    - Local LOAD: `Tuple[UOp, UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_LOCAL`.
+      - SHAPETRACKER UOp.
+      - Local UOps.STORE to the same local buffer. We will barrier this later.
+
+    The Lowerer replaces the SHAPETRACKER with an indexing uop and gates the LOAD if needed.
+
+    - Normal LOAD: `Tuple[UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_GLOBAL`.
+      - Indexing UOp, can only return `dtypes.int32`.
+    - Gated LOAD: `Tuple[UOp, UOp, UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_GLOBAL`.
+      - Indexing UOp, can only return `dtypes.int32`.
+      - Gate UOp, can only return `dtypes.bool`.
+      - Value if gate is `False`, can only be a `UOps.CONST` with arg 0, 0.0 or `False`.
+    - Barriered LOAD: `Tuple[UOp, UOp, UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_LOCAL`.
+      - Indexing UOp, can only return `dtypes.int32`.
+      - Gate UOp, can only return `dtypes.bool`.
+      - Barrier UOp `UOps.BARRIER`.
+  - **`arg`**: `None`
+  """
+  STORE = auto()
+  """
+  - **`dtype`**: `None`
+  - **`src`**:
+
+    Similar to LOAD, the scheduler and Kernel create STOREs with a SHAPETRACKER uop in src:
+
+    - Buffer UOp `UOps.DEFINE_GLOBAL` or `UOps.DEFINE_LOCAL`.
+    - SHAPETRACKER UOp.
+    - Value to store.
+
+    The Lowerer replaces the SHAPETRACKER with an indexing uop and gates the STORE if needed.
+
+    - Normal STORE: `Tuple[UOp, UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_GLOBAL` or `UOps.DEFINE_LOCAL`.
+      - Indexing Op, can only return `dtypes.int32`.
+      - Value to store.
+    - Gated STORE: `Tuple[UOp, UOp, UOp, UOp]`
+      - Buffer UOp `UOps.DEFINE_GLOBAL` or `UOps.DEFINE_LOCAL`.
+      - Indexing UOp, can only return `dtypes.int32`.
+      - Value to store.
+      - Gate UOp, can only return `dtypes.bool`.
+  - **`arg`**: `None`
+  """
+  PHI = auto()
   # control flow ops
-  BARRIER = auto(); IF = auto(); RANGE = auto() # noqa: E702
-  # these two are not graph nodes
-  ENDRANGE = auto(); ENDIF = auto() # noqa: E702
+  BARRIER = auto()
+  """
+  Inserts a warp sync between local stores and local loads.
+
+  - **`dtype`**: `None`
+  - **`src`**: `Tuple[UOp, ...]`, Only local STOREs are allowed.
+  - **`arg`**: `None`
+  """
+  IF = auto()
+  RANGE = auto()
+  # ops that are not graph nodes
+  ENDRANGE = auto()
+  ENDIF = auto()
 
 BUFFER_UOPS = {UOps.LOAD, UOps.STORE, UOps.CONST}
 
@@ -64,14 +267,14 @@ class UOp:
     return (self.op is UOps.ALU and \
       self.arg in {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.CMPNE, BinaryOps.XOR, BinaryOps.AND, BinaryOps.OR})
   @functools.cached_property
-  def cmp_tuple(self):
+  def cmp_tuple(self) -> Tuple[int, Any, Optional[DType], Tuple[UOp, ...]]:
     # NOTE: this sort of DEFINE_VAR shouldn't have to be here. only for PTX
     return (self.op.value, (self.arg if self.op is not UOps.DEFINE_VAR else self.arg.expr) if self.op is not UOps.ALU else \
             self.arg.value, self.dtype, self.src)
   def __lt__(self, x:UOp): return self.cmp_tuple < x.cmp_tuple
   @functools.cached_property
   def key(self) -> bytes:
-    return hashlib.sha256(functools.reduce(lambda x,y: x+y, [s.key for s in self.src], str((self.op, self.dtype, self.arg)).encode())).digest()
+    return hashlib.sha256(str((self.op, self.dtype, self.arg)).encode() + b"".join([s.key for s in self.src])).digest()
   def __repr__(self): return pretty_print(self, lambda x: f"{type(self).__name__}({x.op}, {x.dtype}, arg={x.argstr()}, src=(%s))")
   def argstr(self):
     return f'({", ".join(map(str, self.arg))})' if self.op is UOps.REDUCE_AXIS else repr(self.arg) if isinstance(self.arg, Variable) else self.arg
@@ -179,8 +382,7 @@ class UOp:
         if s1.arg > 0: return self.sconst(s0.vmin.arg//s1.arg), self.sconst(s0.vmax.arg//s1.arg)
         if s1.arg < 0: return self.sconst(-(s0.vmax.arg//-s1.arg)), self.sconst(-(s0.vmin.arg//-s1.arg))
       if self.arg is BinaryOps.MAX: return self.sconst(max(s0.vmin.arg, s1.vmin.arg)), self.sconst(max(s0.vmax.arg, s1.vmax.arg))
-      if self.arg is BinaryOps.CMPLT: return (UOp.sconst(dtypes.bool, True), UOp.sconst(dtypes.bool, True)) if s0.vmax.arg < s1.vmin.arg else \
-        (UOp.sconst(dtypes.bool, False), UOp.sconst(dtypes.bool, False)) if s0.vmin.arg >= s1.vmax.arg else (None, None)
+      if self.arg is BinaryOps.CMPLT: return (UOp.sconst(dtypes.bool, s0.vmax.arg<s1.vmin.arg), UOp.sconst(dtypes.bool, s0.vmin.arg<s1.vmax.arg))
     return None, None
 
 @dataclass(frozen=True)
@@ -196,6 +398,8 @@ def get_location() -> Tuple[str, int]:
   # no matchers in ops.py, find the real frame
   while (frm.f_code.co_filename.endswith("/ops.py") or frm.f_code.co_filename == '<string>') and frm.f_back is not None: frm = frm.f_back
   return frm.f_code.co_filename, frm.f_lineno
+@functools.lru_cache(None)
+def lines(fn): return open(fn).readlines()
 
 @dataclass(frozen=True, repr=False)  # reuse repr from UOp
 class NOp(UOp):
@@ -205,26 +409,31 @@ class NOp(UOp):
   location: Tuple[str, int] = field(default_factory=get_location)
 
   @staticmethod
+  @functools.lru_cache(None)
   def var(name:Optional[str]=None, dtype:Optional[DType]=None): return NOp(UOps.NOOP, dtype=dtype, name=name)
   @staticmethod
+  @functools.lru_cache(None)
   def cvar(name:Optional[str]=None, dtype:Optional[DType]=None): return NOp(UOps.CONST, dtype=dtype, name=name)
   def const(self:Union[UOp, DType, None], b:ConstType|Variable): return NOp((x:=UOp.const(self, b)).op, x.dtype, x.src, x.arg)
 
   @functools.cached_property
   def upat(self:NOp) -> UPat:
     return UPat(name=self.name, dtype=self.dtype, location=self.location) if self.op is UOps.NOOP else \
-      UPat(self.op, self.arg, (list if self.commutative() else tuple)(src.upat for src in self.src) or None, self.name,
+      UPat(self.op, self.arg, (list if self.commutative() else tuple)([src.upat for src in self.src]) or None, self.name,
            self.dtype, self.allow_any_len, location=self.location)
 
 class UPat:
   def __init__(self, op:Optional[Union[UOps, Set[UOps]]]=None, arg:Any=None, src:Optional[Union[Tuple[UPat, ...], List[UPat], UPat]]=None,
-               name:Optional[str]=None, dtype:Optional[Union[DType, Set[DType]]]=None, allow_any_len:bool=False, location=None):
+               name:Optional[str]=None, dtype:Optional[Union[DType, Set[DType]]]=None, allow_any_len:bool=False, location=None,
+               custom_early_reject:Optional[Set[Tuple[UOps, Any]]]=None):
     self.op: Optional[Tuple[UOps, ...]] = None if op is None else (tuple(op) if isinstance(op, set) else (op,))
     self.dtype: Optional[Tuple[DType, ...]] = None if dtype is None else (tuple(dtype) if isinstance(dtype, set) else (dtype,))
     self.arg, self.name = arg, name
+    self.in_src = src
     self.src: Any = None
+
     # try all permutations if it's a list
-    if isinstance(src, list): self.src = list(itertools.permutations(src))
+    if isinstance(src, list): self.src = list(itertools.permutations(src)) if not all_same(src) else [src]
     # only one if it's a tuple
     elif isinstance(src, tuple): self.src = [src]
     # repeat if it's a UPat
@@ -233,11 +442,12 @@ class UPat:
     self.allowed_len: int = 0 if allow_any_len or isinstance(src, UPat) or src is None else len(src)
     self.location = location or get_location()
 
-  @functools.cached_property
-  def early_reject(self):
-    # TODO: this can be improved to support some allowed_len == 0 patterns
-    return set((pp.op[0], pp.arg) for pp in self.src[0] if pp.op is not None and len(pp.op) == 1) if self.allowed_len else set()
+    if custom_early_reject is not None: self.early_reject = custom_early_reject
+    else:
+      upat_match = [self.in_src] if isinstance(self.in_src, UPat) else ([] if self.in_src is None else self.src[0])
+      self.early_reject = set((pp.op[0], pp.arg) for pp in upat_match if pp.op is not None and len(pp.op) == 1)
 
+  def printable(self:UPat): return lines(self.location[0])[self.location[1]-1].strip()
   def __repr__(self):
     def rep(x):
       form = "UPat(%s, %s, name=%s, dtype=%s, allow_any_len=%s, src=%s)"
@@ -249,11 +459,11 @@ def _match(uop:UOp, pat:UPat, store:Dict[str, UOp]) -> List[Dict[str, UOp]]:
   if (pat.name is not None and store.setdefault(pat.name, uop) is not uop) or \
      (pat.dtype is not None and uop.dtype not in pat.dtype) or \
      (pat.arg is not None and pat.arg != uop.arg) or \
-     (pat.op is not None and uop.op not in pat.op): return []
+     (pat.op is not None and uop.op not in pat.op) or \
+     (pat.allowed_len != 0 and len(uop.src) != pat.allowed_len): return []
   if pat.src is None: return [store]
   res: List[Dict[str, UOp]] = []
   for vp in pat.src:
-    if pat.allowed_len != 0 and len(uop.src) != pat.allowed_len: return []
     new_stores = [store.copy()]
     for uu, vv in zip(uop.src, vp): new_stores = [rstore for nstore in new_stores for rstore in _match(uu, vv, nstore)]
     res.extend(new_stores)
@@ -278,40 +488,47 @@ class PatternMatcher:
       if (matches := _match(uop, p, {})) and (ret:=fxn(**matches[0])) is not None: return ret # NOTE: if it returns None, we keep trying to match
     return None
 
-if getenv("TRACK_MATCH_STATS", 0):
-  match_stats = dict()
-  class TrackedPattenMatcher(PatternMatcher):
-    def __init__(self, patterns:List[Tuple[Union[UPat, NOp], Callable]]):
-      super().__init__(patterns)
-      for p,_ in self.patterns:
-        if p not in match_stats: match_stats[p] = [0,0,0.0]
+# *** tracking pattern matcher ***
 
-    def rewrite(self, uop:UOp) -> Optional[UOp]:
-      ret = None
-      ler = set([(u.op, u.arg) for u in uop.src] + [(u.op, None) for u in uop.src])
-      for p,fxn,early_reject in itertools.chain(self.pdict[(uop.op, uop.arg)], self.pdict[(uop.op, None)]):
-        st = time.perf_counter()
-        if not early_reject.issubset(ler):
-          match_stats[p][2] += time.perf_counter()-st
-          continue
-        match_stats[p][1] += 1
-        if (matches := _match(uop, p, {})) and (ret:=fxn(**matches[0])) is not None:
-          match_stats[p][0] += 1
-          match_stats[p][2] += time.perf_counter()-st
-          return ret # NOTE: if it returns None, we keep trying to match
+TRACK_MATCH_STATS = getenv("TRACK_MATCH_STATS", 0)
+match_stats:Dict[UPat, List[Union[int, float]]] = dict()
+class TrackedPattenMatcher(PatternMatcher):
+  def __init__(self, patterns:List[Tuple[Union[UPat, NOp], Callable]]):
+    super().__init__(patterns)
+    for p,_ in self.patterns:
+      if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
+
+  def rewrite(self, uop:UOp) -> Optional[UOp]:
+    ret = None
+    ler = set([(u.op, u.arg) for u in uop.src] + [(u.op, None) for u in uop.src])
+    for p,fxn,early_reject in itertools.chain(self.pdict[(uop.op, uop.arg)], self.pdict[(uop.op, None)]):
+      st = time.perf_counter()
+      if not early_reject.issubset(ler):
         match_stats[p][2] += time.perf_counter()-st
-      return None
+        continue
+      match_stats[p][1] += 1
+      if (matches := _match(uop, p, {})) and (ret:=fxn(**matches[0])) is not None:
+        match_stats[p][0] += 1
+        match_stats[p][2] += (et:=time.perf_counter()-st)
+        match_stats[p][3] += et
+        if TRACK_MATCH_STATS >= 2: print(f"{et*1e6:7.2f} us -- ", p.printable())
+        return ret # NOTE: if it returns None, we keep trying to match
+      match_stats[p][2] += time.perf_counter()-st
+    return None
+
+if TRACK_MATCH_STATS:
   PatternMatcher = TrackedPattenMatcher  # type: ignore
   import atexit
-  @functools.lru_cache(None)
-  def lines(fn): return open(fn).readlines()
   @atexit.register
   def print_match_stats():
-    ret = [0,0,0.0]
+    ret = [0,0,0.0,0.0]
     for k,v in sorted(list(match_stats.items()), key=lambda x: x[1][2]):
-      print(f"{v[0]:6d} / {v[1]:7d} -- {v[2]*1000.:9.2f} ms -- {k.location}", lines(k.location[0])[k.location[1]-1].strip())
+      loc_str = f"{k.location[0].split('/')[-1]}:{k.location[1]}"
+      print(f"{v[0]:6d} / {v[1]:7d} -- {v[3]*1000.:9.2f} / {v[2]*1000.:9.2f} ms -- {loc_str:15s}", k.printable())
       ret = [x+y for x,y in zip(ret, v)]
-    print(f"{ret[0]:6d} / {ret[1]:7d} -- {ret[2]*1000.:9.2f} ms -- TOTAL")
+    print(f"{ret[0]:6d} / {ret[1]:7d} -- {ret[3]*1000.:9.2f} / {ret[2]*1000.:9.2f} ms -- TOTAL")
+
+# *** simple graph rewrite engine ***
 
 def graph_rewrite(sink:UOp, pm:PatternMatcher) -> UOp:
   nodes: Dict[Tuple, UOp] = {}
@@ -375,7 +592,7 @@ def type_verify(uops):
     if uop is UOps.DEFINE_GLOBAL: assert isinstance(dtype, (PtrDType, ImageDType)), f"invalid dtype for global buffer {dtype}"
     if isinstance(dtype, ImageDType): assert uop is UOps.DEFINE_GLOBAL, f"{uop} can't be image"
     if uop is UOps.SHAPETRACKER: assert len(src) == 0, f"SHAPETRACKER must only define a ShapeTracker arg {uop}"
-    if uop is UOps.REDUCE_AXIS: assert isinstance(arg, tuple) and len(arg) == 2 and arg[0] in ReduceOps, f"invalid arg for REDUCE_AXIS {arg}"
+    if uop is UOps.REDUCE_AXIS: assert isinstance(arg, tuple) and len(arg) == 2 and arg[0] in BinaryOps, f"invalid arg for REDUCE_AXIS {arg}"
     if uop in {UOps.CONST, UOps.DEFINE_ACC}:
       if uop is UOps.CONST:
         assert dtype is not None and dtype == dtype.scalar(), f"consts must be scalar, got {dtype}"
@@ -452,5 +669,5 @@ def flops_mem(uops:List[UOp], ignore_indexing=False) -> Tuple[sint, sint]:
       flops += (mults * (2 if u.arg == TernaryOps.MULACC else 1)) * u.dtype.count
     elif u.op is UOps.WMMA and u not in dont_count:
       assert u.arg[1] is not None
-      flops += 2 * prod(u.arg[1]) // 32 * mults
+      flops += 2 * prod(u.arg[1]) // u.arg[5] * mults
   return flops, mem
