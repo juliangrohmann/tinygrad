@@ -391,6 +391,7 @@ class SASSRenderer(Renderer):
             vals[u] = queue(u, ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["TRUNC"]))
             if dtype.itemsize <= 4: ins.mods.extend(["NTZ"])
             if vin[0].dtype.itemsize != 4 or dtype.itemsize > 4: ins.mods.extend(dtype_mods(dtype)) # NOTE: special case to match nvcc
+            elif dtypes.is_unsigned(dtype): ins.mods.extend(["U32"]) # NOTE: special case to match nvcc
             if vin[0].dtype is dtypes.half: ins.mods.extend(["F16"])
           elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
             vals[u] = queue(u, Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", vals[vin[0]]], mods=["F16", "F32", "PACK_AB"]))
