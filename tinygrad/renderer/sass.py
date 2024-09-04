@@ -32,7 +32,7 @@ def const_addr(uop:UOp, offset=0):
   return f"c[0x0][{hex(param_cbank + uop.arg * 8 + offset)}]"
 
 def is_contiguous(srcs:List[Any]):
-  return all(isinstance(s, Register) and all_same([s.size for s in srcs]) and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
+  return all(isinstance(s, Register) and s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 
 def nregs(byte_size):
   return (byte_size + 3) // 4
