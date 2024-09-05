@@ -160,24 +160,19 @@ class SASSRenderer(Renderer):
   def render_where(self, dest, pred:Union[Register, str], src_t:Register, src_f:Union[Register,str], dtype:DType) -> List[Instruction]:
     return [Instruction("SEL" if dtypes.is_int(dtype) else "FSEL", dest, [src_t, src_f, pred])] # nvcc does float packed SEL here instead of FSEL
 
-  def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]:
-    srcs = [src_l, src_r]
+  def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]: # TODO: refactor
     if dtypes.is_int(dtype) or dtypes.is_float(dtype):
       ret = []
-      for i in range(0, nregs(dtype.itemsize)): # 64bit+ (long)
-        assert arg is BinaryOps.CMPNE or i == 0, f"64bit+ only supported for CMPNE. {arg=}"
-        srcs = [s.offset(i) for s in srcs]
-        ret.append(ins := Instruction("ISETP", dest, ["PT"] + srcs + ["PT"], mods=[f"{self.setp_mod[arg]}"]))
-        if dtypes.is_unsigned(dtype): ins.mods.append("U32")
-        ins.mods.append("AND")
-        if i > 0:
-          ins.mods.append("EX")
-          ins.srcs.append(dest)
+      for i in range(0, nregs(dtype.itemsize)):
+        ret.append(ins := Instruction("ISETP", dest, ["PT"] + [s.offset(i) for s in [src_l, src_r]] + ["PT"], mods=[f"{self.setp_mod[arg]}", "AND"]))
+        if dtypes.is_unsigned(dtype):
+          ins.mods.append("U32")
+        if dtype.itemsize // dtype.count > 4: # TODO: is vector cmp needed?
+          ins.mods.append("EX" if i % 2 == 1 else "U32")
+          if i % 2 == 1: ins.srcs.append(dest)
       return ret
-    elif dtype is dtypes.bool:
-      return [Instruction("PLOP3", dest, ["PT"] + srcs + ["PT"] + list(self.lop['^&']), mods=["LUT"])]
     else:
-      raise NotImplementedError
+      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + list(self.lop['^&']), mods=["LUT"])]
 
   def render_iter(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
     return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), *self.render_bra(label, pred)]
