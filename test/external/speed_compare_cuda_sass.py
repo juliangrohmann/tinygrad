@@ -137,6 +137,7 @@ if __name__ == "__main__":
       print(e)
       print(colored(f"kernel {num}: runtime failure", "red"))
       result["runtime_failure"].append(num)
+      continue
 
     # check if cuda and sass buffers match
     if allclose(cuda_bufs, debug_bufs):
