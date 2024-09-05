@@ -92,10 +92,12 @@ sass_matcher = PatternMatcher([
    lambda root,x,y,z,k: UOp(root.op, dtypes.char, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
    lambda root: UOp(root.op, dtypes.char, root.src, root.arg).cast(dtypes.bool)),
-  # (UPat(UOps.CAST, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
-  #     src=(UPat(UOps.LOAD, name="x", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)])))),
+  (UPat(UOps.ALU, name="root", arg=(BinaryOps.MUL, BinaryOps.ADD), dtype=dtypes.bool),
+   lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND if arg is BinaryOps.MUL else BinaryOps.OR).cast(dtypes.bool)),
+  # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)},
+  #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
-  (UPat(UOps.CAST, name="root", dtype=set([dt for dt in dtypes.fields().values() if dt.itemsize != 4]), src=(UPat(name="x", dtype=dtypes.bool))),
+  (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   # Shift left/right for int mul/div by 2
   # A, B -> ADD, C -> ADD               ===     A, B, C -> ADD3
@@ -123,7 +125,9 @@ class SASSRenderer(Renderer):
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
   lop = {
     "&": ("0xc0", "0x0"),   # a & b & (c | ~c)
-    "&3": ("0x80", "0x0"),  # a & b & c
+    "|": ("0xfc", "0x0"),   # a | b & (c | ~c)
+    "&&": ("0x80", "0x0"),  # a & b & c
+    "||": ("0xfe", "0x0"),   # a | b & (c | ~c)
     "^&": ("0x28", "0x0",), # (a ^ b) & c
     "~": ("0x0f", "0x0")    # ~a & (b | ~b) & (c | ~c)
   }
@@ -172,6 +176,7 @@ class SASSRenderer(Renderer):
           if i % 2 == 1: ins.srcs.append(dest)
       return ret
     else:
+      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + list(self.lop['^&']), mods=["LUT"])]
       return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + list(self.lop['^&']), mods=["LUT"])]
 
   def render_iter(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
@@ -423,9 +428,11 @@ class SASSRenderer(Renderer):
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
-        if arg is BinaryOps.MUL and dtype is dtypes.bool:
-          if len(srcs) == 2: srcs.append("PT")
-          vals[u] = queue(u, Instruction("PLOP3", new_pred(), ["PT"] + srcs + list(self.lop['&3']), mods=["LUT"]))
+        if arg in [BinaryOps.AND, BinaryOps.OR]:
+          lop = self.lop['&|'[arg is BinaryOps.OR] * len(srcs)]
+          if len(srcs) == 2: srcs.append("PT" if (pred := dtype is dtypes.bool) else "RZ")
+          params = ["PLOP3", new_pred(), ["PT"] + srcs + list(lop)] if pred else ["LOP3", new_reg(dtype.itemsize), srcs + [lop[0]] + ["!PT"]]
+          vals[u] = queue(u, Instruction(*params, mods=["LUT"]))
         elif arg in [BinaryOps.MUL, BinaryOps.ADD]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))
