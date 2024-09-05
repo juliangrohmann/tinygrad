@@ -164,11 +164,11 @@ class SASSRenderer(Renderer):
       ret = []
       for i in range(0, nregs(dtype.itemsize)):
         ret.append(ins := Instruction("ISETP", dest, ["PT"] + [s.offset(i) for s in [src_l, src_r]] + ["PT"], mods=[f"{self.setp_mod[arg]}", "AND"]))
-        if dtypes.is_unsigned(dtype):
+        if (ext := dtype.itemsize // dtype.count > 4) and i % 2 == 1: # TODO: is vector cmp needed?
+          ins.mods.append("EX")
+          ins.srcs.append(dest)
+        if dtypes.is_unsigned(dtype) or (ext and i % 2 == 0):
           ins.mods.append("U32")
-        if dtype.itemsize // dtype.count > 4: # TODO: is vector cmp needed?
-          ins.mods.append("EX" if i % 2 == 1 else "U32")
-          if i % 2 == 1: ins.srcs.append(dest)
       return ret
     else:
       return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop(lambda a,b,c: (a^b)&c), "0x0"], mods=["LUT"])]

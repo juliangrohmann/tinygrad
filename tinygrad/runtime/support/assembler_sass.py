@@ -54,7 +54,7 @@ class SASSAssembler:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
     def choose_mod(explicit_mods, spec_mods):
       valid_mods = [m for m in explicit_mods if m in spec_mods]
-      assert len(valid_mods) <= 1, f"ambiguous modifier for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {valid_mods=}, {spec_mods=}"
+      assert len(valid_mods) <= 1, f"ambiguous modifier for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {explicit_mods=}, {valid_mods=}, {spec_mods=}"
       mod_key = valid_mods[0] if len(valid_mods) else ''
       assert mod_key in spec_mods, f"default modifier not allowed for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {spec_mods=}, {spec.op_mods=}"
       return mod_key
