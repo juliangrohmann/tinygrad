@@ -422,8 +422,8 @@ class SASSRenderer(Renderer):
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
-        if arg in [BinaryOps.AND, BinaryOps.OR]:
-          lop_val = lop(lambda a,b,c: a|b if arg is BinaryOps.OR else a&b)
+        if arg in [BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR]:
+          lop_val = lop(lambda a,b,c: a|b if arg is BinaryOps.OR else a&b if arg is BinaryOps.AND else a^b)
           if len(srcs) == 2: srcs.append("PT" if (pred := dtype is dtypes.bool) else "RZ")
           params = ["PLOP3", new_pred(), ["PT"] + srcs + [lop_val, "0x0"]] if pred else ["LOP3", new_reg(dtype.itemsize), srcs + [lop_val, "!PT"]]
           vals[u] = queue(u, Instruction(*params, mods=["LUT"]))
