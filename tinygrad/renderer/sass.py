@@ -95,8 +95,12 @@ sass_matcher = PatternMatcher([
    lambda root,x,y,z,k: UOp(root.op, dtypes.char, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
    lambda root: UOp(root.op, dtypes.char, root.src, root.arg).cast(dtypes.bool)),
-  (UPat(UOps.ALU, name="root", arg=(BinaryOps.MUL, BinaryOps.ADD), dtype=dtypes.bool),
-   lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND if arg is BinaryOps.MUL else BinaryOps.OR).cast(dtypes.bool)),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
+   lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, dtype=dtypes.bool),
+   lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.MAX, dtype=dtypes.bool),
+   lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
   # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)},
   #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
@@ -163,7 +167,8 @@ class SASSRenderer(Renderer):
     if dtypes.is_int(dtype) or dtypes.is_float(dtype):
       ret = []
       for i in range(0, nregs(dtype.itemsize)):
-        ret.append(ins := Instruction("ISETP", dest, ["PT"] + [s.offset(i) for s in [src_l, src_r]] + ["PT"], mods=[f"{self.setp_mod[arg]}", "AND"]))
+        op = "ISETP" if dtypes.is_int(dtype) else "FSETP"
+        ret.append(ins := Instruction(op, dest, ["PT", src_l.offset(i), src_r.offset(i), "PT"], mods=[f"{self.setp_mod[arg]}", "AND"]))
         if (ext := dtype.itemsize // dtype.count > 4) and i % 2 == 1: # TODO: is vector cmp needed?
           ins.mods.append("EX")
           ins.srcs.append(dest)
@@ -274,7 +279,7 @@ class SASSRenderer(Renderer):
       return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop)
 
     def to_reg(uop:UOp) -> Register:
-      if isinstance(var := vals[uop], Register):
+      if isinstance(var := vals[uop], Register): # TODO: replace with better graph rewrite rules
         return queue(uop, self.render_where(new_reg(), var.negate(), vals[0], "0x1", dtypes.int)) if var.pred else var
       vals[uop] = dest = new_reg(uop.dtype.itemsize)
       return queue(uop, self.render_mov(dest, var, uop.dtype))
