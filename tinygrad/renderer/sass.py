@@ -217,6 +217,17 @@ class SASSRenderer(Renderer):
                 Instruction("FSEL", dest, [dest, "-INF", pred])])
     return ins
 
+  def render_sqrt(self, dest:Register, src:Register, bar_regs:Register, bar_lab:str, bufs:List[Register]) -> List[Instruction]: # TODO: only valid for input < 2^102. branch to __internal_0_$__cuda_sm20_sqrt_rn_f32_slowpath
+    return [Instruction("BSSY", bar_regs, [f"`({bar_lab})"]),
+            Instruction("IADD3", bufs[0], [src, "-0xd000000", "RZ"]),
+            Instruction("MUFU", dest, [src], mods=["RSQ"]),
+            Instruction("FMUL", bufs[1], [src, dest], mods=["FTZ"]),
+            Instruction("FMUL", dest, [dest, "0.5"], mods=["FTZ"]),
+            Instruction("FFMA", bufs[2], [bufs[1].negate(), bufs[1], src]),
+            Instruction("FFMA", dest, [bufs[2], dest, bufs[1]]),
+            Instruction("BSYNC", None, [bar_regs]),
+            Instruction(bar_lab, None, [], label=True)]
+
   def render(self, name:str, uops:List[UOp]) -> str:
     attr:Dict[str, int] = {"PARAM_COUNT": 0}
     kernel:List[Instruction] = []
@@ -435,6 +446,9 @@ class SASSRenderer(Renderer):
         elif arg is UnaryOps.LOG2:
           assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
           vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
+        elif arg is UnaryOps.SQRT:
+          assert dtype is dtypes.float, f"sqrt not supported for {dtype}" # TODO: remove
+          vals[u] = queue(u, self.render_sqrt(new_reg(dtype.itemsize), to_reg(vin[0]), new_bar_reg(), f".SQRT_{new_label()}", [new_reg(dtype.itemsize) for _ in range(3)]))
         else:
           raise NotImplementedError
       else:
