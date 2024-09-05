@@ -379,7 +379,8 @@ class SASSRenderer(Renderer):
           elif dtypes.is_int(dtype):
             if dtype.itemsize > 4:
               vals[u] = dest = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], vin[0].dtype))
-              queue(u, Instruction("SHF", dest.offset(1), ["RZ", "0x1f", dest], mods=["R", "HI", "SU"[dtypes.is_unsigned(vin[0].dtype)] + "32"]))
+              if not dtypes.is_unsigned(dtype):
+                queue(u, Instruction("SHF", dest.offset(1), ["RZ", "0x1f", dest], mods=["R", "HI", "S32"]))
             else:
               vals[u] = vals[vin[0]]
           elif dtype is dtypes.bool:
