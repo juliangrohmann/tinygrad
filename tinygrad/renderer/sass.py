@@ -443,7 +443,7 @@ class SASSRenderer(Renderer):
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_var(v) for v in vin], vin[0].dtype))
         elif arg is TernaryOps.WHERE:
-          vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), *[vals[v] for v in vin], dtype))
+          vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]], to_reg(vin[1]), vals[vin[2]], dtype))
         elif arg is UnaryOps.LOG2:
           assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
           vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
