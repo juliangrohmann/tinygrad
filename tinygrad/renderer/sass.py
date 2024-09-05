@@ -37,6 +37,9 @@ def is_contiguous(srcs:List[Any]):
 def nregs(byte_size):
   return (byte_size + 3) // 4
 
+def lop(func:Callable[[int, int, int], int]):
+  return hex(func(*[int(v, 16) for v in ["F0", "CC", "AA"]]))
+
 @dataclass
 class Register:
   idx: int
@@ -123,14 +126,6 @@ class SASSRenderer(Renderer):
   # language
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
-  lop = {
-    "&": ("0xc0", "0x0"),   # a & b & (c | ~c)
-    "|": ("0xfc", "0x0"),   # a | b & (c | ~c)
-    "&&": ("0x80", "0x0"),  # a & b & c
-    "||": ("0xfe", "0x0"),   # a | b & (c | ~c)
-    "^&": ("0x28", "0x0",), # (a ^ b) & c
-    "~": ("0x0f", "0x0")    # ~a & (b | ~b) & (c | ~c)
-  }
   setp_mod = {
     BinaryOps.CMPLT: "LT",
     BinaryOps.CMPNE: "NE"
@@ -176,8 +171,7 @@ class SASSRenderer(Renderer):
           if i % 2 == 1: ins.srcs.append(dest)
       return ret
     else:
-      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + list(self.lop['^&']), mods=["LUT"])]
-      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + list(self.lop['^&']), mods=["LUT"])]
+      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop(lambda a,b,c: (a^b)&c), "0x0"], mods=["LUT"])]
 
   def render_iter(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
     return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), *self.render_bra(label, pred)]
@@ -196,7 +190,7 @@ class SASSRenderer(Renderer):
     ins = [Instruction("FSETP", pred, ["PT", src, "1.175494350822287508e-38", "PT"], mods=["GEU", "AND"]),
            Instruction("FMUL", src, [src, "8388608"], pred=pred.negate()),
            Instruction("IADD3", dest, [src, "-0x3f3504f3", "RZ"]),
-           Instruction("LOP3", bufs[0], [dest, "0xff800000", "RZ", "0xc0", "!PT"], mods=["LUT"]),
+           Instruction("LOP3", bufs[0], [dest, "0xff800000", "RZ", lop(lambda a,b,c: a&b), "!PT"], mods=["LUT"]),
            Instruction("IADD3", dest, [src, bufs[0].negate(), "RZ"]),
            Instruction("I2FP", bufs[0], [bufs[0]], mods=["F32", "S32"]),
            Instruction("FADD", bufs[1], [dest, "-1"]),
@@ -401,7 +395,7 @@ class SASSRenderer(Renderer):
             vals[u] = queue(u, Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0]).modify("H0_H0")], mods=["F32"]))
           elif dtype is dtypes.bool:
             if vin[0].dtype is dtypes.half:
-              vals[u] = queue(u, Instruction(f"LOP3", new_pred(), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", self.lop["&"][0], "!PT"], mods=["LUT"]))
+              vals[u] = queue(u, Instruction(f"LOP3", new_pred(), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", lop(lambda a,b,c: a&b), "!PT"], mods=["LUT"]))
             else:
               vals[u] = queue(u, Instruction(f"FSETP", new_pred(), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
         elif vin[0].dtype is dtypes.bool:
@@ -429,9 +423,9 @@ class SASSRenderer(Renderer):
         srcs = [vals[v] for v in vin]
         assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg in [BinaryOps.AND, BinaryOps.OR]:
-          lop = self.lop['&|'[arg is BinaryOps.OR] * len(srcs)]
+          lop_val = lop(lambda a,b,c: a|b if arg is BinaryOps.OR else a&b)
           if len(srcs) == 2: srcs.append("PT" if (pred := dtype is dtypes.bool) else "RZ")
-          params = ["PLOP3", new_pred(), ["PT"] + srcs + list(lop)] if pred else ["LOP3", new_reg(dtype.itemsize), srcs + [lop[0]] + ["!PT"]]
+          params = ["PLOP3", new_pred(), ["PT"] + srcs + [lop_val, "0x0"]] if pred else ["LOP3", new_reg(dtype.itemsize), srcs + [lop_val, "!PT"]]
           vals[u] = queue(u, Instruction(*params, mods=["LUT"]))
         elif arg in [BinaryOps.MUL, BinaryOps.ADD]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
