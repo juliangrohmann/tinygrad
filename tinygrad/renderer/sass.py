@@ -41,16 +41,21 @@ def nregs(byte_size):
 class Register:
   idx: int
   size: int = 1
-  pred: bool = False
+  pred: bool = False # TODO: make these flags a str identifier
   uniform: bool = False
+  barrier: bool = False
   negated: bool = False
   mod: str = None
   def render(self):
-    prefix = '-!'[self.pred] if self.negated else ''
-    return f"{prefix}{'U' if self.uniform else ''}{'RP'[self.pred]}{self.idx if self.idx != -1 else 'Z'}{f'.{self.mod}' if self.mod else ''}"
+    pre_mod = '-!'[self.pred] if self.negated else ''
+    return f"{pre_mod}{self.identity()}{f'.{self.mod}' if self.mod else ''}"
   def offset(self, n): return dataclasses.replace(self, idx=self.idx + n)
+  def base(self): return self.offset(-(self.idx % self.size))
   def negate(self): return dataclasses.replace(self, negated=not self.negated)
   def modify(self, mod): return dataclasses.replace(self, mod=mod)
+  def identity(self): return f"{'U' if self.uniform else ''}{'RP'[self.pred] if not self.barrier else 'B'}{self.idx if self.idx != -1 else 'Z'}"
+  def __hash__(self): return hash(self.identity())
+  def __eq__(self, other): return other.identity() == self.identity()
 
 @dataclass
 class ControlCode:
@@ -80,6 +85,8 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
+write_latency_ops = {"MUFU", "LDG", "S2R"}
+read_latency_ops = {"MUFU"}
 sass_matcher = PatternMatcher([
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
    lambda root,x,y,z,k: UOp(root.op, dtypes.char, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
@@ -178,12 +185,11 @@ class SASSRenderer(Renderer):
   def render_bra(self, label:str, pred:Register) -> List[Instruction]:
     return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
 
-  def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType):
-    return [Instruction("MUFU", dest, [src], mods=["RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise (see kernel #6887)
+  def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType): # TODO: pass reg/pred generator
+    return [Instruction("MUFU", dest, [src], mods=["RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise
             Instruction("FFMA", buf, [dest, src, "-1"]),
             Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=["FTZ"]),
             Instruction("FFMA", dest, [dest, buf, dest])]
-
 
   def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]:
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
@@ -214,7 +220,6 @@ class SASSRenderer(Renderer):
   def render(self, name:str, uops:List[UOp]) -> str:
     attr:Dict[str, int] = {"PARAM_COUNT": 0}
     kernel:List[Instruction] = []
-    ctrl_codes:Dict[UOp, List[ControlCode]] = defaultdict(list)
     vals:Dict[Any, Union[Register,str]] = {}
 
     reg_cap = 251 # TODO: remove
@@ -236,14 +241,12 @@ class SASSRenderer(Renderer):
       assert pred_cnt <= pred_cap, "trying to assign to new predicate: all registers filled" # TODO: remove & optim regs after render
       return Register(idx, pred=True)
 
-    active_barriers = []
-    def new_barrier() -> int:
-      nonlocal active_barriers
-      for i in range(6):
-        if not i in active_barriers:
-          active_barriers.append(i)
-          return i
-      return active_barriers[0]
+    bar_reg_cnt = 0
+    def new_bar_reg() -> Register:
+      nonlocal bar_reg_cnt
+      idx = bar_reg_cnt
+      bar_reg_cnt += 1
+      return Register(idx, barrier=True)
 
     iter_stack = []
     label_cnt = 0
@@ -256,30 +259,11 @@ class SASSRenderer(Renderer):
       if not 1 in vals: vals[1] = queue(None, self.render_mov(new_reg(), "0x1", dtypes.int))
       return vals[1]
 
-    def wait_on_barriers(uop:UOp, ctrl:ControlCode):
-      for oper in uop.src:
-        if not oper in ctrl_codes:
-          wait_on_barriers(oper, ctrl)
-        else:
-          for bidx in [c.write for c in ctrl_codes[oper] if c.write is not None]:
-            if not bidx in active_barriers: continue
-            ctrl.wait.append(bidx)
-            active_barriers.remove(bidx)
-            if not active_barriers: return
-
     def queue(uop:UOp, instrs:Union[List[Instruction], Instruction]) -> Register:
       if not isinstance(instrs, list): instrs = [instrs]
-      nonlocal active_barriers
-      for ins in instrs:
-        if uop and active_barriers:
-          wait_on_barriers(uop, ins.ctrl)
-        ctrl_codes[uop].append(ins.ctrl)
-        ins.ctrl.yield_ |= ins.ctrl.stall >= 12 # TODO: is it 12?
-        kernel.append(ins)
-      for ins in instrs:
-        if ins.dest is not None and ins.dest.idx % ins.dest.size == 0:
-          return ins.dest
-      return instrs[-1].dest
+      kernel.extend(instrs)
+      base_regs = [ins.dest for ins in instrs if ins.dest is not None and ins.dest.idx % ins.dest.size == 0]
+      return base_regs[-1] if base_regs else instrs[-1].dest
 
     def to_var(uop:UOp) -> Union[Register, str]:
       return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop)
@@ -328,7 +312,7 @@ class SASSRenderer(Renderer):
     def render_permute(dest, msb, lsb, byte_size):
       return [Instruction("PRMT", dest.offset(i), [msb, "0x5410" if byte_size == 2 else "0x6420", lsb]) for i in range(dest.size)]
 
-    queue(None, Instruction(f".text.{name}", None, None, label=True))
+    queue(None, Instruction(f".text.{name}", None, [], label=True))
     vals[0] = Register(-1)
     vals[float("inf")] = "INF"
     vals[float("-inf")] = "-INF"
@@ -342,7 +326,6 @@ class SASSRenderer(Renderer):
           print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
       if op is UOps.SPECIAL:
         vals[u] = queue(u, ins := Instruction("S2R", new_reg(), [(self.tid if (tid := arg[0][:3] == "lid") else self.gid)[dim := int(arg[0][-1])]]))
-        ins.ctrl.write = new_barrier()
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
         vals[u] = vals[arg] if arg in vals else render_value(arg, dtype)
@@ -353,7 +336,7 @@ class SASSRenderer(Renderer):
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
       elif op is UOps.RANGE:
         vals[u] = queue(u, self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
-        queue(u, Instruction(label := f".LOOP_{new_label()}", None, None, label=True))
+        queue(u, Instruction(label := f".LOOP_{new_label()}", None, [], label=True))
         update = render_alu(BinaryOps.ADD, vals[u], vals[u], unity(), dtype)
         branch = self.render_iter(label, new_pred(), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
@@ -365,7 +348,6 @@ class SASSRenderer(Renderer):
         if vin[0].op is UOps.DEFINE_GLOBAL:
           pred = vals[vin[3]] if len(vin) > 3 else None
           vals[u] = queue(u, ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"], pred=pred))
-          ins.ctrl.write = new_barrier()
           ins.mods.extend(memory_mods(dtype))
           if pred: queue(u, self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
         else:
@@ -459,17 +441,40 @@ class SASSRenderer(Renderer):
         raise NotImplementedError
 
     queue(None, Instruction("EXIT", None, []))
-    queue(None, Instruction(buf_lab := ".L_BUF", None, None, label=True))
+    queue(None, Instruction(buf_lab := ".L_BUF", None, [], label=True))
     queue(None, Instruction("BRA", None, [f"`({buf_lab})"]))
     for _ in range(10): queue(None, Instruction("NOP", None, [])) # TODO: pad to multiple of 8
-    queue(None, Instruction(".L_END", None, None, label=True))
+    queue(None, Instruction(".L_END", None, [], label=True))
 
     attr["SHI_REGISTERS"] = reg_cnt + 3 # two internal registers on sm >= 8x, and RZ
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = i*16
+    set_ctrl(kernel)
     if getenv("CUASM", 0):
       return attach_sections(''.join(ins.render()+"\n" for ins in kernel[1:]), CUDARenderer("sm_89").render(name, uops), reg_cnt)
     else:
       return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+def set_ctrl(kernel):
+  def new_bar():
+    return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
+  def set_bar(deps, bar_tab):
+    active_bar.append(bar := new_bar())
+    bar_tab.update({d.base(): bar for d in deps if isinstance(d, Register)})
+    return bar
+  def wait_bar(deps, bar_tab):
+    bars = {bar_tab[d.base()] for d in deps if isinstance(d, Register) and d.base() in bar_tab}
+    inst.ctrl.wait.extend(list(bars))
+    for k,v in list(bar_tab.items()):
+      if v in bars: bar_tab.pop(k, None)
+    for b in bars: active_bar.remove(b)
+  active_bar = []
+  write_bar, read_bar = {}, {}
+  for inst in kernel:
+    inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_latency_ops else None
+    inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_latency_ops else None
+    wait_bar(inst.srcs, write_bar)
+    wait_bar([inst.dest], read_bar)
+    inst.ctrl.yield_ |= inst.ctrl.stall >= 12 # TODO: is it 12?
 
 def attach_sections(sass_src:str, cuda_src:str, reg_cnt:int):
   fn = (Path(tempfile.gettempdir()) / f"cu_buf_{hashlib.md5(cuda_src.encode()).hexdigest()}").as_posix()
