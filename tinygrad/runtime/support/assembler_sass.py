@@ -74,7 +74,7 @@ class SASSAssembler:
         if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.idx == enc.idx)
         if enc.inverse: value ^= 2 ** enc.length - 1
         value = value >> (seen[enc.idx] + enc.shift)
-        code += set_bits(value, enc.start + seen[enc.idx], enc.length)
+        code += set_bits(value, enc.start, enc.length)
         seen[enc.idx] += enc.length
       elif enc.type == EncodingType.MODIFIER:
         if not len(spec.op_mods[enc.value]): continue # TODO: remove empty mod entries from isa
