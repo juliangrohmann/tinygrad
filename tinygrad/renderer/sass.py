@@ -101,6 +101,8 @@ sass_matcher = PatternMatcher([
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MAX, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
+  (UPat(UOps.ALU, name="root", arg=UnaryOps.RECIP, src=(UPat(name="x"),), dtype=dtypes.half),
+   lambda root,x: UOp(root.op, dtypes.float, (x.cast(dtypes.float),), root.arg).cast(dtypes.half)),
   # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)},
   #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
