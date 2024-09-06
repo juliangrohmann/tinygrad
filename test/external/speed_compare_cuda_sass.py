@@ -55,11 +55,6 @@ if __name__ == "__main__":
 
   result = defaultdict(list)
   average_tm_cuda, average_tm_ptx = 0, 0
-  impl = [0, 2, 4, 11, 13, 14, 15, 16, 17, 22, 27, 29, 31, 42, 60, 64, 93, 105, 114, 122, 130, 134, 139, 185, 198, 199, 200, 204, 215, 216, 226, 228,
-          231, 232, 336, 351, 362, 372, 381, 384, 396, 410, 426, 427, 429, 435, 469, 513, 617, 618, 746, 896, 1022, 1459, 1537, 1785, 1994, 2011,
-          2013, 2265, 2357, 3009, 3019, 3285, 3231, 3593, 4020, 4074, 4361, 5389, 6071, 6413, 6933, 6971, 7014, 7101, 7469, 7758, 7874, 8195, 8429,
-          9059, 9274, 9358, 9393, 9772, 9986, 10493, 10696, 10814, 10889]
-  # inconsistent = [1150]
   single, start, end, max_nodes = getenv("NUM", -1), getenv("START", 0), getenv("END", len(ast_strs)), getenv("MAX_NODES", -1)
   for num,ast in enumerate(ast_strs):
     if (getenv("TEST", 0) and num not in impl) or not (start <= num < end) or (single != -1 and num != single):
@@ -107,11 +102,10 @@ if __name__ == "__main__":
       continue
 
     # init buffers
-    np.random.seed(42)
+    np.random.seed(222)
     cuda_bufs = bufs_from_lin(lin)
     for buf in cuda_bufs:
-      gen = np.random.uniform if dtypes.is_float(buf.dtype) else np.random.randint
-      buf.copyin(memoryview((gen(-1000, 1000, size=buf.size).astype(np.dtype(buf.dtype.fmt).type))))
+      buf.copyin(memoryview(bytearray(np.random.bytes(buf.size * buf.dtype.itemsize))))
     debug_bufs = [Buffer(buf.device, buf.size, buf.dtype, initial_value=bytearray(buf.as_buffer())) for buf in cuda_bufs]
 
     if is_debug:

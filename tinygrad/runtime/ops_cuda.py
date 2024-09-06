@@ -5,8 +5,9 @@ from tinygrad.helpers import DEBUG, getenv, from_mv, init_c_var, init_c_struct_t
 from tinygrad.device import Compiled, BufferOptions, LRUAllocator
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.renderer.assembly import PTXRenderer
+from tinygrad.renderer.sass import SASSRenderer
 from tinygrad.runtime.autogen import cuda
-from tinygrad.runtime.support.compiler_cuda import cuda_disassemble, pretty_ptx, CUDACompiler, PTXCompiler, PTX
+from tinygrad.runtime.support.compiler_cuda import cuda_disassemble, pretty_ptx, CUDACompiler, PTXCompiler, SASSCompiler, PTX
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 def check(status):
@@ -113,8 +114,10 @@ class CUDADevice(Compiled):
     CUDADevice.devices.append(self)
 
     from tinygrad.runtime.graph.cuda import CUDAGraph
-    super().__init__(device, CUDAAllocator(self), PTXRenderer(self.arch) if PTX else CUDARenderer(self.arch),
-                     PTXCompiler(self.arch) if PTX else CUDACompiler(self.arch), functools.partial(CUDAProgram, self), graph=CUDAGraph)
+    super().__init__(device, CUDAAllocator(self),
+                     SASSRenderer(self.arch) if getenv("SASS") else PTXRenderer(self.arch) if PTX else CUDARenderer(self.arch),
+                     SASSCompiler(self.arch) if getenv("SASS") else PTXCompiler(self.arch) if PTX else CUDACompiler(self.arch),
+                     functools.partial(CUDAProgram, self), graph=CUDAGraph)
 
   def synchronize(self):
     check(cuda.cuCtxSetCurrent(self.context))

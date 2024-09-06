@@ -492,7 +492,7 @@ def full_graph_rewrite(sink:UOp, opts:Optional[Renderer]=None) -> UOp:
     sink = graph_rewrite(sink, folder+(expander+float4_folding if opts is not None and opts.supports_float4 else expander))
     sink = graph_rewrite(sink, folder+reducer)
 
-  # for PTX only
+  # for PTX and SASS only
   if opts is not None and opts.extra_matcher is not None: sink = graph_rewrite(sink, folder+opts.extra_matcher)
   return sink
 
