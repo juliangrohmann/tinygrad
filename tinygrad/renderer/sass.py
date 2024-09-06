@@ -102,30 +102,17 @@ def recip(x:UOp) -> UOp:
   dest = dest * buf + dest
   return src.ne(0).where(dest, src.const(math.inf)).cast(x.dtype)
 
-def idiv(x:UOp, y:UOp) -> UOp:
+def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
   abs_y = y.alu(SASSOps.IABS)
-  r0 = abs_y.cast(dtypes.float)
-  r4 = x.alu(SASSOps.IABS)
-  r2 = x.alu(BinaryOps.XOR, y)
-  p1 = -r2.lt(x.const(0))
-  r0 = r0.alu(SASSOps.RECIP_APPROX).bitcast(dtypes.int)
-  r6 = r0 + int("0xffffffe", 16)
-  r0 = -abs_y
-  r7 = r6.cast(x.dtype)
-  r6 = UOp(UOps.VECTORIZE, dtypes.int.vec(2), (x.const(0), r7))
-  r10 = -r7
-  r13 = r10 * abs_y
-  r7 = r7.alu(SASSOps.HI, r13, r6)
-  r7 = r7.alu(SASSOps.HI, r4, x.const(0))
-  r0 = r7 * r0 + r4
-  p2 = r0.lt(abs_y)
-  r0 = p2.where(r0, r0 - abs_y)
-  r7 = p2.where(r7, r7 + 1)
-  p2 = y.ne(0)
-  p0 = r0.ge(abs_y)
-  r7 = p0.where(r7 + 1, r7)
-  r7 = p1.where(r7, -r7)
-  return p2.where(r7, x.const(int("0x7f800000", 16)))
+  abs_x = x.alu(SASSOps.IABS)
+  buf = (abs_y.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(dtypes.int) + int("0xffffffe", 16)).cast(x.dtype)
+  buf = buf.alu(SASSOps.HI, -buf * abs_y, UOp(UOps.VECTORIZE, dtypes.int.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_x, x.const(0))
+  fma = buf * -abs_y + abs_x
+  pred = fma.lt(abs_y)
+  buf = pred.where(buf, buf + 1)
+  buf = pred.where(fma, fma - abs_y).ge(abs_y).where(buf + 1, buf)
+  dest = (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
+  return y.ne(0).where(dest, x.const(int("0x7f800000", 16)))
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F"} # TODO: I2F is only variable latency for cross register (64bit) ops?
 read_latency_ops = {"MUFU"}
