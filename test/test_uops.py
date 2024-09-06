@@ -88,6 +88,7 @@ class TestUOps(unittest.TestCase):
         for b in [-3.0, 1.0] + ([] if no_b_zero else [0.0]):
           a = dtypes.as_const(a, dts[0])
           b = dtypes.as_const(abs(b) if no_b_neg else b, dts[1])
+          print(f"{a=}, {b=}")
           self._equal(f([a,b], op, dts), fxn(a,b))
 
   def _test_top_fxn(self, op, fxn, dts=(dtypes.float32, )*3):

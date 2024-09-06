@@ -7,12 +7,15 @@ from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
-from tinygrad.helpers import getenv, all_same, flatten
+from tinygrad.runtime.support.elf import elf_loader
+from tinygrad.runtime.support.compiler_cuda import SASSCompiler
+from tinygrad.helpers import getenv, all_same, flatten, to_function_name
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
+from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
 def render_value(x, dtype):
@@ -91,10 +94,14 @@ class Instruction:
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F"} # TODO: I2F is only variable latency for cross register (64bit) ops?
 read_latency_ops = {"MUFU"}
 sass_matcher = PatternMatcher([
-  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
-   lambda root,x,y,z,k: UOp(root.op, dtypes.char, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
-  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX, TODO: make uchar, TODO: same pattern for STORE
-   lambda root: UOp(root.op, dtypes.char, root.src, root.arg).cast(dtypes.bool)),
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))), # NOTE: from PTX
+   lambda root,x,y,z,k: UOp(root.op, dtypes.uchar, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX
+   lambda root: UOp(root.op, dtypes.uchar, root.src, root.arg).cast(dtypes.bool)),
+  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool), UPat())), # NOTE: from PTX
+   lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
+  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))), # NOTE: from PTX
+   lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, dtype=dtypes.bool),
@@ -128,7 +135,7 @@ class SASSRenderer(Renderer):
   extra_matcher = sass_matcher
   def __init__(self, arch:str):
     self.tensor_cores = SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
-    self.cuda_renderer = CUDARenderer(arch) # TODO: remove
+    self.arch = arch # TODO: remove
   # language
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
@@ -171,7 +178,7 @@ class SASSRenderer(Renderer):
       for i in range(0, nregs(dtype.itemsize)):
         op = "ISETP" if dtypes.is_int(dtype) else "FSETP"
         ret.append(ins := Instruction(op, dest, ["PT", src_l.offset(i), src_r.offset(i), "PT"], mods=[f"{self.setp_mod[arg]}", "AND"]))
-        if (ext := dtype.itemsize // dtype.count > 4) and i % 2 == 1: # TODO: is vector cmp needed?
+        if (ext := dtype.itemsize // dtype.count > 4) and i % 2 == 1: # TODO: remove vector cmp
           ins.mods.append("EX")
           ins.srcs.append(dest)
         if dtypes.is_unsigned(dtype) or (ext and i % 2 == 0):
@@ -186,13 +193,13 @@ class SASSRenderer(Renderer):
   def render_bra(self, label:str, pred:Register) -> List[Instruction]:
     return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
 
-  def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType): # TODO: pass reg/pred generator
+  def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType): # TODO: pass reg/pred generator, TODO: move to pattern matcher
     return [Instruction("MUFU", dest, [src], mods=["RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise
             Instruction("FFMA", buf, [dest, src, "-1"]),
             Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=["FTZ"]),
             Instruction("FFMA", dest, [dest, buf, dest])]
 
-  def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]:
+  def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]: # TODO: move to pattern matcher
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
     ins = [Instruction("FSETP", pred, ["PT", src, "1.175494350822287508e-38", "PT"], mods=["GEU", "AND"]),
            Instruction("FMUL", src, [src, "8388608"], pred=pred.negate()),
@@ -218,7 +225,7 @@ class SASSRenderer(Renderer):
                 Instruction("FSEL", dest, [dest, "-INF", pred])])
     return ins
 
-  def render_sqrt(self, dest:Register, src:Register, bar_regs:Register, bar_lab:str, bufs:List[Register]) -> List[Instruction]: # TODO: only valid for input < 2^102. branch to __internal_0_$__cuda_sm20_sqrt_rn_f32_slowpath
+  def render_sqrt(self, dest:Register, src:Register, bar_regs:Register, bar_lab:str, bufs:List[Register]) -> List[Instruction]: # TODO: only valid for input < 2^102. branch to __internal_0_$__cuda_sm20_sqrt_rn_f32_slowpath, # TODO: move to pattern matcher
     return [Instruction("BSSY", bar_regs, [f"`({bar_lab})"]),
             Instruction("IADD3", bufs[0], [src, "-0xd000000", "RZ"]),
             Instruction("MUFU", dest, [src], mods=["RSQ"]),
@@ -230,6 +237,11 @@ class SASSRenderer(Renderer):
             Instruction(bar_lab, None, [], label=True)]
 
   def render(self, name:str, uops:List[UOp]) -> str:
+    if getenv("GRAPHUOPS"): # TODO: remove
+      graph_uops(uops)
+    if debug_sass := getenv("DEBUG_SASS", ""):
+      with open(debug_sass) as f: return f.read()
+
     attr:Dict[str, int] = {"PARAM_COUNT": 0}
     kernel:List[Instruction] = []
     vals:Dict[Any, Union[Register,str]] = {}
@@ -459,6 +471,11 @@ class SASSRenderer(Renderer):
         elif arg is UnaryOps.LOG2:
           assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
           vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
+        # elif arg is UnaryOps.EXP2:
+        #   assert dtype is dtypes.float, f"exp2 not supported for {dtype}" # TODO: remove
+        #   # vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
+        #   vals[u] = "0x0"
+        #   raise NotImplementedError
         elif arg is UnaryOps.SQRT:
           assert dtype is dtypes.float, f"sqrt not supported for {dtype}" # TODO: remove
           vals[u] = queue(u, self.render_sqrt(new_reg(dtype.itemsize), to_reg(vin[0]), new_bar_reg(), f".SQRT_{new_label()}", [new_reg(dtype.itemsize) for _ in range(3)]))
@@ -476,10 +493,28 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = reg_cnt + 3 # two internal registers on sm >= 8x, and RZ
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = i*16
     set_ctrl(kernel)
-    if getenv("CUASM", 0):
-      return attach_sections(''.join(ins.render()+"\n" for ins in kernel[1:]), CUDARenderer("sm_89").render(name, uops), reg_cnt)
-    else:
-      return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+    sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+    # debug TODO: remove
+    if out_dir := getenv("WRITE_SRC", ""):
+      cuda_src = CUDARenderer(self.arch).render(to_function_name(name), uops)
+      with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
+      subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(), (Path(out_dir) / "nvcc.cu").as_posix()])
+      with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
+        subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f)
+      with open(Path(out_dir) / "nvcc.cubin", "rb") as f: cuda_blob = f.read()
+      cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
+      with open(Path(out_dir) / "nvcc.bin", "wb") as f: f.write(cuda_kernel)
+      with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
+        tmp.close()
+        subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
+      elf = SASSCompiler(self.arch).compile(sass_src)
+      with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(elf)
+      with open(Path(out_dir) / "rendered_cuobjdump.sass", "w") as f:
+        subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f)
+    return sass_src
 
 def set_ctrl(kernel):
   def new_bar():
