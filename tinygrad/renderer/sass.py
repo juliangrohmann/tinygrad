@@ -20,7 +20,7 @@ from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum):
-  IABS = auto(); FMA = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
+  IABS = auto(); FMA = auto(); HI = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
 
 def render_value(x, dtype):
   if dtypes.is_float(dtype):
@@ -102,6 +102,31 @@ def recip(x:UOp) -> UOp:
   dest = dest * buf + dest
   return src.ne(0).where(dest, src.const(math.inf)).cast(x.dtype)
 
+def idiv(x:UOp, y:UOp) -> UOp:
+  abs_y = y.alu(SASSOps.IABS)
+  r0 = abs_y.cast(dtypes.float)
+  r4 = x.alu(SASSOps.IABS)
+  r2 = x.alu(BinaryOps.XOR, y)
+  p1 = -r2.lt(x.const(0))
+  r0 = r0.alu(SASSOps.RECIP_APPROX).bitcast(dtypes.int)
+  r6 = r0 + int("0xffffffe", 16)
+  r0 = -abs_y
+  r7 = r6.cast(x.dtype)
+  r6 = UOp(UOps.VECTORIZE, dtypes.int.vec(2), (x.const(0), r7))
+  r10 = -r7
+  r13 = r10 * abs_y
+  r7 = r7.alu(SASSOps.HI, r13, r6)
+  r7 = r7.alu(SASSOps.HI, r4, x.const(0))
+  r0 = r7 * r0 + r4
+  p2 = r0.lt(abs_y)
+  r0 = p2.where(r0, r0 - abs_y)
+  r7 = p2.where(r7, r7 + 1)
+  p2 = y.ne(0)
+  p0 = r0.ge(abs_y)
+  r7 = p0.where(r7 + 1, r7)
+  r7 = p1.where(r7, -r7)
+  return p2.where(r7, x.const(int("0x7f800000", 16)))
+
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F"} # TODO: I2F is only variable latency for cross register (64bit) ops?
 read_latency_ops = {"MUFU"}
 sass_matcher = PatternMatcher([
@@ -132,7 +157,8 @@ sass_matcher = PatternMatcher([
   # A -> NEG, B -> OP                   ===     -A, B -> OP
   # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
   # A -> CAST(bool) -> CAST(num)        ===     A -> CAST(num) (results from LOAD/STORE: bool -> uchar cast)
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip)
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
+  (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv)
 ])
 
   # return [Instruction("FSETP", pred, ["PT", src, "0", "PT"], mods=["NE", "AND"]),
@@ -268,7 +294,7 @@ class SASSRenderer(Renderer):
       return Register(idx, size=n, uniform=uniform)
 
     pred_cap = 6 # TODO: remove
-    pred_cnt = 0
+    pred_cnt = 1 # IMAD dumps to P0
     def new_pred() -> Register:
       nonlocal pred_cnt
       idx = pred_cnt
@@ -462,7 +488,7 @@ class SASSRenderer(Renderer):
         vals[u] = vals[vin[0]].offset(arg)
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
-        assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
+        # assert arg is TernaryOps.WHERE or all_same(dt := [v.dtype for v in vin]), f"dtype mismatch in alu: {dt}" # TODO: remove
         if arg in [BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR]:
           lop_val = lop(lambda a,b,c: a|b if arg is BinaryOps.OR else a&b if arg is BinaryOps.AND else a^b)
           if len(srcs) == 2: srcs.append("PT" if (pred := dtype is dtypes.bool) else "RZ")
@@ -482,6 +508,9 @@ class SASSRenderer(Renderer):
         elif arg is SASSOps.IABS:
           assert dtypes.is_int(dtype), f"abs only supported for int"
           vals[u] = queue(u, Instruction("IABS", new_reg(dtype.itemsize), [to_reg(vin[0])]))
+        elif arg is SASSOps.HI:
+          assert dtypes.is_int(dtype), f"hi only supported for int"
+          vals[u] = queue(u, Instruction("IMAD", new_reg(4), [to_reg(v) for v in vin], mods=["HI"]))
         elif arg is TernaryOps.WHERE:
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]], to_reg(vin[1]), vals[vin[2]], dtype))
         elif arg is UnaryOps.LOG2:
