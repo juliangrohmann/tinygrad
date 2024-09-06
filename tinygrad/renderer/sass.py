@@ -312,14 +312,23 @@ class SASSRenderer(Renderer):
 
     def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register, str], src_r:Union[Register, str], dtype:DType):
       srcs = [src_l, src_r]
-      if dtypes.is_int(dtype):
+      if dtypes.is_int(dtype): # TODO: replace with better graph rewrite rules
         if arg is BinaryOps.MUL: srcs.append(vals[0])
         elif arg is BinaryOps.ADD: srcs[1:1] = [unity()]
         else: raise NotImplementedError
       elif not isinstance(srcs[0], Register):
         if isinstance(srcs[1], Register): srcs = srcs[::-1]
         else: srcs[0] = to_reg(vin[0])
-      return Instruction(self.alu[arg][dtypes.int if dtypes.is_int(dtype) else dtype], dest, srcs)
+      ret = [ins := Instruction(op := self.alu[arg][dtypes.int if dtypes.is_int(dtype) else dtype], dest, srcs)]
+      if dtypes.is_int(dtype) and arg is BinaryOps.MUL:
+        if dtypes.is_unsigned(dtype) or dtype.itemsize > 4:
+          ins.mods.append("U32")
+        if dtype.itemsize > 4:
+          ins.mods.append("WIDE")
+          ins.srcs = ["PT"] + ins.srcs
+          ret.append(Instruction(op, dest.offset(1), [srcs[0].offset(1), srcs[1], dest.offset(1)]))
+          ret.append(Instruction(op, dest.offset(1), [srcs[0], srcs[1].offset(1), dest.offset(1)]))
+      return ret
 
     def render_permute(dest, msb, lsb, byte_size):
       return [Instruction("PRMT", dest.offset(i), [msb, "0x5410" if byte_size == 2 else "0x6420", lsb]) for i in range(dest.size)]
