@@ -302,6 +302,7 @@ class UOp:
   def __xor__(self, x): return self.alu(BinaryOps.XOR, self.ufix(x))
   def __and__(self, x): return self.alu(BinaryOps.AND, self.ufix(x))
   def __or__(self, x): return self.alu(BinaryOps.OR, self.ufix(x))
+  def __abs__(self): return self * self.cast(dtypes.bool).where(self.lt(self.const(0)).where(self.const(-1), self.const(1)), self.const(0))
   def ne(self, x): return self.alu(BinaryOps.CMPNE, self.ufix(x))
   def eq(self, x): return -self.ne(x)
   def lt(self, x): return self.alu(BinaryOps.CMPLT, self.ufix(x))

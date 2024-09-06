@@ -19,7 +19,7 @@ from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
-class SASSOps(Enum):
+class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
   IABS = auto(); FMA = auto(); HI = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
 
 def render_value(x, dtype):
@@ -103,8 +103,8 @@ def recip(x:UOp) -> UOp:
   return src.ne(0).where(dest, src.const(math.inf)).cast(x.dtype)
 
 def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
-  abs_y = y.alu(SASSOps.IABS)
-  abs_x = x.alu(SASSOps.IABS)
+  abs_y = abs(x)
+  abs_x = abs(y)
   buf = (abs_y.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(dtypes.int) + int("0xffffffe", 16)).cast(x.dtype)
   buf = buf.alu(SASSOps.HI, -buf * abs_y, UOp(UOps.VECTORIZE, dtypes.int.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_x, x.const(0))
   fma = buf * -abs_y + abs_x
@@ -503,11 +503,6 @@ class SASSRenderer(Renderer):
         elif arg is UnaryOps.LOG2:
           assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
           vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
-        # elif arg is UnaryOps.EXP2:
-        #   assert dtype is dtypes.float, f"exp2 not supported for {dtype}" # TODO: remove
-        #   # vals[u] = queue(u, self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_pred(), [new_reg(dtype.itemsize) for _ in range(4)]))
-        #   vals[u] = "0x0"
-        #   raise NotImplementedError
         elif arg is UnaryOps.SQRT:
           assert dtype is dtypes.float, f"sqrt not supported for {dtype}" # TODO: remove
           vals[u] = queue(u, self.render_sqrt(new_reg(dtype.itemsize), to_reg(vin[0]), new_bar_reg(), f".SQRT_{new_label()}", [new_reg(dtype.itemsize) for _ in range(3)]))
