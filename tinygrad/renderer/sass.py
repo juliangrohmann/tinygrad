@@ -1,8 +1,9 @@
-import tempfile, hashlib, subprocess, struct, re, dataclasses
+import tempfile, hashlib, subprocess, struct, re, dataclasses, math
 import hashlib
 import subprocess
 import struct
 import re
+from enum import Enum, auto
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 from pathlib import Path
@@ -17,6 +18,9 @@ from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
+
+class SASSOps(Enum):
+  ABS = auto(); FMA = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
 
 def render_value(x, dtype):
   if dtypes.is_float(dtype):
@@ -91,6 +95,13 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
+def recip(x:UOp) -> UOp:
+  src = x.cast(dtypes.float)
+  dest = src.alu(SASSOps.RECIP_APPROX)
+  buf = (dest * src - 1) * -1
+  dest = dest * buf + dest
+  return src.ne(0).where(dest, src.const(math.inf)).cast(x.dtype)
+
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F"} # TODO: I2F is only variable latency for cross register (64bit) ops?
 read_latency_ops = {"MUFU"}
 sass_matcher = PatternMatcher([
@@ -108,8 +119,6 @@ sass_matcher = PatternMatcher([
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MAX, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
-  (UPat(UOps.ALU, name="root", arg=UnaryOps.RECIP, src=(UPat(name="x"),), dtype=dtypes.half),
-   lambda root,x: UOp(root.op, dtypes.float, (x.cast(dtypes.float),), root.arg).cast(dtypes.half)),
   # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)},
   #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
@@ -123,7 +132,15 @@ sass_matcher = PatternMatcher([
   # A -> NEG, B -> OP                   ===     -A, B -> OP
   # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
   # A -> CAST(bool) -> CAST(num)        ===     A -> CAST(num) (results from LOAD/STORE: bool -> uchar cast)
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip)
 ])
+
+  # return [Instruction("FSETP", pred, ["PT", src, "0", "PT"], mods=["NE", "AND"]),
+  #         Instruction("MUFU", dest, [src], mods=["RCP"]),
+  #         Instruction("FFMA", buf, [dest, src, "-1"]),
+  #         Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=["FTZ"]),
+  #         Instruction("FFMA", dest, [dest, buf, dest], pred=pred),
+  #         Instruction("MOV", dest, ["0x7f800000"], pred=pred.negate())]
 
 class SASSRenderer(Renderer):
   device = "CUDA"
@@ -192,12 +209,6 @@ class SASSRenderer(Renderer):
 
   def render_bra(self, label:str, pred:Register) -> List[Instruction]:
     return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
-
-  def render_recip(self, dest:Register, src:Register, buf:Register, dtype:DType): # TODO: pass reg/pred generator, TODO: move to pattern matcher
-    return [Instruction("MUFU", dest, [src], mods=["RCP"]),  # TODO: only valid for divisor >= 2^-126. branch to __internal_0_$__cuda_sm20_rcp_rn_f32_slowpath otherwise
-            Instruction("FFMA", buf, [dest, src, "-1"]),
-            Instruction("FADD", buf, [buf.negate(), "-RZ"], mods=["FTZ"]),
-            Instruction("FFMA", dest, [dest, buf, dest])]
 
   def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]: # TODO: move to pattern matcher
     assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
@@ -430,6 +441,8 @@ class SASSRenderer(Renderer):
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]].negate(), vals[0], render_value(1, dtype), dtype))
         else:
           raise NotImplementedError
+      elif op is UOps.BITCAST:
+        vals[u] = vals[vin[0]]
       elif op is UOps.VECTORIZE:
         if vin[0].dtype.itemsize < 4:
           for nb in range(2, vin[0].dtype.itemsize - 1, -1):
@@ -458,8 +471,8 @@ class SASSRenderer(Renderer):
         elif arg in [BinaryOps.MUL, BinaryOps.ADD]:
           assert len(srcs) == 2, f"too many sources for mul/add/sub: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))
-        elif arg is UnaryOps.RECIP:
-          vals[u] = queue(u, self.render_recip(new_reg(dtype.itemsize), vals[vin[0]], new_reg(dtype.itemsize), dtype))
+        elif arg is SASSOps.RECIP_APPROX:
+          vals[u] = queue(u, Instruction("MUFU", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["RCP"]))
         elif arg is BinaryOps.MAX:
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
           vals[u] = queue(u, Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change
@@ -497,18 +510,21 @@ class SASSRenderer(Renderer):
 
     # debug TODO: remove
     if out_dir := getenv("WRITE_SRC", ""):
-      cuda_src = CUDARenderer(self.arch).render(to_function_name(name), uops)
-      with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
-      subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(), (Path(out_dir) / "nvcc.cu").as_posix()])
-      with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
-        subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f)
-      with open(Path(out_dir) / "nvcc.cubin", "rb") as f: cuda_blob = f.read()
-      cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
-      with open(Path(out_dir) / "nvcc.bin", "wb") as f: f.write(cuda_kernel)
-      with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
-        tmp.close()
-        subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      try:
+        cuda_src = CUDARenderer(self.arch).render(to_function_name(name), uops)
+        with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
+        subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(), (Path(out_dir) / "nvcc.cu").as_posix()])
+        with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
+          subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f)
+        with open(Path(out_dir) / "nvcc.cubin", "rb") as f: cuda_blob = f.read()
+        cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
+        with open(Path(out_dir) / "nvcc.bin", "wb") as f: f.write(cuda_kernel)
+        with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
+          tmp.close()
+          subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      except Exception as e:
+        pass
       with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
       elf = SASSCompiler(self.arch).compile(sass_src)
       with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(elf)
