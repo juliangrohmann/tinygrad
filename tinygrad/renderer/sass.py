@@ -20,7 +20,7 @@ from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum):
-  ABS = auto(); FMA = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
+  IABS = auto(); FMA = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
 
 def render_value(x, dtype):
   if dtypes.is_float(dtype):
@@ -479,6 +479,9 @@ class SASSRenderer(Renderer):
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(u, self.render_cmp(arg, new_pred(), *[to_var(v) for v in vin], vin[0].dtype))
+        elif arg is SASSOps.IABS:
+          assert dtypes.is_int(dtype), f"abs only supported for int"
+          vals[u] = queue(u, Instruction("IABS", new_reg(dtype.itemsize), [to_reg(vin[0])]))
         elif arg is TernaryOps.WHERE:
           vals[u] = queue(u, self.render_where(new_reg(dtype.itemsize), vals[vin[0]], to_reg(vin[1]), vals[vin[2]], dtype))
         elif arg is UnaryOps.LOG2:
