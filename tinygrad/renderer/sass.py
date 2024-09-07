@@ -121,8 +121,7 @@ def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
   pred = fma.lt(abs_y)
   buf = pred.where(buf, buf + 1)
   buf = pred.where(fma, fma - abs_y).ge(abs_y).where(buf + 1, buf)
-  dest = (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
-  return y.ne(0).where(dest, x.const(0x7f800000))
+  return (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F"} # TODO: I2F is only variable latency for cross register (64bit) ops?
 read_latency_ops = {"MUFU"}
