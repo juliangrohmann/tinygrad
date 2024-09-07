@@ -198,7 +198,7 @@ def parse_int(value):
   return ["I"], [int(value, 16)], {}
 
 def parse_float(value):
-  value = "0f7fffffff" if value == "NAN" else "0x7f800000" if value == "INF" else value
+  value = "0f7fffffff" if value == "NAN" else "0f7f800000" if value == "INF" else value
   return ["FI"], [int(value[2:], 16) if value.startswith('0f') else float(value)], {}
 
 def parse_special_reg(label):

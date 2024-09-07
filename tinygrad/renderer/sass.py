@@ -8,7 +8,7 @@ from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.compiler_cuda import SASSCompiler
 from tinygrad.helpers import getenv, all_same, flatten, to_function_name
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
-from tinygrad.dtype import dtypes, DType
+from tinygrad.dtype import dtypes, DType, ConstType
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
@@ -28,7 +28,7 @@ def render_value(x, dtype):
 
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
-  return f"{'-' if neg else ''}0x" + ''.join(f"{c:>02x}" for c in struct.pack(f"!{dtype.fmt}", x))
+  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{dtype.fmt}", x))}"
 
 def const_addr(uop:UOp, offset=0):
   param_cbank = int("160", 16) # TODO: make variable
@@ -82,29 +82,47 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
-def exp2(x:UOp) -> UOp:
-   valid = (-x.lt(x.const(-126.0))) | x.eq(x.const(math.nan))
+def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
+def is_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
+def geu(x:UOp, v:ConstType): return (-x.lt(x.const(v))) | is_nan(x)
+
+def exp2(x:UOp) -> UOp: # from nvcc
+   valid = geu(x, -126.0)
    dest = valid.where(x, x * x.const(0.5)).alu(SASSOps.EXP2_APPROX)
    return valid.where(dest, dest * dest)
+
+def log2(x:UOp) -> UOp:
+    denorm = geu(x, 1.175494350822287508e-38)
+    src = denorm.where(x, x * 8388608).bitcast(dtypes.uint)
+    high = (src - 0x3f3504f3) & 0xff800000
+    coeff = (src - high).bitcast(x.dtype) - 1
+    buf = coeff + x.const(0.0970201) - x.const(0.16845393180847167969)
+    params = [0.1716887056827545166, -0.17900948226451873779, 0.20512372255325317383, -0.24046532809734344482,
+              0.28857114911079406738, -0.36067417263984680176, 0.48089820146560668945, -0.72134751081466674805]
+    for p in params: buf *= coeff + p
+    for _ in range(2): buf *= coeff
+    buf += coeff * 1.4426950216293334961
+    result = high.cast(x.dtype) * 1.1920928955078125e-07 + denorm.where(x.const(0), x.const(-23)) + buf
+    return is_inf(x).where(x.const(float("inf")), is_nan(x).where(x.const(float("nan")), x.eq(0).where(x.const(-float("inf")), result)))
 
 def recip(x:UOp) -> UOp:
   src = x.cast(dtypes.float)
   dest = src.alu(SASSOps.RECIP_APPROX)
   buf = (dest * src - 1) * -1
   dest = dest * buf + dest
-  return src.ne(0).where(dest, src.const(math.inf)).cast(x.dtype)
+  return src.ne(0).where(dest, src.const(float("inf"))).cast(x.dtype)
 
 def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
   abs_y = abs(x)
   abs_x = abs(y)
-  buf = (abs_y.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(x.dtype) + int("0xffffffe", 16)).cast(x.dtype)
+  buf = (abs_y.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(x.dtype) + 0xffffffe).cast(x.dtype)
   buf = buf.alu(SASSOps.HI, -buf * abs_y, UOp(UOps.VECTORIZE, x.dtype.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_x, x.const(0))
   fma = buf * -abs_y + abs_x
   pred = fma.lt(abs_y)
   buf = pred.where(buf, buf + 1)
   buf = pred.where(fma, fma - abs_y).ge(abs_y).where(buf + 1, buf)
   dest = (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
-  return y.ne(0).where(dest, x.const(int("0x7f800000", 16)))
+  return y.ne(0).where(dest, x.const(0x7f800000))
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F"} # TODO: I2F is only variable latency for cross register (64bit) ops?
 read_latency_ops = {"MUFU"}
@@ -138,6 +156,7 @@ sass_matcher = PatternMatcher([
   # A -> CAST(bool) -> CAST(num)        ===     A -> CAST(num) (results from LOAD/STORE: bool -> uchar cast)
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
+  (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv)
 ])
 
@@ -149,7 +168,7 @@ class SASSRenderer(Renderer):
   shared_max = 49152
   tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2),(0,2),(1,2),(1,2),(1,2)], dtype_in=di, dtype_out=do) for (di, do) in ([(dtypes.half, dtypes.float)])] # noqa: E501
   extra_matcher = sass_matcher
-  code_for_op = {UnaryOps.EXP2: None}
+  code_for_op = {UnaryOps.EXP2: None, UnaryOps.LOG2: None}
   def __init__(self, arch:str):
     self.tensor_cores = SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
     self.arch = arch # TODO: remove
@@ -209,32 +228,6 @@ class SASSRenderer(Renderer):
 
   def render_bra(self, label:str, pred:Register) -> List[Instruction]:
     return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
-
-  def render_log2(self, dest:Register, src:Register, pred:Register, bufs:List[Register]) -> List[Instruction]: # TODO: move to pattern matcher
-    assert len(bufs) == 4, f"expected 4 buffers. {len(bufs)=}"
-    ins = [Instruction("FSETP", pred, ["PT", src, "1.175494350822287508e-38", "PT"], mods=["GEU", "AND"]),
-           Instruction("FMUL", src, [src, "8388608"], pred=pred.negate()),
-           Instruction("IADD3", dest, [src, "-0x3f3504f3", "RZ"]),
-           Instruction("LOP3", bufs[0], [dest, "0xff800000", "RZ", lop(lambda a,b,c: a&b), "!PT"], mods=["LUT"]),
-           Instruction("IADD3", dest, [src, bufs[0].negate(), "RZ"]),
-           Instruction("I2FP", bufs[0], [bufs[0]], mods=["F32", "S32"]),
-           Instruction("FADD", bufs[1], [dest, "-1"]),
-           Instruction("FSEL", dest, ["RZ", "-23", pred]),
-           Instruction("ISETP", pred, ["PT", src, "0x7f800000", "PT"], mods=["GE", "U32", "AND"]),
-           Instruction("MOV", bufs[2], ["0x3dc6b27f"]),
-           Instruction("FFMA", bufs[3], [bufs[1], bufs[2], "-0.16845393180847167969"])]
-    params = ["0.1716887056827545166", "-0.17900948226451873779", "0.20512372255325317383", "-0.24046532809734344482",
-              "0.28857114911079406738", "-0.36067417263984680176", "0.48089820146560668945", "-0.72134751081466674805"]
-    for p in params: ins.append(Instruction("FFMA", bufs[3], [bufs[1], bufs[3], p]))
-    for _ in range(2): ins.append(Instruction("FMUL", bufs[3], [bufs[1], bufs[3]]))
-    ins.extend([Instruction("FFMA", bufs[3], [bufs[1], "1.4426950216293334961", bufs[3]]),
-                Instruction("FFMA", dest, [bufs[0], "1.1920928955078125e-07", dest]),
-                Instruction("MOV", bufs[0], ["0x7f800000"], pred=pred),
-                Instruction("FADD", dest, [dest, bufs[3]]),
-                Instruction("FFMA", dest, [src, bufs[0], "+INF"], pred=pred),
-                Instruction("FSETP", pred, ["PT", src, "RZ", "PT"], mods=["NEU", "AND"]),
-                Instruction("FSEL", dest, [dest, "-INF", pred])])
-    return ins
 
   def render_sqrt(self, dest:Register, src:Register, bar_regs:Register, bar_lab:str, bufs:List[Register]) -> List[Instruction]: # TODO: only valid for input < 2^102. branch to __internal_0_$__cuda_sm20_sqrt_rn_f32_slowpath, # TODO: move to pattern matcher
     return [Instruction("BSSY", bar_regs, [f"`({bar_lab})"]),
@@ -329,7 +322,7 @@ class SASSRenderer(Renderer):
     queue(Instruction(f".text.{name}", None, [], label=True))
     vals[0] = Register(-1)
     vals[float("inf")] = "INF"
-    vals[float("-inf")] = "-INF"
+    vals[-float("inf")] = "-INF"
     vals["DESC"] = queue(Instruction("ULDC", Register(idx=4, type="UR"), ["c[0x0][0x118]"], mods=["64"])) # load explicit memory descriptor
 
     for u in uops:
@@ -412,7 +405,7 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif op is UOps.BITCAST:
-        vals[u] = vals[vin[0]]
+        vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") else v
       elif op is UOps.VECTORIZE:
         if vin[0].dtype.itemsize < 4:
           for nb in range(2, vin[0].dtype.itemsize - 1, -1):
@@ -459,9 +452,6 @@ class SASSRenderer(Renderer):
           vals[u] = queue(Instruction("IMAD", new_reg(4), [to_reg(v) for v in vin], mods=["HI"]))
         elif arg is TernaryOps.WHERE:
           vals[u] = queue(self.render_where(new_reg(dtype.itemsize), vals[vin[0]], to_reg(vin[1]), vals[vin[2]], dtype))
-        elif arg is UnaryOps.LOG2:
-          assert dtype is dtypes.float, f"log2 not supported for {dtype}" # TODO: remove
-          vals[u] = queue(self.render_log2(new_reg(dtype.itemsize), to_reg(vin[0]), new_reg(prefix="P"), [new_reg(dtype.itemsize) for _ in range(4)]))
         elif arg is UnaryOps.SQRT:
           assert dtype is dtypes.float, f"sqrt not supported for {dtype}" # TODO: remove
           vals[u] = queue(self.render_sqrt(new_reg(dtype.itemsize), to_reg(vin[0]), new_reg(prefix="B"), new_reg(prefix=".SQRT_"), [new_reg(dtype.itemsize) for _ in range(3)]))
@@ -511,7 +501,7 @@ class SASSRenderer(Renderer):
     return ssa_src if getenv("SSA") else sass_src
 
 def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
-  def alloc(size): return next((i for i in range(255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
+  def alloc(size): return next((i for i in range(reg_type == "P", 255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
   locs, all_reg = defaultdict(list), set()
   for i,r in enumerate([src for inst in kernel for src in [*inst.srcs, inst.dest]]):
     if isinstance(r, Register) and r.idx >= 0 and r.type == reg_type:
