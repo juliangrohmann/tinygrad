@@ -28,7 +28,8 @@ def render_value(x, dtype):
 
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
-  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{dtype.fmt}", x))}"
+  overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
+  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", x))}"
 
 def const_addr(uop:UOp, offset=0):
   param_cbank = int("160", 16) # TODO: make variable
