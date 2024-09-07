@@ -16,11 +16,11 @@ from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
-  IABS = auto(); FMA = auto(); HI = auto(); FLUSH = auto(); RECIP_APPROX = auto() # noqa: E702
+  IABS = auto(); FMA = auto(); HI = auto(); FLUSH = auto(); RECIP_APPROX = auto(); EXP2_APPROX = auto() # noqa: E702
 
 def render_value(x, dtype):
   if dtypes.is_float(dtype):
-    return "0x7fffffff" if x is math.nan else "INF" if x is math.inf else str(x)
+    return str(x).upper()
   elif dtype is dtypes.bool:
     return "PT" if x else "!PT"
   else:
@@ -82,6 +82,11 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
+def exp2(x:UOp) -> UOp:
+   valid = (-x.lt(x.const(-126.0))) | x.eq(x.const(math.nan))
+   dest = valid.where(x, x * x.const(0.5)).alu(SASSOps.EXP2_APPROX)
+   return valid.where(dest, dest * dest)
+
 def recip(x:UOp) -> UOp:
   src = x.cast(dtypes.float)
   dest = src.alu(SASSOps.RECIP_APPROX)
@@ -132,6 +137,7 @@ sass_matcher = PatternMatcher([
   # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
   # A -> CAST(bool) -> CAST(num)        ===     A -> CAST(num) (results from LOAD/STORE: bool -> uchar cast)
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
+  (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv)
 ])
 
@@ -143,6 +149,7 @@ class SASSRenderer(Renderer):
   shared_max = 49152
   tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2),(0,2),(1,2),(1,2),(1,2)], dtype_in=di, dtype_out=do) for (di, do) in ([(dtypes.half, dtypes.float)])] # noqa: E501
   extra_matcher = sass_matcher
+  code_for_op = {UnaryOps.EXP2: None}
   def __init__(self, arch:str):
     self.tensor_cores = SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
     self.arch = arch # TODO: remove
@@ -436,6 +443,8 @@ class SASSRenderer(Renderer):
           vals[u] = queue(render_alu(arg, new_reg(dtype.itemsize), *srcs, dtype))
         elif arg is SASSOps.RECIP_APPROX:
           vals[u] = queue(Instruction("MUFU", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["RCP"]))
+        elif arg is SASSOps.EXP2_APPROX:
+          vals[u] = queue(Instruction("MUFU", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["EX2"]))
         elif arg is BinaryOps.MAX:
           assert len(srcs) == 2, f"too many min/max operands: {len(src)}" # TODO: remove
           vals[u] = queue(Instruction(self.alu[arg][dtype], new_reg(vin[0].dtype.itemsize), srcs + ["!PT"])) # TODO: change

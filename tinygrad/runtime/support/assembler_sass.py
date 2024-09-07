@@ -108,7 +108,6 @@ class SASSParser:
     ins = self.labels_to_addr(ins.strip())
     addr = parse_inst_addr(line)
     key, vals, op_mods, vmods = parse_inst(ins, addr=addr)
-    assert key == (ref_key := InstructionParser.parseInstruction(ins).get_key()), f"key mismatch: parsed={key}\tkuter={ref_key}" # TODO: remove
     return ctrl, key, vals, op_mods, vmods
 
   def labels_to_addr(self, s):
@@ -199,7 +198,8 @@ def parse_int(value):
   return ["I"], [int(value, 16)], {}
 
 def parse_float(value):
-  return ["FI"], [int(val[2:], 16) if value.startswith('0f') else float(value)], {}
+  value = "0f7fffffff" if value == "NAN" else "0x7f800000" if value == "INF" else value
+  return ["FI"], [int(value[2:], 16) if value.startswith('0f') else float(value)], {}
 
 def parse_special_reg(label):
   return ["SR"], [sr_vals[label]], {}
@@ -241,6 +241,6 @@ token_formats = (
   (parse_const_memory, re.compile(r'(?P<Prefix>\w*)\[(?P<Bank>[\w\.]+)\]\[(?P<Addr>[+-?\w\.]+)\]')),
   (parse_addr, re.compile(r'(?P<Prefix>\w*)\[(?P<Addr>[^\]]+)\]$')),
   (parse_int, re.compile(f'(?P<Value>[-+]?0x[0-9a-fA-F]+)')),
-  (parse_float, re.compile(r'^(?P<Value>((-?\d+)(\.\d*)?((e|E)[-+]?\d+)?)|([+-]?INF)|([+-]NAN)|-?(0[fF][0-9a-fA-F]+))'
+  (parse_float, re.compile(r'^(?P<Value>((-?\d+)(\.\d*)?((e|E)[-+]?\d+)?)|([+-]?INF)|([+-]?NAN)|-?(0[fF][0-9a-fA-F]+))'
                            r'(\.[a-zA-Z]\w*)*$')),
 )
