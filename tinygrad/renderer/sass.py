@@ -3,7 +3,7 @@ from enum import Enum, auto
 from dataclasses import dataclass, field, asdict, replace
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Union, Optional, cast, Callable
+from typing import Any, DefaultDict, Dict, List, Sequence, Union, Optional, cast, Callable
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.compiler_cuda import SASSCompiler
 from tinygrad.helpers import getenv, all_same, flatten, to_function_name
@@ -20,7 +20,7 @@ class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritiz
 
 def render_value(x, dtype):
   if dtypes.is_float(dtype):
-    return str(x)
+    return "0x7fffffff" if x is math.nan else "INF" if x is math.inf else str(x)
   elif dtype is dtypes.bool:
     return "PT" if x else "!PT"
   else:
@@ -45,19 +45,14 @@ def lop(func:Callable[[int, int, int], int]):
 
 @dataclass
 class Register:
-  idx: int
-  size: int = 1
-  type: str = "R"
-  negated: bool = False
-  mod: str = None
-  def render(self): return f"{'-!'[self.type == "P"] if self.negated else ''}{self.identity()}{f'.{self.mod}' if self.mod else ''}"
+  idx:int; size:int=1; type:str="R"; negated:bool=False; mem_type:Optional[str]=None; postfix:str=""; mod:str=None
+  def render(self):
+    infix = f"{self.type}{self.idx if self.idx != -1 else 'Z'}{f'.{self.mod}' if self.mod else ''}{self.postfix}"
+    return f"{'-!'[self.type == "P"] if self.negated else ''}{f'{self.mem_type}[{infix}]' if self.mem_type is not None else infix}"
   def offset(self, n): return replace(self, idx=self.idx + n)
   def base(self): return self.offset(-(self.idx % self.size))
   def negate(self): return replace(self, negated=not self.negated)
-  def modify(self, mod): return replace(self, mod=mod)
-  def identity(self): return f"{self.type}{self.idx if self.idx != -1 else 'Z'}"
-  def __hash__(self): return hash(self.identity())
-  def __eq__(self, other): return other.identity() == self.identity()
+  def __hash__(self): return id(self)
 
 @dataclass
 class ControlCode:
@@ -179,10 +174,10 @@ class SASSRenderer(Renderer):
   }
 
   def render_mov(self, dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None) -> Instruction:
-    if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"):
+    if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"): # TODO: fix for 64 bit
       src = render_binary(float(src), dtype)
-    srcs = [src.offset(i) if src.size >= i + 1 else "RZ" for i in range(dest.size)] if isinstance(src, Register) else [src] + (dest.size - 1) * ["RZ"]
-    return [Instruction("MOV", dest.offset(i), [srcs[i]], pred=pred) for i in range(dest.size)]
+    srcs = [src.offset(i) for i in range(src.size)] if isinstance(src, Register) else [src] + ["RZ"]*(nregs(dtype.itemsize) - 1)
+    return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
 
   def render_where(self, dest, pred:Union[Register, str], src_t:Register, src_f:Union[Register,str], dtype:DType) -> List[Instruction]:
     return [Instruction("SEL" if dtypes.is_int(dtype) else "FSEL", dest, [src_t, src_f, pred])] # nvcc does float packed SEL here instead of FSEL
@@ -257,11 +252,11 @@ class SASSRenderer(Renderer):
     iter_stack = []
 
     reg_cnt = defaultdict(int)
-    def new_reg(byte_size:int=4, prefix:str="R") -> Register:
+    def new_reg(byte_size:int=4, prefix:str="R", **kwargs) -> Register:
       n = nregs(byte_size) if prefix == "R" else 1
       idx = n * ((reg_cnt[prefix] + n - 1) // n) # ceil
       reg_cnt[prefix] = idx + n
-      return Register(idx, size=n, type=prefix)
+      return Register(idx, size=n, type=prefix, **kwargs)
 
     def unity() -> Register:
       if not 1 in vals: vals[1] = queue(self.render_mov(new_reg(), "0x1", dtypes.int))
@@ -276,28 +271,23 @@ class SASSRenderer(Renderer):
     def to_var(uop:UOp) -> Union[Register, str]:
       return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop)
 
-    def to_reg(uop:UOp) -> Register:
+    def to_reg(uop:UOp, **kwargs) -> Register:
       if isinstance(var := vals[uop], Register): # TODO: replace with better graph rewrite rules
         return queue(self.render_where(new_reg(), var.negate(), vals[0], "0x1", dtypes.int)) if var.type == "P" else var
-      vals[uop] = dest = queue(self.render_mov(new_reg(uop.dtype.itemsize), var, uop.dtype))
+      vals[uop] = dest = queue(self.render_mov(new_reg(uop.dtype.itemsize, **kwargs), var, uop.dtype))
       return dest
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
-      if idx.op is UOps.CONST:
-        g_addr = vals[glob]
-        if not isinstance(g_addr, Register):
-          vals[glob] = g_addr = new_reg(byte_size=8)
-          queue(Instruction("IMAD", g_addr, ["RZ", "RZ", const_addr(glob)], mods=["U32"]))
-          queue(Instruction("IMAD", g_addr.offset(1), ["RZ", "RZ", const_addr(glob, offset=4)], mods=["U32"]))
-        addr_str = g_addr.render() + ".64"
-        if idx.arg != 0:
-          addr_str += f"+{hex(idx.arg * glob.dtype.itemsize)}"
+      if idx.op is UOps.CONST: # TODO: move all of this to pattern matcher?
+        if not isinstance(vals[glob], Register):
+          vals[glob] = g_addr = new_reg(8)
+          queue([Instruction("IMAD", g_addr.offset(i), ["RZ", "RZ", const_addr(glob, offset=i*4)], mods=["U32"]) for i in range(2)])
+        dest = replace(g_addr, postfix=f"+{hex(idx.arg * glob.dtype.itemsize)}" if idx.arg != 0 else "")
       else:
         if glob.dtype.itemsize not in vals:
           vals[glob.dtype.itemsize] = queue(self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
-        g_addr = queue(Instruction("IMAD", new_reg(byte_size=8), ["PT"] + [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=["WIDE"], pred=pred)) # TODO: PT = hack, need better isa fuzzing
-        addr_str = g_addr.render() + ".64"
-      return f"desc[{vals["DESC"].render()}][{addr_str}]" # explicit memory descriptor
+        dest = queue(Instruction("IMAD", new_reg(byte_size=8), ["PT"] + [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=["WIDE"], pred=pred)) # TODO: PT = hack, need better isa fuzzing
+      return replace(dest, mem_type=f"desc[{vals['DESC'].render()}]", mod="64") # explicit memory descriptor
 
     def memory_mods(dtype:DType):
       return [f"{'' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
@@ -404,7 +394,7 @@ class SASSRenderer(Renderer):
           elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
             vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", vals[vin[0]]], mods=["F16", "F32", "PACK_AB"]))
           elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
-            vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0]).modify("H0_H0")], mods=["F32"]))
+            vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0], mod="H0_H0")], mods=["F32"]))
           elif dtype is dtypes.bool:
             if vin[0].dtype is dtypes.half:
               vals[u] = queue(Instruction(f"LOP3", new_reg(prefix="P"), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", lop(lambda a,b,c: a&b), "!PT"], mods=["LUT"]))
@@ -427,7 +417,7 @@ class SASSRenderer(Renderer):
         elif not is_contiguous(srcs := [vals[v] for v in vin]):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
-          queue(flatten([self.render_mov(dest.offset(i*n), s, vin[0].dtype) for i,s in enumerate(srcs)]))
+          queue([inst for i,s in enumerate(srcs) for inst in self.render_mov(dest.offset(i*n), s, vin[0].dtype)])
         else:
           srcs[0].size = nregs(dtype.itemsize)
           vals[u] = srcs[0]
@@ -477,9 +467,13 @@ class SASSRenderer(Renderer):
     for _ in range(10): queue(Instruction("NOP", None, [])) # TODO: pad to multiple of 8
     queue(Instruction(".L_END", None, [], label=True))
 
-    attr["SHI_REGISTERS"] = reg_cnt["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = i*16
     set_ctrl(kernel)
+    attr["SHI_REGISTERS"] = reg_cnt["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+
+    attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
     # debug TODO: remove
@@ -500,21 +494,43 @@ class SASSRenderer(Renderer):
       except Exception:
         pass
       with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
+      with open(Path(out_dir) / "rendered_ssa.sass", "w") as f: f.write(ssa_src)
       elf = SASSCompiler(self.arch).compile(sass_src)
       with open(Path(out_dir) / "rendered.cubin", "wb") as f: f.write(elf)
       with open(Path(out_dir) / "rendered_cuobjdump.sass", "w") as f:
         subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f)
-    return sass_src
+    return ssa_src if getenv("SSA") else sass_src
+
+def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
+  def alloc(size): return next((i for i in range(255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
+  locs, all_reg = defaultdict(list), set()
+  for i,r in enumerate([src for inst in kernel for src in [*inst.srcs, inst.dest]]):
+    if isinstance(r, Register) and r.idx >= 0 and r.type == reg_type:
+      locs[r.base().idx, r.size].append(i)
+      all_reg.add(r)
+  events = sorted([(k, max(v), False) for k,v in locs.items()] + [(k, min(v), True) for k,v in locs.items()], key=lambda x: x[1])
+  allocated, repl = [], {}
+  for (idx, size), _, is_alloc in events:
+    if is_alloc:
+      repl[idx] = base_idx = alloc(size)
+      allocated.extend([base_idx + i for i in range(size)])
+    else:
+      for i in range(size): allocated.remove(repl[idx] + i)
+  for reg in all_reg:
+    if (bidx := reg.base().idx) in repl:
+      reg.idx = repl[bidx] + reg.idx - bidx
+  max_reg = max(all_reg, key=lambda x: x.idx + x.size) if all_reg else None
+  return max_reg.base().idx + max_reg.size if max_reg else 0
 
 def set_ctrl(kernel):
   def new_bar():
     return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
   def set_bar(deps, bar_tab):
     active_bar.append(bar := new_bar())
-    bar_tab.update({d.base(): bar for d in deps if isinstance(d, Register)})
+    bar_tab.update({d.base().idx: bar for d in deps if isinstance(d, Register)})
     return bar
   def wait_bar(deps, bar_tab):
-    bars = {bar_tab[d.base()] for d in deps if isinstance(d, Register) and d.base() in bar_tab}
+    bars = {bar_tab[d.base().idx] for d in deps if isinstance(d, Register) and d.base().idx in bar_tab}
     inst.ctrl.wait.extend(list(bars))
     for k,v in list(bar_tab.items()):
       if v in bars: bar_tab.pop(k, None)
