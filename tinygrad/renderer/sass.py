@@ -71,7 +71,7 @@ def const_ext(root:UOp):
   raw = int(render_binary(root.arg, root.dtype), 16)
   return UOp(UOps.VECTORIZE, dtypes.uint.vec(2), src=tuple([UOp.const(dtypes.uint, v) for v in (raw & 0xffffffff, raw >> 32)])).bitcast(root.dtype)
 
-def where_double(p:UOp, x:UOp, y:UOp) -> UOp:
+def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
   return UOp(UOps.VECTORIZE, xv.dtype, (p.where(xv.gep(0), yv.gep(0)), p.where(xv.gep(1), yv.gep(1)))).bitcast(x.dtype)
 
@@ -110,7 +110,7 @@ sass_matcher = PatternMatcher([
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
   (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), add_long),
-  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.double, src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_double),
+  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
