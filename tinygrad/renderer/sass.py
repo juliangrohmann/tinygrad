@@ -16,7 +16,16 @@ from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
-  IABS = auto(); FMA = auto(); HI = auto(); WIDE = auto(); FLUSH = auto(); RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
+  IABS = auto(); FMA = auto(); HI = auto(); WIDE = auto(); DMAX = auto(); FLUSH = auto() # noqa: E702
+  RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
+
+ext_to_word = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
+
+def render_binary(x, dtype): # TODO: simplify
+  x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
+  overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
+  print(x)
+  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", x))}"
 
 def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
 def is_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
@@ -49,48 +58,48 @@ def recip(x:UOp) -> UOp:
   return src.ne(0).where(dest, src.const(float("inf"))).cast(x.dtype)
 
 def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
-  abs_y = abs(x)
-  abs_x = abs(y)
-  buf = (abs_y.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(x.dtype) + 0xffffffe).cast(x.dtype)
-  buf = buf.alu(SASSOps.HI, -buf * abs_y, UOp(UOps.VECTORIZE, x.dtype.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_x, x.const(0))
-  fma = buf * -abs_y + abs_x
-  pred = fma.lt(abs_y)
+  abs_x, abs_y = abs(x), abs(y)
+  buf = (abs_x.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(x.dtype) + 0xffffffe).cast(x.dtype)
+  buf = buf.alu(SASSOps.HI, -buf * abs_x, UOp(UOps.VECTORIZE, x.dtype.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_y, x.const(0))
+  fma = buf * -abs_x + abs_y
+  pred = fma.lt(abs_x)
   buf = pred.where(buf, buf + 1)
-  buf = pred.where(fma, fma - abs_y).ge(abs_y).where(buf + 1, buf)
+  buf = pred.where(fma, fma - abs_x).ge(abs_x).where(buf + 1, buf)
   return (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
 
+def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
+  xv, yv = [r.bitcast(ext_to_word[r.dtype].vec(2)) for r in (x, y)]
+  return UOp(UOps.VECTORIZE, dtypes.float.vec(2), (p.where(xv.gep(0), yv.gep(0)), p.where(xv.gep(1), yv.gep(1)))).bitcast(x.dtype)
+
 sass_matcher = PatternMatcher([
-  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))), # NOTE: from PTX
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))),
    lambda root,x,y,z,k: UOp(root.op, dtypes.uchar, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
-  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())), # NOTE: from PTX
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())),
    lambda root: UOp(root.op, dtypes.uchar, root.src, root.arg).cast(dtypes.bool)),
-  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool), UPat())), # NOTE: from PTX
+  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool), UPat())),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
-  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))), # NOTE: from PTX
+  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
+  (UPat(UOps.CONST, name="root", dtype=set(dt for dt in dtypes.fields().values() if dt.itemsize > 4)),
+   lambda root: UOp(UOps.VECTORIZE, dtypes.uint.vec(2), src=(UOp.const(dtypes.uint, (raw := int(render_binary(root.arg, root.dtype), 16)) & 0xffffffff), UOp.const(dtypes.uint, raw >> 32))).bitcast(root.dtype)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MAX, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
-  # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)},
+  # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}, # TODO: fuse cast into load when possible
   #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
   (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
-  # Shift left/right for int mul/div by 2
-  # A, B -> ADD, C -> ADD               ===     A, B, C -> ADD3
-  # A, B -> MUL, C -> ADD               ===     A, B, C -> FMA
-  # A, B -> CMPNE, CONST True -> CMPNE  ===     A, B -> CMPEQ
-  # A, B -> CMP, C -> MUL               ===     A, B, C -> CMP.AND
-  # A -> NEG, B -> OP                   ===     -A, B -> OP
-  # bool, bool -> OP, bool -> OP        ===     bool, bool, bool -> PLOP3
-  # A -> CAST(bool) -> CAST(num)        ===     A -> CAST(num) (results from LOAD/STORE: bool -> uchar cast)
+  (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
+   lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
-  (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv)
+  (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
+  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.double, src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext)
 ])
 
 @dataclass
@@ -138,11 +147,6 @@ def render_value(x, dtype):
   elif dtype is dtypes.bool: return "PT" if x else "!PT"
   else: return render_binary(x, dtype)
 
-def render_binary(x, dtype): # TODO: simplify
-  x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
-  overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
-  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", x))}"
-
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
@@ -151,16 +155,11 @@ def nregs(byte_size): return (byte_size + 3) // 4
 def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0xAA))
 def lop_inst(d, s, dt, code):
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
-  return Instruction("LOP3", d, srcs + [code, "!PT"]) if dt is dtypes.bool else Instruction("PLOP3", d, ["PT"] + srcs + [code, "0x0"])
+  return Instruction("LOP3", d, [*srcs, code, "!PT"]) if dt is dtypes.bool else Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"])
 
 ints = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt))
 floats = set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
 numeric = ints | floats
-
-# lop_val = lop(lambda a,b,c: a|b if arg is BinaryOps.OR else a&b if arg is BinaryOps.AND else a^b)
-# if len(srcs) == 2: srcs.append("PT" if (pred := dtype is dtypes.bool) else "RZ")
-# params = ["PLOP3", new_reg(prefix="P"), ["PT"] + srcs + [lop_val, "0x0"]] if pred else ["LOP3", new_reg(dtype.itemsize), srcs + [lop_val, "!PT"]]
-# vals[u] = queue(Instruction(*params, mods=["LUT"]))
 
 inst_for_cast = (
 )
@@ -168,12 +167,13 @@ inst_for_cast = (
 inst_for_op: Dict[Op, Callable] = {
   BinaryOps.ADD: lambda d,s,dt: Instruction("IADD3" if dt in ints else dtype_op("ADD", dt), d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MUL: lambda d,s,dt: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
-  BinaryOps.MAX: lambda d,s,dt: Instruction(dtype_op("MNMX", dt), d, s + ["!PT"]),
-  TernaryOps.WHERE: lambda d,s,dt: Instruction("SEL" if dt in ints else "FSEL", d, s),
+  BinaryOps.MAX: lambda d,s,dt: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
+  TernaryOps.WHERE: lambda d,s,dt: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
   SASSOps.IABS: lambda d,s,dt: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt: Instruction("IMAD" if dt in ints else "FMA", d, s),
   SASSOps.HI: lambda d,s,dt: Instruction("IMAD", d, s, mods=["HI"]),
   SASSOps.WIDE: lambda d,s,dt: Instruction("IMAD", d, s, mods=["WIDE"]),
+  SASSOps.DMAX: lambda d,s,dt: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["EX2"]),
   SASSOps.SQRT_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["RSQ"]),
@@ -268,7 +268,7 @@ class SASSRenderer(Renderer):
 
     def to_reg(uop:UOp, **kwargs) -> Register:
       if isinstance(var := vals[uop], Register): # TODO: replace with better graph rewrite rules
-        return queue(self.render_where(new_reg(), var.negate(), vals[0], "0x1", dtypes.int)) if var.type == "P" else var
+        return queue(inst_for_op[TernaryOps.WHERE](new_reg(), [var.negate(), vals[0], "0x1"], dtypes.int)) if var.type == "P" else var
       vals[uop] = dest = queue(self.render_mov(new_reg(uop.dtype.itemsize, **kwargs), var, uop.dtype))
       return dest
 
@@ -396,7 +396,7 @@ class SASSRenderer(Renderer):
             else:
               vals[u] = queue(Instruction(f"FSETP", new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
         elif vin[0].dtype is dtypes.bool:
-          vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[0], render_value(1, dtype), vals[vin[0]].negate()], dtype))
+          vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype))
         else:
           raise NotImplementedError
       elif op is UOps.BITCAST:
@@ -409,19 +409,19 @@ class SASSRenderer(Renderer):
             if vin[0].dtype.itemsize == 1:
               vals[u] = dest = new_reg(len(vin))
               queue(flatten([render_permute(dest.offset(i), dest.offset(0), dest.offset(1), 1) for i in range(dest.size)]))
-        elif not all(isinstance(Register, vals[v]) for v in vin) or not is_contiguous([vals[v] for v in vin]):
+        elif not all(isinstance(vals[v], Register) for v in vin) or not is_contiguous([vals[v] for v in vin]):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
-          queue([inst for i,s in enumerate(srcs) for inst in self.render_mov(dest.offset(i*n), s, vin[0].dtype)])
+          queue([inst for i,s in enumerate([vals[v] for v in vin]) for inst in self.render_mov(dest.offset(i*n), s, vin[0].dtype)])
         else:
-          srcs[0].size = nregs(dtype.itemsize)
-          vals[u] = srcs[0]
+          vals[u] = vals[vin[0]]
+          for v in vin: vals[v].size = nregs(dtype.itemsize)
       elif op is UOps.GEP:
         vals[u] = vals[vin[0]].offset(arg)
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg in inst_for_op:
-          vals[u] = queue(inst_for_op[arg](new_reg(dtype.itemsize, prefix="P" if dtype is dtypes.bool else "R"), srcs, dtype))
+          vals[u] = queue(inst_for_op[arg](new_reg(dtype.itemsize, prefix="P" if dtype.scalar() is dtypes.bool else "R"), [to_var(v) for v in vin], dtype))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
@@ -485,7 +485,7 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
     if is_alloc:
       repl[idx] = base_idx = alloc(size)
       allocated.extend([base_idx + i for i in range(size)])
-    else:
+    elif idx in repl:
       for i in range(size): allocated.remove(repl[idx] + i)
   for reg in all_reg:
     if (bidx := reg.base().idx) in repl:
@@ -493,8 +493,8 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
   max_reg = max(all_reg, key=lambda x: x.idx + x.size) if all_reg else None
   return max_reg.base().idx + max_reg.size if max_reg else 0
 
-write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "DSETP", "DADD", "DMUL", "DMNMX"} # TODO: I2F is only variable latency for double width
-read_latency_ops = {"MUFU"}
+write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "DSETP", "DADD", "DMUL", "DSETP"} # TODO: I2F is only variable latency for double width
+read_latency_ops = {"MUFU", "DSETP"}
 
 def set_ctrl(kernel):
   def new_bar():
