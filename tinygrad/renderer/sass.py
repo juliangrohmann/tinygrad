@@ -166,7 +166,7 @@ def render_value(x, dtype):
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
-def dtype_op(op, dt): return [{dtypes.double:'D', dtypes.float:'F', dtypes.half:'H'}[dt], 'I'][dtypes.is_int(dt)] + op + ['', '2'][dt == dtypes.half]
+def dtype_op(op, dt): return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.half else '')
 def nregs(byte_size): return (byte_size + 3) // 4
 def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0xAA))
 def lop_inst(d, s, dt, code):
@@ -214,7 +214,7 @@ class SASSRenderer(Renderer):
   # language
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
-  setp_mod = {BinaryOps.CMPLT: "LT", BinaryOps.CMPNE: "NE"}
+  setp_mod = {BinaryOps.CMPLT: "LT", BinaryOps.CMPNE: "NEU"}
 
   def render_mov(self, dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None) -> Instruction:
     if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"): # TODO: fix for 64 bit
@@ -226,7 +226,11 @@ class SASSRenderer(Renderer):
     if dtypes.is_int(dtype) or dtypes.is_float(dtype):
       ret = []
       op = dtype_op("SETP", dtype)
-      ret.append(ins := Instruction(op, dest, ["PT", src_l, src_r, "PT"], mods=[f"{self.setp_mod[arg]}", "AND"]))
+      ret.append(ins := Instruction(op, dest, ["PT", src_l, src_r, "PT"], mods=["AND"]))
+      if arg is BinaryOps.CMPNE:
+        ins.mods.append("NEU" if dtypes.is_float(dtype) else "NE")
+      elif arg is BinaryOps.CMPLT:
+        ins.mods.append("LT")
       if dtypes.is_unsigned(dtype) or dtype is dtypes.long:
         ins.mods.append("U32")
       if dtype is dtypes.long:
