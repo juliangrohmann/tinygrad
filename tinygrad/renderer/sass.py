@@ -24,7 +24,6 @@ ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.doubl
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
   overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
-  print(x)
   return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", x))}"
 
 def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
@@ -78,8 +77,13 @@ def where_double(p:UOp, x:UOp, y:UOp) -> UOp:
 
 def mul_long(x:UOp, y:UOp):
   xv, yv = ext_to_vec(x), ext_to_vec(y)
-  base = x.bitcast(dtypes.ulong).alu(SASSOps.WIDE, y.bitcast(dtypes.ulong)).bitcast(xv.dtype)
+  base = x.bitcast(dtypes.uint).alu(SASSOps.WIDE, y.bitcast(dtypes.uint)).bitcast(xv.dtype)
   return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(0) * yv.gep(1) + xv.gep(1) * yv.gep(0) + base.gep(1))).bitcast(x.dtype)
+
+def add_long(x:UOp, y:UOp):
+  xv = ext_to_vec(x)
+  base = xv.gep(0).bitcast(dtypes.uint).alu(SASSOps.WIDE, UOp.const(dtypes.uint, 1), y).bitcast(xv.dtype)
+  return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(1) + base.gep(1))).bitcast(x.dtype)
 
 sass_matcher = PatternMatcher([
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))),
@@ -105,6 +109,7 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
+  (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), add_long),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.double, src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_double),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
@@ -168,29 +173,30 @@ def lop_inst(d, s, dt, code):
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
   return Instruction("LOP3", d, [*srcs, code, "!PT"]) if dt is dtypes.bool else Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"])
 
-ints = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt))
-floats = set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
+ints, floats = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
+usig = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt))
 numeric = ints | floats
 
 inst_for_cast = (
 )
 
 inst_for_op: Dict[Op, Callable] = {
-  BinaryOps.ADD: lambda d,s,dt: Instruction("IADD3" if dt in ints else dtype_op("ADD", dt), d, fill(s, 3, dt) if dt in ints else s),
-  BinaryOps.MUL: lambda d,s,dt: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
-  BinaryOps.MAX: lambda d,s,dt: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
-  TernaryOps.WHERE: lambda d,s,dt: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
-  SASSOps.IABS: lambda d,s,dt: Instruction("IABS", d, s),
-  SASSOps.FMA: lambda d,s,dt: Instruction("IMAD" if dt in ints else "FMA", d, s),
-  SASSOps.HI: lambda d,s,dt: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
-  SASSOps.WIDE: lambda d,s,dt: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + ["U32"] if dtypes.is_unsigned(dt) else []),
-  SASSOps.DMAX: lambda d,s,dt: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
-  SASSOps.RECIP_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["RCP"]),
-  SASSOps.EXP2_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["EX2"]),
-  SASSOps.SQRT_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["RSQ"]),
-  BinaryOps.AND: lambda d,s,dt: lop_inst(d, s, dt, lop_code(lambda a,b,c: a&b if len(s) == 2 else a&b&c)), # TODO: treat lops separately for arbitrary ternary fusion
-  BinaryOps.OR: lambda d,s,dt: lop_inst(d, s, dt, lop_code(lambda a,b,c: a|b if len(s) == 2 else a|b|c)),
-  BinaryOps.XOR: lambda d,s,dt: lop_inst(d, s, dt, lop_code(lambda a,b,c: a^b if len(s) == 2 else a^b^c)),
+  BinaryOps.MUL: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
+  BinaryOps.MAX: lambda d,s,dt,u: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
+  TernaryOps.WHERE: lambda d,s,dt,u: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
+  SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
+  SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else "FMA", d, s),
+  SASSOps.HI: lambda d,s,dt,u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
+  SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u.src[0].dtype in usig else [])),
+  SASSOps.DMAX: lambda d,s,dt,u: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
+  SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
+  SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
+  SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
+  BinaryOps.AND: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a&b if len(s) == 2 else a&b&c)), # TODO: treat lops separately for arbitrary ternary fusion
+  BinaryOps.OR: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a|b if len(s) == 2 else a|b|c)),
+  BinaryOps.XOR: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a^b if len(s) == 2 else a^b^c)),
+  BinaryOps.ADD: lambda d,s,dt,u: Instruction("IADD3" if dt in ints else dtype_op("ADD", dt), d, fill(s, 3, dt) if dt in ints else s)
+    # [Instruction("IADD3", d.offset(1), [*fill([r.offset(1) for r in s], 3, dt), "P0", "!PT"], mods=["X"])] if dt in [dtypes.long, dtypes.ulong] else []
 }
 
 class SASSRenderer(Renderer):
@@ -412,7 +418,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg in inst_for_op:
-          vals[u] = queue(inst_for_op[arg](new_reg(dtype.itemsize, prefix="P" if dtype.scalar() is dtypes.bool else "R"), [to_var(v) for v in vin], dtype))
+          vals[u] = queue(inst_for_op[arg](new_reg(dtype.itemsize, prefix="P" if dtype.scalar() is dtypes.bool else "R"), [to_var(v) for v in vin], dtype, u))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
