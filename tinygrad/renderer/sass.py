@@ -19,7 +19,7 @@ class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritiz
   IABS = auto(); FMA = auto(); HI = auto(); WIDE = auto(); DMAX = auto(); FLUSH = auto() # noqa: E702
   RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
-ext_to_word = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
+ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
 
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
@@ -30,6 +30,7 @@ def render_binary(x, dtype): # TODO: simplify
 def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
 def is_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
 def geu(x:UOp, v:ConstType): return (-x.lt(x.const(v))) | is_nan(x)
+def ext_to_vec(x:UOp): return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
 
 def exp2(x:UOp) -> UOp: # from nvcc
   valid = geu(x, -126.0)
@@ -67,9 +68,18 @@ def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
   buf = pred.where(fma, fma - abs_x).ge(abs_x).where(buf + 1, buf)
   return (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
 
-def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
-  xv, yv = [r.bitcast(ext_to_word[r.dtype].vec(2)) for r in (x, y)]
-  return UOp(UOps.VECTORIZE, dtypes.float.vec(2), (p.where(xv.gep(0), yv.gep(0)), p.where(xv.gep(1), yv.gep(1)))).bitcast(x.dtype)
+def const_ext(root:UOp):
+  raw = int(render_binary(root.arg, root.dtype), 16)
+  return UOp(UOps.VECTORIZE, dtypes.uint.vec(2), src=tuple([UOp.const(dtypes.uint, v) for v in (raw & 0xffffffff, raw >> 32)])).bitcast(root.dtype)
+
+def where_double(p:UOp, x:UOp, y:UOp) -> UOp:
+  xv, yv = ext_to_vec(x), ext_to_vec(y)
+  return UOp(UOps.VECTORIZE, xv.dtype, (p.where(xv.gep(0), yv.gep(0)), p.where(xv.gep(1), yv.gep(1)))).bitcast(x.dtype)
+
+def mul_long(x:UOp, y:UOp):
+  xv, yv = ext_to_vec(x), ext_to_vec(y)
+  base = x.bitcast(dtypes.ulong).alu(SASSOps.WIDE, y.bitcast(dtypes.ulong)).bitcast(xv.dtype)
+  return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(0) * yv.gep(1) + xv.gep(1) * yv.gep(0) + base.gep(1))).bitcast(x.dtype)
 
 sass_matcher = PatternMatcher([
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))),
@@ -80,8 +90,7 @@ sass_matcher = PatternMatcher([
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
-  (UPat(UOps.CONST, name="root", dtype=set(dt for dt in dtypes.fields().values() if dt.itemsize > 4)),
-   lambda root: UOp(UOps.VECTORIZE, dtypes.uint.vec(2), src=(UOp.const(dtypes.uint, (raw := int(render_binary(root.arg, root.dtype), 16)) & 0xffffffff), UOp.const(dtypes.uint, raw >> 32))).bitcast(root.dtype)),
+  (UPat(UOps.CONST, name="root", dtype=set(dt for dt in dtypes.fields().values() if dt.itemsize > 4)), const_ext),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, dtype=dtypes.bool),
@@ -95,11 +104,12 @@ sass_matcher = PatternMatcher([
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
+  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
+  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.double, src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_double),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
-  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.double, src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext)
 ])
 
 @dataclass
@@ -143,8 +153,9 @@ class Instruction:
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
 def render_value(x, dtype):
-  if dtypes.is_float(dtype): return str(x).upper()
-  elif dtype is dtypes.bool: return "PT" if x else "!PT"
+  if dtype is dtypes.bool: return "PT" if x else "!PT"
+  elif x == 0: return "RZ"
+  elif dtypes.is_float(dtype): return str(x).upper()
   else: return render_binary(x, dtype)
 
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
@@ -171,8 +182,8 @@ inst_for_op: Dict[Op, Callable] = {
   TernaryOps.WHERE: lambda d,s,dt: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
   SASSOps.IABS: lambda d,s,dt: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt: Instruction("IMAD" if dt in ints else "FMA", d, s),
-  SASSOps.HI: lambda d,s,dt: Instruction("IMAD", d, s, mods=["HI"]),
-  SASSOps.WIDE: lambda d,s,dt: Instruction("IMAD", d, s, mods=["WIDE"]),
+  SASSOps.HI: lambda d,s,dt: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
+  SASSOps.WIDE: lambda d,s,dt: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + ["U32"] if dtypes.is_unsigned(dt) else []),
   SASSOps.DMAX: lambda d,s,dt: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt: Instruction("MUFU", d, s, mods=["EX2"]),
@@ -291,26 +302,6 @@ class SASSRenderer(Renderer):
       sig = f"{'F' if dtypes.is_float(dtype) else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"
       return [sig] if sig not in ["S32", "F32"] else []
 
-    def render_alu(arg:BinaryOps, dest:Register, src_l:Union[Register, str], src_r:Union[Register, str], dtype:DType):
-      srcs = [src_l, src_r]
-      if dtypes.is_int(dtype): # TODO: replace with better graph rewrite rules
-        if arg is BinaryOps.MUL: srcs.append(vals[0])
-        elif arg is BinaryOps.ADD: srcs[1:1] = [unity()]
-        else: raise NotImplementedError
-      elif not isinstance(srcs[0], Register):
-        if isinstance(srcs[1], Register): srcs = srcs[::-1]
-        else: srcs[0] = to_reg(vin[0])
-      ret = [ins := Instruction(op := self.alu[arg][dtypes.int if dtypes.is_int(dtype) else dtype], dest, srcs)]
-      if dtypes.is_int(dtype) and arg is BinaryOps.MUL:
-        if dtypes.is_unsigned(dtype) or dtype.itemsize > 4:
-          ins.mods.append("U32")
-        if dtype.itemsize > 4:
-          ins.mods.append("WIDE")
-          ins.srcs = ["PT"] + ins.srcs
-          ret.append(Instruction(op, dest.offset(1), [srcs[0].offset(1), srcs[1], dest.offset(1)]))
-          ret.append(Instruction(op, dest.offset(1), [srcs[0], srcs[1].offset(1), dest.offset(1)]))
-      return ret
-
     def render_permute(dest, msb, lsb, byte_size):
       return [Instruction("PRMT", dest.offset(i), [msb, "0x5410" if byte_size == 2 else "0x6420", lsb]) for i in range(dest.size)]
 
@@ -339,7 +330,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.RANGE:
         vals[u] = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
         queue(Instruction(label := new_reg(prefix=".LOOP_"), None, [], label=True))
-        update = render_alu(BinaryOps.ADD, vals[u], vals[u], unity(), dtype)
+        update = inst_for_op[BinaryOps.ADD](vals[u], [vals[u], unity()], dtype)
         branch = self.render_iter(label, new_reg(prefix="P"), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
