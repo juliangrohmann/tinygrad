@@ -397,7 +397,7 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif op is UOps.BITCAST:
-        vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") else v
+        vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
       elif op is UOps.VECTORIZE:
         if vin[0].dtype.itemsize < 4:
           for nb in range(2, vin[0].dtype.itemsize - 1, -1):
