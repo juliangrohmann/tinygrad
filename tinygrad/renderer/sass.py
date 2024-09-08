@@ -31,7 +31,7 @@ def is_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
 def geu(x:UOp, v:ConstType): return (-x.lt(x.const(v))) | is_nan(x)
 def ext_to_vec(x:UOp): return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
 
-def exp2(x:UOp) -> UOp: # from nvcc
+def exp2(x:UOp) -> UOp:
   valid = geu(x, -126.0)
   dest = valid.where(x, x * x.const(0.5)).alu(SASSOps.EXP2_APPROX)
   return valid.where(dest, dest * dest)
@@ -50,6 +50,13 @@ def log2(x:UOp) -> UOp:
   result = high.cast(x.dtype) * 1.1920928955078125e-07 + denorm.where(x.const(0), x.const(-23)) + buf
   return is_inf(x).where(x.const(float("inf")), is_nan(x).where(x.const(float("nan")), x.eq(0).where(x.const(-float("inf")), result)))
 
+def sqrt(x:UOp) -> UOp:
+  buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
+  return x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf)
+
+def sin(x:UOp) -> UOp:
+  raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
+
 def recip(x:UOp) -> UOp:
   src = x.cast(dtypes.float)
   dest = src.alu(SASSOps.RECIP_APPROX)
@@ -57,7 +64,8 @@ def recip(x:UOp) -> UOp:
   dest = dest * buf + dest
   return src.ne(0).where(dest, src.const(float("inf"))).cast(x.dtype)
 
-def idiv(x:UOp, y:UOp) -> UOp: # from nvcc
+def idiv(x:UOp, y:UOp) -> UOp:
+  assert x.dtype.itemsize <= 4, f"IDIV not implemented for double width dtypes. given={x.dtype}"
   abs_x, abs_y = abs(x), abs(y)
   buf = (abs_x.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(x.dtype) + 0xffffffe).cast(x.dtype)
   buf = buf.alu(SASSOps.HI, -buf * abs_x, UOp(UOps.VECTORIZE, x.dtype.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_y, x.const(0))
@@ -77,7 +85,7 @@ def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
 
 def mul_long(x:UOp, y:UOp):
   xv, yv = ext_to_vec(x), ext_to_vec(y)
-  base = x.bitcast(dtypes.uint).alu(SASSOps.WIDE, y.bitcast(dtypes.uint)).bitcast(xv.dtype)
+  base = UOp(UOps.ALU, x.dtype, (xv.gep(0).bitcast(dtypes.uint), yv.gep(0).bitcast(dtypes.uint)), SASSOps.WIDE).bitcast(xv.dtype)
   return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(0) * yv.gep(1) + xv.gep(1) * yv.gep(0) + base.gep(1))).bitcast(x.dtype)
 
 def add_long(x:UOp, y:UOp):
@@ -114,6 +122,8 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
+  (UPat(UOps.ALU, UnaryOps.SQRT, src=(UPat(name="x"),)), sqrt),
+  (UPat(UOps.ALU, UnaryOps.SIN, src=(UPat(name="x"),UPat(name="y"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
 ])
 
@@ -196,7 +206,6 @@ inst_for_op: Dict[Op, Callable] = {
   BinaryOps.OR: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a|b if len(s) == 2 else a|b|c)),
   BinaryOps.XOR: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a^b if len(s) == 2 else a^b^c)),
   BinaryOps.ADD: lambda d,s,dt,u: Instruction("IADD3" if dt in ints else dtype_op("ADD", dt), d, fill(s, 3, dt) if dt in ints else s)
-    # [Instruction("IADD3", d.offset(1), [*fill([r.offset(1) for r in s], 3, dt), "P0", "!PT"], mods=["X"])] if dt in [dtypes.long, dtypes.ulong] else []
 }
 
 class SASSRenderer(Renderer):
@@ -244,18 +253,7 @@ class SASSRenderer(Renderer):
 
   def render_bra(self, label:str, pred:Register) -> List[Instruction]:
     return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
-
-  def render_sqrt(self, dest:Register, src:Register, bar_regs:Register, bar_lab:str, bufs:List[Register]) -> List[Instruction]: # TODO: only valid for input < 2^102. branch to __internal_0_$__cuda_sm20_sqrt_rn_f32_slowpath, # TODO: move to pattern matcher
-    return [Instruction("BSSY", bar_regs, [f"`({bar_lab})"]),
-            Instruction("IADD3", bufs[0], [src, "-0xd000000", "RZ"]),
-            Instruction("MUFU", dest, [src], mods=["RSQ"]),
-            Instruction("FMUL", bufs[1], [src, dest], mods=["FTZ"]),
-            Instruction("FMUL", dest, [dest, "0.5"], mods=["FTZ"]),
-            Instruction("FFMA", bufs[2], [bufs[1].negate(), bufs[1], src]),
-            Instruction("FFMA", dest, [bufs[2], dest, bufs[1]]),
-            Instruction("BSYNC", None, [bar_regs]),
-            Instruction(bar_lab, None, [], label=True)]
-
+  
   def render(self, name:str, uops:List[UOp]) -> str:
     if getenv("GRAPHUOPS"): # TODO: remove
       graph_uops(uops)
@@ -401,6 +399,7 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif op is UOps.BITCAST:
+        assert vin[0].dtype.itemsize == dtype.itemsize, f"bitcast from {vin[0].dtype} to {dtype}: itemsize mismatch"
         vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
       elif op is UOps.VECTORIZE:
         if vin[0].dtype.itemsize < 4:
@@ -426,11 +425,9 @@ class SASSRenderer(Renderer):
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
-        elif arg is UnaryOps.SQRT:
-          assert dtype is dtypes.float, f"sqrt not supported for {dtype}" # TODO: remove
-          vals[u] = queue(self.render_sqrt(new_reg(dtype.itemsize), to_reg(vin[0]), new_reg(prefix="B"), new_reg(prefix=".SQRT_"), [new_reg(dtype.itemsize) for _ in range(3)]))
         else:
-          raise NotImplementedError
+          assert vin[0].dtype.itemsize == dtype.itemsize, f"bitcast from {vin[0].dtype} to {dtype}: itemsize mismatch"
+          vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
       else:
         raise NotImplementedError
 
@@ -491,8 +488,7 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
   for reg in all_reg:
     if (bidx := reg.base().idx) in repl:
       reg.idx = repl[bidx] + reg.idx - bidx
-  max_reg = max(all_reg, key=lambda x: x.idx + x.size) if all_reg else None
-  return max_reg.base().idx + max_reg.size if max_reg else 0
+  return max([r.base().idx + r.size for r in all_reg] + [0])
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "DSETP", "DADD", "DMUL", "DSETP"} # TODO: I2F is only variable latency for double width
 read_latency_ops = {"MUFU", "DSETP"}
