@@ -171,7 +171,7 @@ def nregs(byte_size): return (byte_size + 3) // 4
 def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0xAA))
 def lop_inst(d, s, dt, code):
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
-  return Instruction("LOP3", d, [*srcs, code, "!PT"]) if dt is dtypes.bool else Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"])
+  return Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"]) if dt is dtypes.bool else Instruction("LOP3", d, [*srcs, code, "!PT"])
 
 ints, floats = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
 usig = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt))
@@ -285,7 +285,7 @@ class SASSRenderer(Renderer):
 
     def to_reg(uop:UOp, **kwargs) -> Register:
       if isinstance(var := vals[uop], Register): # TODO: replace with better graph rewrite rules
-        return queue(inst_for_op[TernaryOps.WHERE](new_reg(), [var.negate(), vals[0], "0x1"], dtypes.int)) if var.type == "P" else var
+        return queue(inst_for_op[TernaryOps.WHERE](new_reg(), [var.negate(), vals[0], "0x1"], dtypes.int, uop)) if var.type == "P" else var
       vals[uop] = dest = queue(self.render_mov(new_reg(uop.dtype.itemsize, **kwargs), var, uop.dtype))
       return dest
 
@@ -336,7 +336,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.RANGE:
         vals[u] = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
         queue(Instruction(label := new_reg(prefix=".LOOP_"), None, [], label=True))
-        update = inst_for_op[BinaryOps.ADD](vals[u], [vals[u], unity()], dtype)
+        update = inst_for_op[BinaryOps.ADD](vals[u], [vals[u], unity()], dtype, u)
         branch = self.render_iter(label, new_reg(prefix="P"), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
@@ -393,7 +393,7 @@ class SASSRenderer(Renderer):
             else:
               vals[u] = queue(Instruction(f"FSETP", new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
         elif vin[0].dtype is dtypes.bool:
-          vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype))
+          vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype, u))
         else:
           raise NotImplementedError
       elif op is UOps.BITCAST:
