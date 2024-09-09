@@ -93,7 +93,16 @@ def add_long(x:UOp, y:UOp):
   base = xv.gep(0).bitcast(dtypes.uint).alu(SASSOps.WIDE, UOp.const(dtypes.uint, 1), y).bitcast(xv.dtype)
   return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(1) + base.gep(1))).bitcast(x.dtype)
 
+shiftable_consts = set([2**i for i in range(64)])
 sass_matcher = PatternMatcher([
+  (UPat(UOps.ALU, BinaryOps.MUL, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
+        src=[UPat(UOps.CONST,  name="const"), UPat(name="mul")]),
+   lambda root, mul, const: UOp(UOps.ALU, root.dtype,
+                                (mul, UOp.const(dtypes.int, int(math.log2(const.arg)))), BinaryOps.SHL) if const.arg in shiftable_consts else None),
+  (UPat(UOps.ALU, BinaryOps.IDIV, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
+        src=[UPat(UOps.CONST, name="const"), UPat(name="div")]),
+   lambda root, div, const: UOp(UOps.ALU, root.dtype,
+                                (div, UOp.const(dtypes.int, int(math.log2(const.arg)))), BinaryOps.SHR) if const.arg in shiftable_consts else None),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))),
    lambda root,x,y,z,k: UOp(root.op, dtypes.uchar, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())),
@@ -193,6 +202,8 @@ inst_for_cast = (
 inst_for_op: Dict[Op, Callable] = {
   BinaryOps.MUL: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MAX: lambda d,s,dt,u: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
+  BinaryOps.SHR: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["R", "U32"]),
+  BinaryOps.SHL: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["L", "U32"]),
   TernaryOps.WHERE: lambda d,s,dt,u: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
   SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else "FMA", d, s),
