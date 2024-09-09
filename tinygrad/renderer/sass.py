@@ -131,6 +131,8 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
+  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
+   lambda x,y,z: (x & y) | (x.ne(True) & z)),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
