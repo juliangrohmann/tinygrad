@@ -13,10 +13,11 @@ from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.engine.graph import graph_uops
+from tinygrad.codegen.uopgraph import linearize_uop
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
-  IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
+  IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
   RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
@@ -65,20 +66,14 @@ def recip(x:UOp) -> UOp:
   return src.ne(0).where(dest, src.const(float("inf"))).cast(x.dtype)
 
 def idiv(x:UOp, y:UOp) -> UOp:
-  ret, buf = x.const(0), x.const(0)
   if sig := not dtypes.is_unsigned(x.dtype):
     neg_x, neg_y = x.lt(x.const(0)), y.lt(y.const(0))
     x, y = neg_x.where(-x, x), neg_y.where(-y, y)
-  for i in range(x.dtype.itemsize * 8 - (2 if sig else 1), -1, -1):
-    mask = x.const(2 ** i)
-    buf = (buf * 2) + (x & mask).ne(0).where(x.const(1), x.const(0))
-    cmp = buf.lt(y)
-    buf, ret = cmp.where(buf, buf - y), cmp.where(ret, ret + mask)
-  return (neg_x ^ neg_y).where(-ret, ret) if sig else ret
-
-def const_ext(root:UOp):
-  raw = int(render_binary(root.arg, root.dtype), 16)
-  return UOp(UOps.VECTORIZE, dtypes.uint.vec(2), src=tuple([UOp.const(dtypes.uint, v) for v in (raw & 0xffffffff, raw >> 32)])).bitcast(root.dtype)
+  rng = UOp(UOps.RANGE, dtypes.long, (UOp.const(dtypes.long, x.dtype.itemsize*8 - 1 - sig), UOp.const(dtypes.long, -1), UOp.const(dtypes.long, -1)), arg=(0, True))
+  ret = UOp(UOps.DEFINE_ACC, x.dtype, (x.const(0), rng))
+  val = UOp(UOps.ALU, x.dtype, (x, rng), BinaryOps.SHR)
+  phi_ret = UOp(UOps.PHI, ret.dtype, (ret, (val - y*ret*2).lt(y).where(ret * 2, ret*2 + 1)))
+  return (neg_x ^ neg_y).where(-phi_ret, phi_ret) if sig else phi_ret
 
 def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
@@ -96,7 +91,7 @@ def add_long(x:UOp, y:UOp):
 
 def shf_long(root:UOp, x:UOp, y:UOp):
   ext = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (x, y), SASSOps.SHR_HI if root.arg == BinaryOps.SHR else SASSOps.SHL_HI)
-  base = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (ext_to_vec(x).gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), root.arg)
+  base = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (ext_to_vec(x).gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), root.arg if root.arg is BinaryOps.SHL else SASSOps.SHR_LO)
   return UOp(UOps.VECTORIZE, base.dtype.vec(2), (base, ext)).bitcast(x.dtype)
 
 shiftable_consts = set([2**i for i in range(64)])
@@ -118,7 +113,6 @@ sass_matcher = PatternMatcher([
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
-  # (UPat(UOps.CONST, name="root", dtype=set(dt for dt in dtypes.fields().values() if dt.itemsize > 4)), const_ext),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, dtype=dtypes.bool),
@@ -132,7 +126,7 @@ sass_matcher = PatternMatcher([
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
-  # (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
+  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
   (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), add_long),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
@@ -211,15 +205,16 @@ inst_for_cast = (
 inst_for_op: Dict[Op, Callable] = {
   BinaryOps.MUL: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MAX: lambda d,s,dt,u: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
-  BinaryOps.SHR: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["R", "U32" if u.src[0].dtype.itemsize <= 4 else "U64"]),
-  BinaryOps.SHL: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["L", "U32" if u.src[0].dtype.itemsize <= 4 else "U64"]),
+  BinaryOps.SHR: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["R", "U32"]),
+  BinaryOps.SHL: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["L", "U32"]),
   TernaryOps.WHERE: lambda d,s,dt,u: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
   SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else "FMA", d, s),
   SASSOps.IMAD_HI: lambda d, s, dt, u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
   SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u.src[0].dtype in usig else [])),
   SASSOps.DMAX: lambda d,s,dt,u: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
-  SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64", "HI"]),
+  SASSOps.SHR_LO: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64"]),
+  SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
   SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
@@ -248,9 +243,11 @@ class SASSRenderer(Renderer):
   setp_mod = {BinaryOps.CMPLT: "LT", BinaryOps.CMPNE: "NEU"}
 
   def render_mov(self, dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None) -> Instruction:
-    if dtypes.is_float(dtype) and not isinstance(src, Register) and not src.startswith("0x"): # TODO: fix for 64 bit
-      src = render_binary(float(src), dtype)
-    srcs = [src.offset(i) for i in range(src.size)] if isinstance(src, Register) else [src] + ["RZ"]*(nregs(dtype.itemsize) - 1)
+    if isinstance(src, Register):
+      srcs = [src.offset(i) if i < src.size - src.idx % src.size else "RZ" for i in range(nregs(dtype.itemsize))]
+    else:
+      val = int(render_binary(float(src), dtype) if not src.startswith("0x") else src, 16)
+      srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else [val & 0xffffffff, val >> 32])]
     return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
 
   def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]: # TODO: refactor
@@ -258,14 +255,11 @@ class SASSRenderer(Renderer):
       ret = []
       op = dtype_op("SETP", dtype)
       ret.append(ins := Instruction(op, dest, ["PT", src_l, src_r, "PT"], mods=["AND"]))
-      if arg is BinaryOps.CMPNE:
-        ins.mods.append("NEU" if dtypes.is_float(dtype) else "NE")
-      elif arg is BinaryOps.CMPLT:
-        ins.mods.append("LT")
+      ins.mods.append(cmp_op := (("NEU" if dtypes.is_float(dtype) else "NE") if arg is BinaryOps.CMPNE else "LT"))
       if dtypes.is_unsigned(dtype) or dtype in [dtypes.long, dtypes.ulong]:
         ins.mods.append("U32")
       if dtype in [dtypes.long, dtypes.ulong]:
-        ret.append(Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[f"NE", "AND", "EX"]))
+        ret.append(Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[cmp_op, "AND", "EX"]))
       return ret
     else:
       return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop_code(lambda a, b, c: (a ^ b) & c), "0x0"], mods=["LUT"])]
@@ -351,7 +345,8 @@ class SASSRenderer(Renderer):
         vals[u] = queue(Instruction("S2R", new_reg(), [(self.tid if (tid := arg[0][:3] == "lid") else self.gid)[dim := int(arg[0][-1])]]))
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
-        vals[u] = vals[arg] if arg in vals else render_value(arg, dtype)
+        val = render_value(arg, dtype)
+        vals[u] = vals[arg] if arg in vals else val if dtype.itemsize <= 4 else queue(self.render_mov(new_reg(dtype.itemsize), val, dtype))
       elif op is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
         attr["PARAM_COUNT"] += 1
@@ -359,8 +354,8 @@ class SASSRenderer(Renderer):
         vals[u] = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
       elif op is UOps.RANGE:
         vals[u] = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
-        queue(Instruction(label := new_reg(prefix=".LOOP_"), None, [], label=True))
-        update = inst_for_op[BinaryOps.ADD](vals[u], [vals[u], unity()], dtype, u)
+        queue(Instruction(label := new_reg(prefix=".LOOP_").render(), None, [], label=True))
+        update = inst_for_op[BinaryOps.ADD](vals[u], [vals[u], unity() if len(vin) < 3 else to_reg(vin[2])], dtype, u)
         branch = self.render_iter(label, new_reg(prefix="P"), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
@@ -439,7 +434,7 @@ class SASSRenderer(Renderer):
           vals[u] = vals[vin[0]]
           for v in vin: vals[v].size = nregs(dtype.itemsize)
       elif op is UOps.GEP:
-        vals[u] = vals[vin[0]].offset(arg)
+        vals[u] = to_reg(vin[0]).offset(arg)
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg in inst_for_op:
@@ -464,7 +459,7 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = reg_cnt["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel) # debug TODO: remove
 
-    attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    # attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
     # debug TODO: remove
