@@ -25,7 +25,7 @@ ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.doubl
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
   overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
-  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", x))}"
+  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", dtypes.as_const(x, dtype)))}"
 
 def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
 def is_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
