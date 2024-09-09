@@ -16,7 +16,7 @@ from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
-  IABS = auto(); FMA = auto(); HI = auto(); WIDE = auto(); DMAX = auto(); FLUSH = auto() # noqa: E702
+  IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
   RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
@@ -94,7 +94,13 @@ def add_long(x:UOp, y:UOp):
   base = xv.gep(0).bitcast(dtypes.uint).alu(SASSOps.WIDE, UOp.const(dtypes.uint, 1), y).bitcast(xv.dtype)
   return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(1) + base.gep(1))).bitcast(x.dtype)
 
+def shf_long(root:UOp, x:UOp, y:UOp):
+  ext = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (x, y), SASSOps.SHR_HI if root.arg == BinaryOps.SHR else SASSOps.SHL_HI)
+  base = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (ext_to_vec(x).gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), root.arg)
+  return UOp(UOps.VECTORIZE, base.dtype.vec(2), (base, ext)).bitcast(x.dtype)
+
 shiftable_consts = set([2**i for i in range(64)])
+r_shift = set([1/i for i in range(2, 64)])
 sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, BinaryOps.MUL, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
         src=[UPat(UOps.CONST,  name="const"), UPat(name="mul")]),
@@ -103,7 +109,7 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, BinaryOps.IDIV, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
         src=[UPat(UOps.CONST, name="const"), UPat(name="div")]),
    lambda root, div, const: UOp(UOps.ALU, root.dtype,
-                                (div, UOp.const(dtypes.int, int(math.log2(const.arg)))), BinaryOps.SHR) if const.arg in shiftable_consts else None),
+                                (div, UOp.const(dtypes.int, int(abs(math.log2(const.arg))))), BinaryOps.SHR) if const.arg in shiftable_consts else None),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))),
    lambda root,x,y,z,k: UOp(root.op, dtypes.uchar, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())),
@@ -112,7 +118,7 @@ sass_matcher = PatternMatcher([
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
-  (UPat(UOps.CONST, name="root", dtype=set(dt for dt in dtypes.fields().values() if dt.itemsize > 4)), const_ext),
+  # (UPat(UOps.CONST, name="root", dtype=set(dt for dt in dtypes.fields().values() if dt.itemsize > 4)), const_ext),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, dtype=dtypes.bool),
@@ -126,8 +132,10 @@ sass_matcher = PatternMatcher([
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
-  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
+  # (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
   (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), add_long),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
   (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
@@ -203,14 +211,16 @@ inst_for_cast = (
 inst_for_op: Dict[Op, Callable] = {
   BinaryOps.MUL: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MAX: lambda d,s,dt,u: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
-  BinaryOps.SHR: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["R", "U32"]),
-  BinaryOps.SHL: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["L", "U32"]),
+  BinaryOps.SHR: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["R", "U32" if u.src[0].dtype.itemsize <= 4 else "U64"]),
+  BinaryOps.SHL: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["L", "U32" if u.src[0].dtype.itemsize <= 4 else "U64"]),
   TernaryOps.WHERE: lambda d,s,dt,u: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
   SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else "FMA", d, s),
-  SASSOps.HI: lambda d,s,dt,u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
+  SASSOps.IMAD_HI: lambda d, s, dt, u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
   SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u.src[0].dtype in usig else [])),
   SASSOps.DMAX: lambda d,s,dt,u: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
+  SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64", "HI"]),
+  SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
   SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
@@ -354,7 +364,7 @@ class SASSRenderer(Renderer):
         branch = self.render_iter(label, new_reg(prefix="P"), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
-        vals[u] = queue(elf.render_mov(vals[vin[0]], vals[vin[1]], dtype))
+        vals[u] = queue(self.render_mov(vals[vin[0]], vals[vin[1]], dtype))
       elif op is UOps.ENDRANGE:
         queue(iter_stack.pop(-1))
       elif op is UOps.LOAD:
