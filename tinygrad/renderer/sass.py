@@ -65,15 +65,16 @@ def recip(x:UOp) -> UOp:
   return src.ne(0).where(dest, src.const(float("inf"))).cast(x.dtype)
 
 def idiv(x:UOp, y:UOp) -> UOp:
-  assert x.dtype.itemsize <= 4, f"IDIV not implemented for double width dtypes. given={x.dtype}"
-  abs_x, abs_y = abs(x), abs(y)
-  buf = (abs_x.cast(dtypes.float).alu(SASSOps.RECIP_APPROX).bitcast(x.dtype) + 0xffffffe).cast(x.dtype)
-  buf = buf.alu(SASSOps.HI, -buf * abs_x, UOp(UOps.VECTORIZE, x.dtype.vec(2), (x.const(0), buf))).alu(SASSOps.HI, abs_y, x.const(0))
-  fma = buf * -abs_x + abs_y
-  pred = fma.lt(abs_x)
-  buf = pred.where(buf, buf + 1)
-  buf = pred.where(fma, fma - abs_x).ge(abs_x).where(buf + 1, buf)
-  return (-x.alu(BinaryOps.XOR, y).lt(x.const(0))).where(buf, -buf)
+  ret, buf = x.const(0), x.const(0)
+  if sig := not dtypes.is_unsigned(x.dtype):
+    neg_x, neg_y = x.lt(x.const(0)), y.lt(y.const(0))
+    x, y = neg_x.where(-x, x), neg_y.where(-y, y)
+  for i in range(30 if sig else 31, -1, -1):
+    mask = x.const(2 ** i)
+    buf = buf.alu(BinaryOps.SHL, x.const(1)) + (x & mask).alu(BinaryOps.SHR, x.const(i))
+    cmp = buf.lt(y)
+    buf, ret = cmp.where(buf, buf - y), cmp.where(ret, ret + mask)
+  return (neg_x ^ neg_y).where(-ret, ret) if sig else ret
 
 def const_ext(root:UOp):
   raw = int(render_binary(root.arg, root.dtype), 16)
