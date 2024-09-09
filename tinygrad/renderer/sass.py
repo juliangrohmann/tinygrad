@@ -69,9 +69,9 @@ def idiv(x:UOp, y:UOp) -> UOp:
   if sig := not dtypes.is_unsigned(x.dtype):
     neg_x, neg_y = x.lt(x.const(0)), y.lt(y.const(0))
     x, y = neg_x.where(-x, x), neg_y.where(-y, y)
-  for i in range(30 if sig else 31, -1, -1):
+  for i in range(x.dtype.itemsize * 8 - (2 if sig else 1), -1, -1):
     mask = x.const(2 ** i)
-    buf = buf.alu(BinaryOps.SHL, x.const(1)) + (x & mask).alu(BinaryOps.SHR, x.const(i))
+    buf = (buf * 2) + (x & mask).ne(0).where(x.const(1), x.const(0))
     cmp = buf.lt(y)
     buf, ret = cmp.where(buf, buf - y), cmp.where(ret, ret + mask)
   return (neg_x ^ neg_y).where(-ret, ret) if sig else ret
@@ -252,10 +252,10 @@ class SASSRenderer(Renderer):
         ins.mods.append("NEU" if dtypes.is_float(dtype) else "NE")
       elif arg is BinaryOps.CMPLT:
         ins.mods.append("LT")
-      if dtypes.is_unsigned(dtype) or dtype is dtypes.long:
+      if dtypes.is_unsigned(dtype) or dtype in [dtypes.long, dtypes.ulong]:
         ins.mods.append("U32")
-      if dtype is dtypes.long:
-        ret.append(Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[f"{self.setp_mod[arg]}", "AND", "EX"]))
+      if dtype in [dtypes.long, dtypes.ulong]:
+        ret.append(Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[f"NE", "AND", "EX"]))
       return ret
     else:
       return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop_code(lambda a, b, c: (a ^ b) & c), "0x0"], mods=["LUT"])]
