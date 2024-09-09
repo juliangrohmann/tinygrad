@@ -137,6 +137,7 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, UnaryOps.SQRT, src=(UPat(name="x"),)), sqrt),
   (UPat(UOps.ALU, UnaryOps.SIN, src=(UPat(name="x"),UPat(name="y"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
+  (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
 ])
 
 @dataclass
@@ -443,8 +444,7 @@ class SASSRenderer(Renderer):
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
         else:
-          assert vin[0].dtype.itemsize == dtype.itemsize, f"bitcast from {vin[0].dtype} to {dtype}: itemsize mismatch"
-          vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
+          raise NotImplementedError
       else:
         raise NotImplementedError
 
