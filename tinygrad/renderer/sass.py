@@ -49,7 +49,7 @@ def log2(x:UOp) -> UOp:
   for _ in range(2): buf *= coeff
   buf += coeff * 1.4426950216293334961
   result = high.cast(x.dtype) * 1.1920928955078125e-07 + denorm.where(x.const(0), x.const(-23)) + buf
-  return is_inf(x).where(x.const(float("inf")), is_nan(x).where(x.const(float("nan")), x.eq(0).where(x.const(-float("inf")), result)))
+  return (-x.bitcast(dtypes.uint).lt(0x7f800000)).where(x.const(float("nan")), x.eq(0).where(x.const(-float("inf")), result))
 
 def sqrt(x:UOp) -> UOp:
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
@@ -246,7 +246,7 @@ class SASSRenderer(Renderer):
     if isinstance(src, Register):
       srcs = [src.offset(i) if i < src.size - src.idx % src.size else "RZ" for i in range(nregs(dtype.itemsize))]
     else:
-      val = int(render_binary(float(src), dtype) if not src.startswith("0x") else src, 16)
+      val = int(render_binary(float(src), dtype) if not re.match(f"-?0x", src) else src, 16)
       srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else [val & 0xffffffff, val >> 32])]
     return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
 
@@ -459,7 +459,7 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = reg_cnt["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel) # debug TODO: remove
 
-    # attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
     # debug TODO: remove
