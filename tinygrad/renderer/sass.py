@@ -263,7 +263,8 @@ class SASSRenderer(Renderer):
         ret.append(Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[cmp_op, "AND", "EX"]))
       return ret
     else:
-      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop_code(lambda a, b, c: (a ^ b) & c), "0x0"], mods=["LUT"])]
+      func = (lambda a,b,c: (a^b)&c) if arg == BinaryOps.CMPNE else lambda a,b,c: (~a)&b&c
+      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop_code(func), "0x0"], mods=["LUT"])]
 
   def render_iter(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
     return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), *self.render_bra(label, pred)]
