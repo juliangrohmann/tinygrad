@@ -14,11 +14,12 @@ from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.engine.graph import graph_uops
 from tinygrad.codegen.uopgraph import linearize_uop
+from tinygrad.codegen.transcendental import xlog2
 from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
-  RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
+  SET_BITS = auto(); RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
 
@@ -27,8 +28,10 @@ def render_binary(x, dtype): # TODO: simplify
   overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
   return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", dtypes.as_const(x, dtype)))}"
 
+def int_like(dt:DType): return dt if dtypes.is_int(dt) else {dtypes.double:dtypes.long, dtypes.float:dtypes.int, dtypes.half:dtypes.short}[dt]
 def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
-def is_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
+def is_inf(x:UOp): return is_pos_inf(x.bitcast(dtypes.uint) & 0x7fffffff)
+def is_pos_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
 def geu(x:UOp, v:ConstType): return (-x.lt(x.const(v))) | is_nan(x)
 def ext_to_vec(x:UOp): return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
 
@@ -37,7 +40,7 @@ def exp2(x:UOp) -> UOp:
   dest = valid.where(x, x * x.const(0.5)).alu(SASSOps.EXP2_APPROX)
   return valid.where(dest, dest * dest)
 
-def log2(x:UOp) -> UOp:
+def log2(x:UOp) -> UOp: # TODO: fast but only accurate for int operand
   denorm = geu(x, 1.175494350822287508e-38)
   src = denorm.where(x, x * 8388608).bitcast(dtypes.uint)
   high = (src - 0x3f3504f3) & 0xff800000
@@ -53,16 +56,16 @@ def log2(x:UOp) -> UOp:
 
 def sqrt(x:UOp) -> UOp:
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
-  return is_inf(x).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
+  return is_pos_inf(x).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
 
 def sin(x:UOp) -> UOp:
   raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
 
 def recip(x:UOp) -> UOp:
-  dest = x.alu(SASSOps.RECIP_APPROX)
-  buf = (dest * x - 1) * -1
-  dest = dest * buf + dest
-  return x.ne(0).where(dest, x.const(float("inf"))).cast(x.dtype)
+  approx = x.alu(SASSOps.RECIP_APPROX)
+  dest = approx * (approx * x - 1) * -1 + approx
+  inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, 0x7fffffff)).bitcast(x.dtype) for v in [0x7f800000, 0]]
+  return is_inf(x).where(zero, x.ne(0).where(dest, inf))
 
 def idiv(x:UOp, y:UOp) -> UOp:
   if sig := not dtypes.is_unsigned(x.dtype):
@@ -92,6 +95,11 @@ def shf_long(root:UOp, x:UOp, y:UOp):
   ext = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (x, y), SASSOps.SHR_HI if root.arg == BinaryOps.SHR else SASSOps.SHL_HI)
   base = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (ext_to_vec(x).gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), root.arg if root.arg is BinaryOps.SHL else SASSOps.SHR_LO)
   return UOp(UOps.VECTORIZE, base.dtype.vec(2), (base, ext)).bitcast(x.dtype)
+
+def bitwise_long(root:UOp, x:UOp, y:UOp):
+  xv, yv = ext_to_vec(x), ext_to_vec(y)
+  base, ext = (b := xv.gep(0)).bitcast(dtypes.uint).alu(root.arg, yv.gep(0).bitcast(dtypes.uint)).bitcast(b.dtype), xv.gep(1).alu(root.arg, yv.gep(1))
+  return UOp(UOps.VECTORIZE, xv.dtype, (base, ext)).bitcast(x.dtype)
 
 shiftable_consts = set([2**i for i in range(64)])
 r_shift = set([1/i for i in range(2, 64)])
@@ -138,18 +146,19 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
    lambda x,y,z: (x & y) | (x.ne(True) & z)),
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float}, src=(UPat(name="x"))), recip),
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dt for dt in ints if dt.itemsize <= 4}, src=(UPat(name="x"))),
+   lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))),
   (UPat(UOps.ALU, UnaryOps.EXP2, dtype=not_half, src=(UPat(name="x"),)), exp2),
-  (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="x"),)), log2),
+  (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="d"),)), xlog2),
   (UPat(UOps.ALU, UnaryOps.SQRT, dtype=not_half, src=(UPat(name="x"),)), sqrt),
   (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"),UPat(name="y"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
   (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
   *[(UPat(UOps.ALU, op, dtype=dtypes.half, name="x"),
-     lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half)))
-    for op in half_not_supported],
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dt for dt in ints if dt.itemsize <= 4}, src=(UPat(name="x"))),
-   lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))),
+     lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))) for op in half_not_supported],
+  *[(UPat(UOps.ALU, name="root", arg=op, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))),
+     bitwise_long) for op in {BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR}],
 ])
 
 @dataclass
@@ -225,6 +234,7 @@ inst_for_op: Dict[Op, Callable] = {
   SASSOps.SHR_LO: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64"]),
   SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
   SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
+  SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
   SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
