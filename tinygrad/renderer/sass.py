@@ -61,11 +61,11 @@ def sqrt(x:UOp) -> UOp:
 def sin(x:UOp) -> UOp:
   raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
 
-def recip(x:UOp) -> UOp:
+def recip_single(x:UOp) -> UOp:
   approx = x.alu(SASSOps.RECIP_APPROX)
   dest = approx * (approx * x - 1) * -1 + approx
-  inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, nan)).bitcast(x.dtype) for v in [inf, 0]]
-  return is_inf(x).where(zero, x.ne(0).where(dest, inf))
+  sig_inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, nan)).bitcast(x.dtype) for v in [inf, 0]]
+  return is_inf(x).where(zero, x.ne(0).where(dest, sig_inf))
 
 def recip_double(x:UOp) -> UOp:
   xv = ext_to_vec(x)
@@ -155,14 +155,14 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
    lambda x,y,z: (x & y) | (x.ne(True) & z)),
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float}, src=(UPat(name="x"))), recip),
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float}, src=(UPat(name="x"))), recip_single),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.double}, src=(UPat(name="x"))), recip_double),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dt for dt in ints if dt.itemsize <= 4}, src=(UPat(name="x"))),
    lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))),
   (UPat(UOps.ALU, UnaryOps.EXP2, dtype=not_half, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="d"),)), xlog2),
   (UPat(UOps.ALU, UnaryOps.SQRT, dtype=not_half, src=(UPat(name="x"),)), sqrt),
-  (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"))), sin),
+  # (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
   (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
   *[(UPat(UOps.ALU, op, dtype=dtypes.half, name="x"),
@@ -263,7 +263,7 @@ class SASSRenderer(Renderer):
   shared_max = 49152
   tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2),(0,2),(1,2),(1,2),(1,2)], dtype_in=di, dtype_out=do) for (di, do) in ([(dtypes.half, dtypes.float)])] # noqa: E501
   extra_matcher = sass_matcher
-  code_for_op = {UnaryOps.EXP2: None, UnaryOps.LOG2: None}
+  code_for_op = {UnaryOps.EXP2: None, UnaryOps.LOG2: None, UnaryOps.SIN: None}
   def __init__(self, arch:str):
     self.tensor_cores = SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
     self.arch = arch # TODO: remove
@@ -475,7 +475,7 @@ class SASSRenderer(Renderer):
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
         else:
-          raise NotImplementedError
+          vals[u] = "0x0"
       else:
         raise NotImplementedError
 
