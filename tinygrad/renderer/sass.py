@@ -19,9 +19,10 @@ from CuAsm import CubinFile, CuAsmParser
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
-  SET_BITS = auto(); RECIP_APPROX = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
+  SET_BITS = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
+inf, nan, inf_ext, nan_ext = 0x7f800000, 2**31-1, 0x7ff0000000000000, 2**64-1
 
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
@@ -29,9 +30,8 @@ def render_binary(x, dtype): # TODO: simplify
   return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", dtypes.as_const(x, dtype)))}"
 
 def int_like(dt:DType): return dt if dtypes.is_int(dt) else {dtypes.double:dtypes.long, dtypes.float:dtypes.int, dtypes.half:dtypes.short}[dt]
-def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(0x7f800001)
-def is_inf(x:UOp): return is_pos_inf(x.bitcast(dtypes.uint) & 0x7fffffff)
-def is_pos_inf(x:UOp): return x.bitcast(dtypes.uint).eq(0x7f800000)
+def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(inf + 1)
+def is_inf(x:UOp): return (x.bitcast(dtypes.uint) & nan).eq(inf)
 def geu(x:UOp, v:ConstType): return (-x.lt(x.const(v))) | is_nan(x)
 def ext_to_vec(x:UOp): return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
 
@@ -56,7 +56,7 @@ def log2(x:UOp) -> UOp: # TODO: fast but only accurate for int operand
 
 def sqrt(x:UOp) -> UOp:
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
-  return is_pos_inf(x).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
+  return x.bitcast(dtypes.uint).eq(inf).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
 
 def sin(x:UOp) -> UOp:
   raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
@@ -64,8 +64,17 @@ def sin(x:UOp) -> UOp:
 def recip(x:UOp) -> UOp:
   approx = x.alu(SASSOps.RECIP_APPROX)
   dest = approx * (approx * x - 1) * -1 + approx
-  inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, 0x7fffffff)).bitcast(x.dtype) for v in [0x7f800000, 0]]
+  inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, nan)).bitcast(x.dtype) for v in [inf, 0]]
   return is_inf(x).where(zero, x.ne(0).where(dest, inf))
+
+def recip_double(x:UOp) -> UOp:
+  xv = ext_to_vec(x)
+  rcp_base = (xv.gep(1).bitcast(dtypes.int) + UOp.const(dtypes.int, 0x300402)).bitcast(xv.dtype.scalar())
+  rcp_ext = xv.gep(1).alu(SASSOps.RECIP_HI)
+  approx = UOp(UOps.VECTORIZE, xv.dtype, (rcp_base, rcp_ext)).bitcast(x.dtype)
+  buf = -x*approx + 1
+  it = approx*(buf*buf + buf) + approx
+  return it*(-x*it + 1) + it
 
 def idiv(x:UOp, y:UOp) -> UOp:
   if sig := not dtypes.is_unsigned(x.dtype):
@@ -147,12 +156,13 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
    lambda x,y,z: (x & y) | (x.ne(True) & z)),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float}, src=(UPat(name="x"))), recip),
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.double}, src=(UPat(name="x"))), recip_double),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dt for dt in ints if dt.itemsize <= 4}, src=(UPat(name="x"))),
    lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))),
   (UPat(UOps.ALU, UnaryOps.EXP2, dtype=not_half, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="d"),)), xlog2),
   (UPat(UOps.ALU, UnaryOps.SQRT, dtype=not_half, src=(UPat(name="x"),)), sqrt),
-  (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"),UPat(name="y"))), sin),
+  (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
   (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
   *[(UPat(UOps.ALU, op, dtype=dtypes.half, name="x"),
@@ -201,15 +211,15 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
-def render_value(x, dtype):
+def render_value(x, dtype, allow_reg=False):
   if dtype is dtypes.bool: return "PT" if x else "!PT"
-  elif x == 0: return "RZ"
+  elif x == 0 and allow_reg: return "RZ"
   elif dtypes.is_float(dtype): return str(x).upper()
   else: return render_binary(x, dtype)
 
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
-def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
+def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype, allow_reg=True) for i in range(count)]
 def dtype_op(op, dt): return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.half else '')
 def nregs(byte_size): return (byte_size + 3) // 4
 def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0xAA))
@@ -235,7 +245,8 @@ inst_for_op: Dict[Op, Callable] = {
   SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
   SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
   SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
-  SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
+  SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]), # TODO: move mod to arg
+  SASSOps.RECIP_HI: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP64H"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
   SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
   BinaryOps.AND: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a&b if len(s) == 2 else a&b&c)), # TODO: treat lops separately for arbitrary ternary fusion
@@ -278,7 +289,8 @@ class SASSRenderer(Renderer):
       if dtypes.is_unsigned(dtype) or dtype in [dtypes.long, dtypes.ulong]:
         ins.mods.append("U32")
       if dtype in [dtypes.long, dtypes.ulong]:
-        ret.append(Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[cmp_op, "AND", "EX"]))
+        ret.append(ins := Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[cmp_op, "AND", "EX"]))
+        if dtypes.is_unsigned(dtype): ins.mods.append("U32")
       return ret
     else:
       func = (lambda a,b,c: (a^b)&c) if arg == BinaryOps.CMPNE else lambda a,b,c: (~a)&b&c
@@ -366,7 +378,7 @@ class SASSRenderer(Renderer):
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
         val = render_value(arg, dtype)
-        vals[u] = vals[arg] if arg in vals else val if dtype.itemsize <= 4 else queue(self.render_mov(new_reg(dtype.itemsize), val, dtype))
+        vals[u] = (vals[arg] if arg in vals else val) if dtype.itemsize <= 4 else queue(self.render_mov(new_reg(dtype.itemsize), val, dtype))
       elif op is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
         attr["PARAM_COUNT"] += 1
