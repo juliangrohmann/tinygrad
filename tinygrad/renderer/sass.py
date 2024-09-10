@@ -53,17 +53,16 @@ def log2(x:UOp) -> UOp:
 
 def sqrt(x:UOp) -> UOp:
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
-  return x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf)
+  return is_inf(x).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
 
 def sin(x:UOp) -> UOp:
   raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
 
 def recip(x:UOp) -> UOp:
-  src = x.cast(dtypes.float)
-  dest = src.alu(SASSOps.RECIP_APPROX)
-  buf = (dest * src - 1) * -1
+  dest = x.alu(SASSOps.RECIP_APPROX)
+  buf = (dest * x - 1) * -1
   dest = dest * buf + dest
-  return src.ne(0).where(dest, src.const(float("inf"))).cast(x.dtype)
+  return x.ne(0).where(dest, x.const(float("inf"))).cast(x.dtype)
 
 def idiv(x:UOp, y:UOp) -> UOp:
   if sig := not dtypes.is_unsigned(x.dtype):
@@ -96,6 +95,12 @@ def shf_long(root:UOp, x:UOp, y:UOp):
 
 shiftable_consts = set([2**i for i in range(64)])
 r_shift = set([1/i for i in range(2, 64)])
+half_not_supported = [UnaryOps.RECIP, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN, UnaryOps.SQRT]
+not_half = {dt for dt in dtypes.fields().values() if dt is not dtypes.half}
+ints, floats = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
+usig = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt))
+numeric = ints | floats
+
 sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, BinaryOps.MUL, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
         src=[UPat(UOps.CONST,  name="const"), UPat(name="mul")]),
@@ -134,12 +139,17 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
    lambda x,y,z: (x & y) | (x.ne(True) & z)),
   (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float, dtypes.half}, src=(UPat(name="x"))), recip),
-  (UPat(UOps.ALU, UnaryOps.EXP2, src=(UPat(name="x"),)), exp2),
-  (UPat(UOps.ALU, UnaryOps.LOG2, src=(UPat(name="x"),)), log2),
-  (UPat(UOps.ALU, UnaryOps.SQRT, src=(UPat(name="x"),)), sqrt),
-  (UPat(UOps.ALU, UnaryOps.SIN, src=(UPat(name="x"),UPat(name="y"))), sin),
+  (UPat(UOps.ALU, UnaryOps.EXP2, dtype=not_half, src=(UPat(name="x"),)), exp2),
+  (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="x"),)), log2),
+  (UPat(UOps.ALU, UnaryOps.SQRT, dtype=not_half, src=(UPat(name="x"),)), sqrt),
+  (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"),UPat(name="y"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
   (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
+  *[(UPat(UOps.ALU, op, dtype=dtypes.half, name="x"),
+     lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half)))
+    for op in half_not_supported],
+  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dt for dt in ints if dt.itemsize <= 4}, src=(UPat(name="x"))),
+   lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))),
 ])
 
 @dataclass
@@ -197,10 +207,6 @@ def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0
 def lop_inst(d, s, dt, code):
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
   return Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"]) if dt is dtypes.bool else Instruction("LOP3", d, [*srcs, code, "!PT"])
-
-ints, floats = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
-usig = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt))
-numeric = ints | floats
 
 inst_for_cast = (
 )
@@ -491,7 +497,8 @@ class SASSRenderer(Renderer):
     return ssa_src if getenv("SSA") else sass_src
 
 def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
-  def alloc(size): return next((i for i in range(reg_type == "P", 255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
+  def alloc(size):
+    return next((i for i in range(reg_type == "P", 255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
   locs, all_reg = defaultdict(list), set()
   for i,r in enumerate([src for inst in kernel for src in [*inst.srcs, inst.dest]]):
     if isinstance(r, Register) and r.idx >= 0 and r.type == reg_type:
