@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Sequence, Union, Optional, cast, Callable
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.compiler_cuda import SASSCompiler
-from tinygrad.helpers import getenv, all_same, flatten, to_function_name
+from tinygrad.helpers import getenv, all_same, flatten, data64_le, to_function_name
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, ConstType
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
@@ -285,7 +285,7 @@ class SASSRenderer(Renderer):
       srcs = [src.offset(i) if i < src.size - src.idx % src.size else "RZ" for i in range(nregs(dtype.itemsize))]
     else:
       val = int(render_binary(float(src), dtype) if not re.match(f"-?0x", src) else src, 16)
-      srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else [val & 0xffffffff, val >> 32])]
+      srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else data64_le(val))]
     return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
 
   def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]: # TODO: refactor
@@ -423,7 +423,7 @@ class SASSRenderer(Renderer):
           elif dtypes.is_int(dtype):
             if dtype.itemsize > 4:
               vals[u] = dest = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
-              if not dtypes.is_unsigned(dtype):
+              if not dtypes.is_unsigned(vin[0].dtype):
                 queue(Instruction("SHF", dest.offset(1), ["RZ", "0x1f", dest], mods=["R", "HI", "S32"]))
             else:
               vals[u] = vals[vin[0]]
@@ -528,8 +528,18 @@ class SASSRenderer(Renderer):
 def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
   def alloc(size):
     return next((i for i in range(reg_type == "P", 7 if reg_type == "P" else 255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
+  unrolled, loops = [], {}
+  for inst in kernel:
+    if inst.label and "LOOP" in inst.op:
+      loops[inst.op] = []
+    unrolled.append(inst)
+    for v in loops.values(): v.append(inst)
+    if inst.srcs and isinstance(inst.srcs[0], str) and (label := next((k for k in loops.keys() if k in inst.srcs[0]), None)):
+      loop_inst = loops.pop(label)
+      unrolled.extend(loop_inst)
+      for v in loops.values(): v.extend(loop_inst)
   locs, all_reg = defaultdict(list), set()
-  for i,r in enumerate([src for inst in kernel for src in [inst.pred, *inst.srcs, inst.dest]]):
+  for i,r in enumerate([src for inst in unrolled for src in [inst.pred, *inst.srcs, inst.dest]]):
     if isinstance(r, Register) and r.idx >= 0 and r.type == reg_type:
       locs[r.base().idx, r.size].append(i)
       all_reg.add(r)
