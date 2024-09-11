@@ -144,10 +144,14 @@ sass_matcher = PatternMatcher([
   # (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}, # TODO: fuse cast into load when possible
   #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
-  (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
+  (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))), # TODO: remove
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   (UPat(UOps.CAST, name="root", dtype={dtypes.double, dtypes.half}, src=(UPat(name="x", dtype={dtypes.double, dtypes.half}))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.float),))),
+  (UPat(UOps.CAST, name="root", dtype={dtypes.double, dtypes.float, dtypes.half}, src=(UPat(name="x", dtype={dtypes.char, dtypes.uchar}))),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.short),))),
+  (UPat(UOps.CAST, name="root", dtype={dt for dt in ints if dt.itemsize < 4}, src=(UPat(name="x", dtype={dtypes.double, dtypes.float}))), # from nvcc
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.uint if dtypes.is_unsigned(root.dtype) else dtypes.int),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
@@ -415,10 +419,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.CAST:
         if dtypes.is_int(vin[0].dtype):
           if dtypes.is_float(dtype):
-            vals[u] = queue(ins := Instruction("I2F", new_reg(dtype.itemsize), [vals[vin[0]]]))
-            if vin[0].dtype is not dtypes.char: ins.mods.extend(dtype_mods(vin[0].dtype))
-            elif dtype is dtypes.float: ins.mods.extend(["S16"]) # NOTE: special case to match nvcc
-            if dtype is dtypes.half: ins.mods.extend(["F16"])
+            vals[u] = queue(Instruction("I2F", new_reg(dtype.itemsize), [vals[vin[0]]], mods=[] + dtype_mods(vin[0].dtype) + dtype_mods(dtype)))
           elif dtypes.is_int(dtype):
             if dtype.itemsize > 4:
               vals[u] = dest = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
@@ -428,16 +429,14 @@ class SASSRenderer(Renderer):
               vals[u] = vals[vin[0]]
           elif dtype is dtypes.bool:
             vals[u] = queue(ins := Instruction(f"ISETP", dest := new_reg(prefix="P"), ["PT", src := to_reg(vin[0]), "RZ", "PT"], mods=["NE", "AND"]))
-            if vin[0].dtype is dtypes.long:
-              ins.mods.extend(["U32"])
-              vals[u] = queue(Instruction(f"ISETP", dest, ["PT", src.offset(1), "RZ", "PT", dest], mods=["NE", "AND", "EX"]))
+            if dtypes.is_unsigned(vin[0].dtype) or vin[0].dtype.itemsize > 4: ins.mods.extend(["U32"])
+            if vin[0].dtype.itemsize > 4:
+              vals[u] = queue(ins := Instruction(f"ISETP", dest, ["PT", src.offset(1), "RZ", "PT", dest], mods=["NE", "AND", "EX"]))
+              if dtypes.is_unsigned(vin[0].dtype): ins.mods.extend(["U32"])
         elif dtypes.is_float(vin[0].dtype):
           if dtypes.is_int(dtype):
-            vals[u] = queue(ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["TRUNC"]))
-            if dtype.itemsize <= 4: ins.mods.extend(["NTZ"])
-            if vin[0].dtype.itemsize != 4 or dtype.itemsize > 4: ins.mods.extend(dtype_mods(dtype)) # NOTE: special case to match nvcc
-            elif dtypes.is_unsigned(dtype): ins.mods.extend(["U32"]) # NOTE: special case to match nvcc
-            if vin[0].dtype is dtypes.half: ins.mods.extend(["F16"])
+            vals[u] = queue(ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["TRUNC"] + dtype_mods(vin[0].dtype) + dtype_mods(dtype)))
+            if dtype.itemsize <= 4 and vin[0].dtype.itemsize <= 4: ins.mods.extend(["NTZ"])
           elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
             vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", to_reg(vin[0])], mods=["F16", "F32", "PACK_AB"]))
           elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
