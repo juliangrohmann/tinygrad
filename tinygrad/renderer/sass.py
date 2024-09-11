@@ -442,16 +442,15 @@ class SASSRenderer(Renderer):
             vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", to_reg(vin[0])], mods=["F16", "F32", "PACK_AB"]))
           elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
             vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=["F32"]))
-          elif (vin[0].dtype is dtypes.double or dtype is dtypes.double) and dtypes.half not in [vin[0].dtype, dtype]:
+          elif (vin[0].dtype is dtypes.double or dtype is dtypes.double) and dtypes.is_float(dtype) and dtypes.half not in [vin[0].dtype, dtype]:
             vals[u] = queue(Instruction("F2F", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=[f"F{dtype.itemsize*8}"]))
           elif dtype is dtypes.bool:
             if vin[0].dtype is dtypes.half:
               vals[u] = queue(Instruction(f"LOP3", new_reg(prefix="P"), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", lop_code(lambda a, b, c: a & b), "!PT"], mods=["LUT"]))
             else:
-              vals[u] = queue(Instruction(f"FSETP", new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
+              vals[u] = queue(Instruction(dtype_op("SETP", vin[0].dtype), new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
           else:
             raise NotImplementedError
-            # vals[u] = "0x0"
         elif vin[0].dtype is dtypes.bool:
           vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype, u))
         else:
