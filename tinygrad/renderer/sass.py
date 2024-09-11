@@ -146,6 +146,7 @@ sass_matcher = PatternMatcher([
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
   (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
    lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
+  (UPat(UOps.CAST, dtype=dtypes.double, src=(UPat(name="x", dtype=dtypes.half))), lambda x: x.cast(dtypes.float).cast(dtypes.double)),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
@@ -252,8 +253,9 @@ inst_for_op: Dict[Op, Callable] = {
   BinaryOps.AND: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a&b if len(s) == 2 else a&b&c)), # TODO: treat lops separately for arbitrary ternary fusion
   BinaryOps.OR: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a|b if len(s) == 2 else a|b|c)),
   BinaryOps.XOR: lambda d,s,dt,u: lop_inst(d, s, dt, lop_code(lambda a,b,c: a^b if len(s) == 2 else a^b^c)),
-  BinaryOps.ADD: lambda d,s,dt,u: Instruction("IADD3" if dt in ints else dtype_op("ADD", dt), d, fill(s, 3, dt) if dt in ints else s)
+  BinaryOps.ADD: lambda d,s,dt,u: Instruction(dtype_op("ADD", dt) + ['', '3'][dt in ints], d, fill(s, 3, dt) if dt in ints else s)
 }
+
 
 class SASSRenderer(Renderer):
   device = "CUDA"
@@ -417,7 +419,7 @@ class SASSRenderer(Renderer):
             if dtype is dtypes.half: ins.mods.extend(["F16"])
           elif dtypes.is_int(dtype):
             if dtype.itemsize > 4:
-              vals[u] = dest = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], vin[0].dtype))
+              vals[u] = dest = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
               if not dtypes.is_unsigned(dtype):
                 queue(Instruction("SHF", dest.offset(1), ["RZ", "0x1f", dest], mods=["R", "HI", "S32"]))
             else:
@@ -435,14 +437,18 @@ class SASSRenderer(Renderer):
             elif dtypes.is_unsigned(dtype): ins.mods.extend(["U32"]) # NOTE: special case to match nvcc
             if vin[0].dtype is dtypes.half: ins.mods.extend(["F16"])
           elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
-            vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", vals[vin[0]]], mods=["F16", "F32", "PACK_AB"]))
+            vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", to_reg(vin[0])], mods=["F16", "F32", "PACK_AB"]))
           elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
-            vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0], mod="H0_H0")], mods=["F32"]))
+            vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=["F32"]))
+          elif vin[0].dtype is dtypes.float and dtype is dtypes.double:
+            vals[u] = queue(Instruction("F2F", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["F64", "F32"]))
           elif dtype is dtypes.bool:
             if vin[0].dtype is dtypes.half:
               vals[u] = queue(Instruction(f"LOP3", new_reg(prefix="P"), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", lop_code(lambda a, b, c: a & b), "!PT"], mods=["LUT"]))
             else:
               vals[u] = queue(Instruction(f"FSETP", new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
+          else:
+            raise NotImplementedError
         elif vin[0].dtype is dtypes.bool:
           vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype, u))
         else:
@@ -466,7 +472,7 @@ class SASSRenderer(Renderer):
           vals[u] = vals[vin[0]]
           for v in vin: vals[v].size = nregs(dtype.itemsize)
       elif op is UOps.GEP:
-        vals[u] = to_reg(vin[0]).offset(arg)
+        vals[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg)//4), mod='_'.join([f"H{int(b % 4 != 0)}"]*2) if dtype.itemsize < 4 else "")
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
         if arg in inst_for_op:
@@ -475,7 +481,7 @@ class SASSRenderer(Renderer):
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
         else:
-          vals[u] = "0x0"
+          raise NotImplementedError
       else:
         raise NotImplementedError
 
@@ -539,7 +545,7 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
       reg.idx = repl[bidx] + reg.idx - bidx
   return max([r.base().idx + r.size for r in all_reg] + [0])
 
-write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "DSETP", "DADD", "DMUL", "DSETP"} # TODO: I2F is only variable latency for double width
+write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2F", "DSETP", "DADD", "DMUL", "DSETP"} # TODO: I2F, F2F are only variable latency for double width
 read_latency_ops = {"MUFU", "DSETP"}
 
 def set_ctrl(kernel):
