@@ -22,7 +22,7 @@ class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritiz
   SET_BITS = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
-inf, nan, inf_ext, nan_ext = 0x7f800000, 2**31-1, 0x7ff0000000000000, 2**64-1
+inf, nan, inf_ext, nan_ext, exp_double = 0x7f800000, 2**31-1, 0x7ff0000000000000, 2**64-1, 0x7ff0000000000000
 
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
@@ -77,14 +77,10 @@ def recip_double(x:UOp) -> UOp:
   return it*(-x*it + 1) + it
 
 def idiv(x:UOp, y:UOp) -> UOp:
-  if sig := not dtypes.is_unsigned(x.dtype):
-    neg_x, neg_y = x.lt(x.const(0)), y.lt(y.const(0))
-    x, y = neg_x.where(-x, x), neg_y.where(-y, y)
-  rng = UOp(UOps.RANGE, dtypes.long, (UOp.const(dtypes.long, x.dtype.itemsize*8 - 1 - sig), UOp.const(dtypes.long, -1), UOp.const(dtypes.long, -1)), arg=(0, True))
-  ret = UOp(UOps.DEFINE_ACC, x.dtype, (x.const(0), rng))
-  val = UOp(UOps.ALU, x.dtype, (x, rng), BinaryOps.SHR)
-  phi_ret = UOp(UOps.PHI, ret.dtype, (ret, (val - y*ret*2).lt(y).where(ret * 2, ret*2 + 1)))
-  return (neg_x ^ neg_y).where(-phi_ret, phi_ret) if sig else phi_ret
+  bits = (x.cast(dtypes.double) / y.cast(dtypes.double)).cast(dtypes.double).bitcast(dtypes.ulong)
+  exp = (bits & exp_double).alu(BinaryOps.SHR, bits.const(52)) - (2**10 - 1)
+  mask = bits.const(1).alu(BinaryOps.SHL, -exp + 52) - 1
+  return exp.lt(0).where(x.const(0), bits.alu(SASSOps.SET_BITS, bits.const(0), mask).bitcast(dtypes.double).cast(x.dtype))
 
 def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
@@ -104,6 +100,11 @@ def shf_long(root:UOp, x:UOp, y:UOp):
   ext = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (x, y), SASSOps.SHR_HI if root.arg == BinaryOps.SHR else SASSOps.SHL_HI)
   base = UOp(UOps.ALU, ext_to_word_dt[x.dtype], (ext_to_vec(x).gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), root.arg if root.arg is BinaryOps.SHL else SASSOps.SHR_LO)
   return UOp(UOps.VECTORIZE, base.dtype.vec(2), (base, ext)).bitcast(x.dtype)
+
+def set_bits_long(x:UOp, y:UOp, z:UOp):
+  xv, yv, zv = ext_to_vec(x), ext_to_vec(y), ext_to_vec(z)
+  ret_lo, ret_hi = [xv.gep(i).alu(SASSOps.SET_BITS, yv.gep(i), zv.gep(i)) for i in range(2)]
+  return UOp(UOps.VECTORIZE, xv.dtype, (ret_lo, ret_hi)).bitcast(x.dtype)
 
 def bitwise_long(root:UOp, x:UOp, y:UOp):
   xv, yv = ext_to_vec(x), ext_to_vec(y)
@@ -154,10 +155,11 @@ sass_matcher = PatternMatcher([
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.uint if dtypes.is_unsigned(root.dtype) else dtypes.int),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
-  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
-  (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), add_long),
-  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
-  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), shf_long),
+  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), mul_long),
+  (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), add_long),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), shf_long),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), shf_long),
+  (UPat(UOps.ALU, arg=SASSOps.SET_BITS, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))), set_bits_long),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
   (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
    lambda x,y,z: (x & y) | (x.ne(True) & z)),
