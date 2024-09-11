@@ -145,8 +145,9 @@ sass_matcher = PatternMatcher([
   #     src=(UPat(UOps.LOAD, name="x", dtype={dt for dt in dtypes.fields().values() if dtypes.is_int(dt)}))),
   #  lambda root, x: UOp(x.op, root.dtype, x.src, x.arg)),
   (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
-   lambda root, x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
-  (UPat(UOps.CAST, dtype=dtypes.double, src=(UPat(name="x", dtype=dtypes.half))), lambda x: x.cast(dtypes.float).cast(dtypes.double)),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
+  (UPat(UOps.CAST, name="root", dtype={dtypes.double, dtypes.half}, src=(UPat(name="x", dtype={dtypes.double, dtypes.half}))),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.float),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"), UPat(name="y"))), mul_long),
@@ -440,8 +441,8 @@ class SASSRenderer(Renderer):
             vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", to_reg(vin[0])], mods=["F16", "F32", "PACK_AB"]))
           elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
             vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=["F32"]))
-          elif vin[0].dtype is dtypes.float and dtype is dtypes.double:
-            vals[u] = queue(Instruction("F2F", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["F64", "F32"]))
+          elif (vin[0].dtype is dtypes.double or dtype is dtypes.double) and dtypes.half not in [vin[0].dtype, dtype]:
+            vals[u] = queue(Instruction("F2F", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=[f"F{dtype.itemsize*8}"]))
           elif dtype is dtypes.bool:
             if vin[0].dtype is dtypes.half:
               vals[u] = queue(Instruction(f"LOP3", new_reg(prefix="P"), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", lop_code(lambda a, b, c: a & b), "!PT"], mods=["LUT"]))
@@ -449,6 +450,7 @@ class SASSRenderer(Renderer):
               vals[u] = queue(Instruction(f"FSETP", new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
           else:
             raise NotImplementedError
+            # vals[u] = "0x0"
         elif vin[0].dtype is dtypes.bool:
           vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype, u))
         else:
