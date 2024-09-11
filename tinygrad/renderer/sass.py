@@ -529,9 +529,9 @@ class SASSRenderer(Renderer):
 
 def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
   def alloc(size):
-    return next((i for i in range(reg_type == "P", 255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
+    return next((i for i in range(reg_type == "P", 7 if reg_type == "P" else 255) if i % size == 0 and all(i + j not in allocated for j in range(size))), None)
   locs, all_reg = defaultdict(list), set()
-  for i,r in enumerate([src for inst in kernel for src in [*inst.srcs, inst.dest]]):
+  for i,r in enumerate([src for inst in kernel for src in [inst.pred, *inst.srcs, inst.dest]]):
     if isinstance(r, Register) and r.idx >= 0 and r.type == reg_type:
       locs[r.base().idx, r.size].append(i)
       all_reg.add(r)
