@@ -221,6 +221,7 @@ def render_value(x, dtype, allow_reg=False):
 
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
+def is_aligned(src:Register, dtype): return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype, allow_reg=True) for i in range(count)]
 def dtype_op(op, dt): return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.half else '')
 def nregs(byte_size): return (byte_size + 3) // 4
@@ -466,7 +467,7 @@ class SASSRenderer(Renderer):
             if vin[0].dtype.itemsize == 1:
               vals[u] = dest = new_reg(len(vin))
               queue(flatten([render_permute(dest.offset(i), dest.offset(0), dest.offset(1), 1) for i in range(dest.size)]))
-        elif not all(isinstance(vals[v], Register) for v in vin) or not is_contiguous([vals[v] for v in vin]):
+        elif not all(isinstance(vals[v], Register) for v in vin) or not is_contiguous([vals[v] for v in vin]) or not is_aligned(vals[vin[0]], dtype):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
           queue([inst for i,s in enumerate([vals[v] for v in vin]) for inst in self.render_mov(dest.offset(i*n), s, vin[0].dtype)])
@@ -547,7 +548,7 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
       reg.idx = repl[bidx] + reg.idx - bidx
   return max([r.base().idx + r.size for r in all_reg] + [0])
 
-write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2F", "DSETP", "DADD", "DMUL", "DSETP"} # TODO: I2F, F2F are only variable latency for double width
+write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "DSETP"} # TODO: I2F, F2I, F2F are only variable latency for double width
 read_latency_ops = {"MUFU", "DSETP"}
 
 def set_ctrl(kernel):
