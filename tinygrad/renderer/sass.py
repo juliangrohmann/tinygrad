@@ -8,7 +8,7 @@ from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.compiler_cuda import SASSCompiler
 from tinygrad.helpers import getenv, all_same, flatten, data64_le, to_function_name
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
-from tinygrad.dtype import dtypes, DType, ConstType, to_dtype
+from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
@@ -23,11 +23,6 @@ class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritiz
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
 inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
-
-def render_binary(x, dtype): # TODO: simplify
-  x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
-  overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
-  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", dtypes.as_const(x, dtype)))}"
 
 def int_like(dt:DType): return dt if dtypes.is_int(dt) else {dtypes.double:dtypes.long, dtypes.float:dtypes.int, dtypes.half:dtypes.short}[dt]
 def is_nan(x:UOp): return -x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}")).lt(inf[x.dtype.itemsize] + 1)
@@ -219,6 +214,11 @@ class Instruction:
     ins = f"{f'@{self.pred.render()} ' if self.pred else ''}{self.op}{''.join([f'.{m}' for m in self.mods])} {operands}"
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
+def render_binary(x, dtype): # TODO: simplify
+  x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
+  overrides = {dtypes.long: 'q', dtypes.ulong: 'Q'}
+  return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", dtypes.as_const(x, dtype)))}"
+
 def render_value(x, dtype, allow_reg=False):
   if dtype is dtypes.bool: return "PT" if x else "!PT"
   elif x == 0 and allow_reg: return "RZ"
@@ -232,6 +232,25 @@ def render_mov(dest:Register, src:Union[Register,str], dtype:DType, pred:Optiona
     val = int(render_binary(float(src), dtype) if not re.match(f"-?0x", src) else src, 16)
     srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else data64_le(val))]
   return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
+
+def render_cmp(arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]: # TODO: refactor
+  if dtypes.is_int(dtype) or dtypes.is_float(dtype):
+    ret = []
+    op = dtype_op("SETP", dtype)
+    ret.append(ins := Instruction(op, dest, ["PT", src_l, src_r, "PT"], mods=["AND"]))
+    ins.mods.append(cmp_op := (("NEU" if dtypes.is_float(dtype) else "NE") if arg is BinaryOps.CMPNE else "LT"))
+    if dtypes.is_unsigned(dtype) or dtype in [dtypes.long, dtypes.ulong]:
+      ins.mods.append("U32")
+    if dtype in [dtypes.long, dtypes.ulong]:
+      ret.append(ins := Instruction(op, dest, ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[cmp_op, "AND", "EX"]))
+      if dtypes.is_unsigned(dtype): ins.mods.append("U32")
+    return ret
+  else:
+    func = (lambda a,b,c: (a^b)&c) if arg == BinaryOps.CMPNE else lambda a,b,c: (~a)&b&c
+    return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop_code(func), "0x0"], mods=["LUT"])]
+
+def render_iter(label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
+  return [*render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), Instruction("BRA", None, [f"`({label})"], pred=pred)]
 
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
@@ -255,7 +274,7 @@ inst_for_alu: Dict[Op, Callable] = {
   SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else "FMA", d, s),
   SASSOps.IMAD_HI: lambda d, s, dt, u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
-  SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u.src[0].dtype in usig else [])),
+  SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u and u.src[0].dtype in usig else [])),
   SASSOps.DMAX: lambda d,s,dt,u: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
   SASSOps.SHR_LO: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64"]),
   SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
@@ -304,28 +323,6 @@ class SASSRenderer(Renderer):
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
   setp_mod = {BinaryOps.CMPLT: "LT", BinaryOps.CMPNE: "NEU"}
 
-  def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]: # TODO: refactor
-    if dtypes.is_int(dtype) or dtypes.is_float(dtype):
-      ret = []
-      op = dtype_op("SETP", dtype)
-      ret.append(ins := Instruction(op, dest, ["PT", src_l, src_r, "PT"], mods=["AND"]))
-      ins.mods.append(cmp_op := (("NEU" if dtypes.is_float(dtype) else "NE") if arg is BinaryOps.CMPNE else "LT"))
-      if dtypes.is_unsigned(dtype) or dtype in [dtypes.long, dtypes.ulong]:
-        ins.mods.append("U32")
-      if dtype in [dtypes.long, dtypes.ulong]:
-        ret.append(ins := Instruction(op, dest.offset(1), ["PT", src_l.offset(1), src_r.offset(1), "PT", dest], mods=[cmp_op, "AND", "EX"]))
-        if dtypes.is_unsigned(dtype): ins.mods.append("U32")
-      return ret
-    else:
-      func = (lambda a,b,c: (a^b)&c) if arg == BinaryOps.CMPNE else lambda a,b,c: (~a)&b&c
-      return [Instruction("PLOP3", dest, ["PT", src_l, src_r, "PT"] + [lop_code(func), "0x0"], mods=["LUT"])]
-
-  def render_iter(self, label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
-    return [*self.render_cmp(BinaryOps.CMPNE, pred, counter, end, dtype), *self.render_bra(label, pred)]
-
-  def render_bra(self, label:str, pred:Register) -> List[Instruction]:
-    return [Instruction("BRA", None, [f"`({label})"], pred=pred)]
-  
   def render(self, name:str, uops:List[UOp]) -> str:
     if getenv("GRAPHUOPS"): # TODO: remove
       graph_uops(uops)
@@ -334,53 +331,52 @@ class SASSRenderer(Renderer):
 
     attr:Dict[str, int] = {"PARAM_COUNT": 0}
     kernel:List[Instruction] = []
-    vals:Dict[Any, Union[Register,str]] = {}
     iter_stack = []
 
-    reg_cnt = defaultdict(int)
-    def new_reg(byte_size:int=4, prefix:str="R", **kwargs) -> Register:
-      n = nregs(byte_size) if prefix == "R" else 1
-      idx = n * ((reg_cnt[prefix] + n - 1) // n) # ceil
-      reg_cnt[prefix] = idx + n
-      return Register(idx, size=n, type=prefix, **kwargs)
+    c = defaultdict(int)
+    r:Dict[Any, Union[Register,str]] = {}
+    def ssa(uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None) -> Register:
+      n = nregs(byte_size or (8 if isinstance(uop.dtype, PtrDType) else uop.dtype.itemsize))
+      idx = n * ((c[p := prefix or ("P" if uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
+      c[p] = idx + n
+      ret = Register(idx, size=n, type=p)
+      if uop: r[uop] = ret
+      return ret
 
-    def unity() -> Register:
-      if not 1 in vals: vals[1] = queue(render_mov(new_reg(), "0x1", dtypes.int))
-      return vals[1]
-
-    def queue(instrs:Union[List[Instruction], Instruction]) -> Register:
+    def kk(instrs:Union[List[Instruction], Instruction]) -> Register:
       kernel.extend(instrs := [instrs] if not isinstance(instrs, list) else instrs)
       return next((ins.dest for ins in instrs[::-1] if ins.dest and ins.dest.idx % ins.dest.size == 0), instrs[-1].dest)
 
     def to_var(uop:UOp) -> Union[Register, str]:
-      return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop)
+      return var if isinstance(var := r[uop], Register) or "P" in var else to_reg(uop)
 
-    def to_reg(uop:UOp, **kwargs) -> Register:
-      if isinstance(var := vals[uop], Register): # TODO: replace with better graph rewrite rules
-        return queue(inst_for_alu[TernaryOps.WHERE](new_reg(), [var.negate(), vals[0], "0x1"], dtypes.int, uop)) if var.type == "P" else var
-      vals[uop] = dest = queue(render_mov(new_reg(uop.dtype.itemsize, **kwargs), var, uop.dtype))
-      return dest
+    def to_reg(uop:UOp) -> Register:
+      if isinstance(var := r[uop], Register): # TODO: replace with better graph rewrite rules
+        return kk(inst_for_alu[TernaryOps.WHERE](ssa(None, byte_size=4, prefix="R"), [var.negate(), r[0], "0x1"], dtypes.int, uop)) if var.type == "P" else var
+      return kk(render_mov(ssa(uop), var, uop.dtype))
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
       if idx.op is UOps.CONST: # TODO: move all of this to pattern matcher?
-        if not isinstance(g_addr := vals[glob], Register):
-          vals[glob] = g_addr = new_reg(8)
-          queue([Instruction("IMAD", g_addr.offset(i), ["RZ", "RZ", const_addr(glob, offset=i*4)], mods=["U32"]) for i in range(2)])
+        if not isinstance(g_addr := r[glob], Register):
+          g_addr = ssa(glob)
+          kk([Instruction("IMAD", g_addr.offset(i), ["RZ", "RZ", const_addr(glob, offset=i*4)], mods=["U32"]) for i in range(2)])
         dest = replace(g_addr, postfix=f"+{hex(idx.arg * glob.dtype.itemsize)}" if idx.arg != 0 else "")
       else:
-        if glob.dtype.itemsize not in vals:
-          vals[glob.dtype.itemsize] = queue(render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
-        dest = queue(Instruction("IMAD", new_reg(byte_size=8), ["PT"] + [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=["WIDE"], pred=pred)) # TODO: PT = hack, need better isa fuzzing
-      return replace(dest, mem_type=f"desc[{vals['DESC'].render()}]", mod="64") # explicit memory descriptor
+        if glob.dtype.itemsize not in r:
+          r[glob.dtype.itemsize] = kk(render_mov(ssa(None, byte_size=4, prefix="R"), hex(glob.dtype.itemsize), dtypes.uint))
+        dest = ssa(None, byte_size=8, prefix="R")
+        kk(ins := inst_for_alu[SASSOps.WIDE](dest, [r[v] for v in [idx, glob.dtype.itemsize, glob]], dtypes.long, None))
+        ins.pred=pred
+      return replace(dest, mem_type=f"desc[{r['DESC'].render()}]", mod="64") # explicit memory descriptor
 
     def memory_mods(dtype:DType):
       return [f"{'' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
 
-    queue(Instruction(f".text.{name}", None, [], label=True))
-    vals[0] = Register(-1)
-    vals[float("inf")] = "INF"
-    vals[-float("inf")] = "-INF"
-    vals["DESC"] = queue(Instruction("ULDC", Register(idx=4, type="UR"), ["c[0x0][0x118]"], mods=["64"])) # load explicit memory descriptor
+    kk(Instruction(f".text.{name}", None, [], label=True))
+    r[0] = Register(-1)
+    r[float("inf")] = "INF"
+    r[-float("inf")] = "-INF"
+    r["DESC"] = kk(Instruction("ULDC", Register(idx=4, type="UR"), ["c[0x0][0x118]"], mods=["64"])) # load explicit memory descriptor
 
     for u in uops:
       op, dtype, vin, arg = u.op, u.dtype, u.src, u.arg
@@ -389,85 +385,79 @@ class SASSRenderer(Renderer):
         for v in vin:
           print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
       if op is UOps.SPECIAL:
-        vals[u] = queue(Instruction("S2R", new_reg(), [(self.tid if (tid := arg[0][:3] == "lid") else self.gid)[dim := int(arg[0][-1])]]))
+        kk(Instruction("S2R", ssa(u), [(self.tid if (tid := arg[0][:3] == "lid") else self.gid)[dim := int(arg[0][-1])]]))
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
-        val = render_value(arg, dtype)
-        vals[u] = (vals[arg] if arg in vals else val) if dtype.itemsize <= 4 else queue(render_mov(new_reg(dtype.itemsize), val, dtype))
+        if dtype.itemsize <= 4: r[u] = r[arg] if arg in r else render_value(arg, dtype)
+        else: kk(render_mov(ssa(u), render_value(arg, dtype), dtype))
       elif op is UOps.DEFINE_GLOBAL:
-        vals[u] = const_addr(u)
+        r[u] = const_addr(u)
         attr["PARAM_COUNT"] += 1
       elif op is UOps.DEFINE_ACC:
-        vals[u] = queue(render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
+        kk(render_mov(ssa(u), r[vin[0]], dtype))
       elif op is UOps.RANGE:
-        vals[u] = queue(render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
-        queue(Instruction(label := new_reg(prefix=".LOOP_").render(), None, [], label=True))
-        update = inst_for_alu[BinaryOps.ADD](vals[u], [vals[u], unity() if len(vin) < 3 else to_reg(vin[2])], dtype, u)
-        branch = self.render_iter(label, new_reg(prefix="P"), vals[u], to_reg(vin[1]), dtype)
+        kk(render_mov(ssa(u), r[vin[0]], dtype))
+        kk(Instruction(label := ssa(None, byte_size=4, prefix=".LOOP_").render(), None, [], label=True))
+        update = inst_for_alu[BinaryOps.ADD](r[u], [r[u], "0x1" if len(vin) < 3 else to_reg(vin[2])], dtype, u)
+        branch = render_iter(label, ssa(None, byte_size=4, prefix="P"), r[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
-        vals[u] = queue(render_mov(vals[vin[0]], vals[vin[1]], dtype))
+        r[u] = kk(render_mov(r[vin[0]], r[vin[1]], dtype))
       elif op is UOps.ENDRANGE:
-        queue(iter_stack.pop(-1))
+        kk(iter_stack.pop(-1))
       elif op is UOps.LOAD:
         if vin[0].op is UOps.DEFINE_GLOBAL:
-          pred = vals[vin[3]] if len(vin) > 3 else None
-          vals[u] = queue(ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"], pred=pred))
-          ins.mods.extend(memory_mods(dtype))
-          if pred: queue(render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
+          pred = r[vin[3]] if len(vin) > 3 else None
+          kk(Instruction("LDG", ssa(u), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"] + memory_mods(dtype), pred=pred))
+          if pred: kk(render_mov(r[u], r[vin[2]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
       elif op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_GLOBAL:
-          queue(ins := Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=["E"]))
-          ins.mods.extend(memory_mods(vin[2].dtype))
+          kk(Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=["E"] + memory_mods(vin[2].dtype)))
         else:
           raise NotImplementedError
       elif op is UOps.CAST:
         for dti,dto,func in inst_for_cast:
           if vin[0].dtype in dti and dtype in dto:
-            vals[u] = queue(func(new_reg(dtype.itemsize, prefix="P" if dtype is dtypes.bool else "R"), to_var(vin[0]), vin[0].dtype, dtype))
+            kk(func(ssa(u), to_var(vin[0]), vin[0].dtype, dtype))
             break
-        else:
-          vals[u] = vals[vin[0]]
+        else: r[u] = r[vin[0]]
       elif op is UOps.BITCAST:
         assert vin[0].dtype.itemsize == dtype.itemsize, f"bitcast from {vin[0].dtype} to {dtype}: itemsize mismatch"
-        vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
+        r[u] = f"0f{v[2:]}" if isinstance(v := r[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
       elif op is UOps.VECTORIZE:
         if vin[0].dtype is dtypes.half:
           assert len(vin) % 2 == 0, f"cannot vectorize {len(vin)} {vin[0].dtype} to {dtype}"
-          dest, srcs = new_reg(dtype.itemsize), [to_reg(v) for v in vin]
-          vals[u] = queue([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
-        elif not all(isinstance(vals[v], Register) for v in vin) or not is_contiguous([vals[v] for v in vin]) or not is_aligned(vals[vin[0]], dtype):
-          vals[u] = dest = new_reg(dtype.itemsize)
-          n = nregs(vin[0].dtype.itemsize)
-          queue([inst for i,s in enumerate([vals[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
+          dest, srcs = ssa(u), [to_reg(v) for v in vin]
+          kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
+        elif not all(isinstance(r[v], Register) for v in vin) or not is_contiguous([r[v] for v in vin]) or not is_aligned(r[vin[0]], dtype):
+          dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
+          kk([inst for i,s in enumerate([r[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
         else:
-          vals[u] = vals[vin[0]]
-          for v in vin: vals[v].size = nregs(dtype.itemsize)
+          r[u] = r[vin[0]]
+          for v in vin: r[v].size = nregs(dtype.itemsize)
       elif op is UOps.GEP:
-        vals[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg)//4), mod='_'.join([f"H{int(b % 4 != 0)}"]*2) if dtype.itemsize < 4 else "")
+        r[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg)//4), mod='_'.join([f"H{int(b % 4 != 0)}"]*2) if dtype.itemsize < 4 else "")
       elif op is UOps.ALU:
-        srcs = [vals[v] for v in vin]
         if arg in inst_for_alu:
-          vals[u] = queue(inst_for_alu[arg](new_reg(dtype.itemsize, prefix="P" if dtype is dtypes.bool else "R"), [to_var(v) for v in vin], dtype, u))
+          kk(inst_for_alu[arg](ssa(u), [to_var(v) for v in vin], dtype, u))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
-          assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
-          vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
+          kk(render_cmp(arg, ssa(u), *[to_var(v) for v in vin], vin[0].dtype))
         else:
           raise NotImplementedError
       else:
         raise NotImplementedError
 
-    queue(Instruction("EXIT", None, []))
-    queue(Instruction(buf_lab := ".L_BUF", None, [], label=True))
-    queue(Instruction("BRA", None, [f"`({buf_lab})"]))
-    for _ in range(10): queue(Instruction("NOP", None, [])) # TODO: pad to multiple of 8
-    queue(Instruction(".L_END", None, [], label=True))
+    kk(Instruction("EXIT", None, []))
+    kk(Instruction(buf_lab := ".L_BUF", None, [], label=True))
+    kk(Instruction("BRA", None, [f"`({buf_lab})"]))
+    for _ in range(10): kk(Instruction("NOP", None, [])) # TODO: pad to multiple of 8
+    kk(Instruction(".L_END", None, [], label=True))
 
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = i*16
     set_ctrl(kernel)
-    attr["SHI_REGISTERS"] = reg_cnt["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    attr["SHI_REGISTERS"] = c["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel) # debug TODO: remove
 
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
