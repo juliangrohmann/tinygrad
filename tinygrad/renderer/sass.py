@@ -3,7 +3,7 @@ from enum import Enum, auto
 from dataclasses import dataclass, field, asdict, replace
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Sequence, Union, Optional, cast, Callable
+from typing import Any, DefaultDict, Dict, List, Tuple, Set, Sequence, Union, Optional, cast, Callable
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.compiler_cuda import SASSCompiler
 from tinygrad.helpers import getenv, all_same, flatten, data64_le, to_function_name
@@ -116,7 +116,7 @@ r_shift = set([1/i for i in range(2, 64)])
 half_not_supported = [UnaryOps.RECIP, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN, UnaryOps.SQRT]
 not_half = {dt for dt in dtypes.fields().values() if dt is not dtypes.half}
 ints, floats = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
-usig = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt))
+usig, longs = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt)), set([dtypes.long, dtypes.ulong])
 numeric = ints | floats
 
 sass_matcher = PatternMatcher([
@@ -225,11 +225,20 @@ def render_value(x, dtype, allow_reg=False):
   elif dtypes.is_float(dtype): return str(x).upper()
   else: return render_binary(x, dtype)
 
+def render_mov(dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None) -> Instruction:
+  if isinstance(src, Register):
+    srcs = [src.offset(i) if i < src.size - src.idx % src.size else "RZ" for i in range(nregs(dtype.itemsize))]
+  else:
+    val = int(render_binary(float(src), dtype) if not re.match(f"-?0x", src) else src, 16)
+    srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else data64_le(val))]
+  return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
+
 def const_addr(uop:UOp, offset=0): return f"c[0x0][{hex(int("160", 16) + uop.arg * 8 + offset)}]"
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 def is_aligned(src:Register, dtype): return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype, allow_reg=True) for i in range(count)]
 def dtype_op(op, dt): return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.half else '')
+def dtype_mods(dt:DType): return [sig] if (sig:=f"{'F' if dt in floats else 'U' if dt in usig else 'S'}{dt.itemsize*8}") not in ["S32", "F32"] else []
 def nregs(byte_size): return (byte_size + 3) // 4
 def prmt_code(a:Register, b:Register): return "0x"+"".join(str(i+j+(2 if r.mod == "H1_H1" else 0)) for i in [0, 4] for j,r in enumerate([a, b]))[::-1]
 def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0xAA))
@@ -237,10 +246,7 @@ def lop_inst(d, s, dt, code):
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
   return Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"]) if dt is dtypes.bool else Instruction("LOP3", d, [*srcs, code, "!PT"])
 
-inst_for_cast = (
-)
-
-inst_for_op: Dict[Op, Callable] = {
+inst_for_alu: Dict[Op, Callable] = {
   BinaryOps.MUL: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MAX: lambda d,s,dt,u: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
   BinaryOps.SHR: lambda d,s,dt,u: Instruction("SHF", d, [*s, "RZ"], mods=["R", "U32"]),
@@ -265,6 +271,21 @@ inst_for_op: Dict[Op, Callable] = {
   BinaryOps.ADD: lambda d,s,dt,u: Instruction(dtype_op("ADD", dt) + ['', '3'][dt in ints], d, fill(s, 3, dt) if dt in ints else s)
 }
 
+inst_for_cast: Tuple[Set, Set, Callable] = (
+  (ints, floats, lambda d,s,dti,dto: Instruction("I2F", d, [s], mods=[] + dtype_mods(dti) + dtype_mods(dto))),
+  (ints, longs, lambda d,s,dti,dto: render_mov(d,s,dto) + ([] if dti in usig else [Instruction("SHF", d.offset(1), ["RZ","0x1f",d], mods=["R","HI","S32"])])),
+  (floats, ints, lambda d,s,dti,dto: Instruction("F2I", d, [s], mods=["TRUNC"] + dtype_mods(dti) + dtype_mods(dto) +
+                                                                     (["NTZ"] if dto not in longs and dti is not dtypes.double else []))),
+  ({dtypes.float}, {dtypes.half}, lambda d,s,dti,dto: Instruction("F2FP", d, ["RZ", s], mods=["F16", "F32", "PACK_AB"])),
+  ({dtypes.half}, {dtypes.float}, lambda d,s,dti,dto: Instruction("HADD2", d, ["-RZ", s], mods=["F32"])),
+  ({dtypes.double, dtypes.float}, {dtypes.double, dtypes.float}, lambda d,s,dti,dto: Instruction("F2F", d, [s], mods=[f"F{dto.itemsize*8}"])),
+  ({dtypes.half}, {dtypes.bool}, lambda d,s,dti,dto: Instruction("LOP3", d, ["RZ", s, "0x7fff", "RZ", lop_code(lambda a,b,c: a&b), "!PT"], mods=["LUT"])),
+  (floats, {dtypes.bool}, lambda d,s,dti,dto: Instruction(dtype_op("SETP", dti), d, ["PT", s, "RZ", "PT"], mods=["NEU", "AND"])),
+  ({dtypes.bool}, ints|floats, lambda d,s,dti,dto: inst_for_alu[TernaryOps.WHERE](d, [s.negate(), "RZ", render_value(1, dto)], dto, None)),
+  (ints, {dtypes.bool}, lambda d,s,dti,dto:
+    [Instruction("ISETP", d, ["PT", s, "RZ", "PT"], mods=["NE", "AND"] + (["U32"] if dti in usig or dti in longs else []))] +
+    ([Instruction("ISETP", d, ["PT", s.offset(1), "RZ", "PT", d], mods=["NE", "AND", "EX"] + (["U32"] if dti in usig else []))] if dti in longs else [])),
+)
 
 class SASSRenderer(Renderer):
   device = "CUDA"
@@ -282,14 +303,6 @@ class SASSRenderer(Renderer):
   gid = [f'SR_CTAID.{"XYZ"[i]}' for i in range(3)]
   tid = [f'SR_TID.{"XYZ"[i]}' for i in range(3)]
   setp_mod = {BinaryOps.CMPLT: "LT", BinaryOps.CMPNE: "NEU"}
-
-  def render_mov(self, dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[str]=None) -> Instruction:
-    if isinstance(src, Register):
-      srcs = [src.offset(i) if i < src.size - src.idx % src.size else "RZ" for i in range(nregs(dtype.itemsize))]
-    else:
-      val = int(render_binary(float(src), dtype) if not re.match(f"-?0x", src) else src, 16)
-      srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else data64_le(val))]
-    return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
 
   def render_cmp(self, arg:BinaryOps, dest:Register, src_l:Register, src_r:Register, dtype:DType) -> List[Instruction]: # TODO: refactor
     if dtypes.is_int(dtype) or dtypes.is_float(dtype):
@@ -332,22 +345,20 @@ class SASSRenderer(Renderer):
       return Register(idx, size=n, type=prefix, **kwargs)
 
     def unity() -> Register:
-      if not 1 in vals: vals[1] = queue(self.render_mov(new_reg(), "0x1", dtypes.int))
+      if not 1 in vals: vals[1] = queue(render_mov(new_reg(), "0x1", dtypes.int))
       return vals[1]
 
     def queue(instrs:Union[List[Instruction], Instruction]) -> Register:
-      if not isinstance(instrs, list): instrs = [instrs]
-      kernel.extend(instrs)
-      base_regs = [ins.dest for ins in instrs if ins.dest is not None and ins.dest.idx % ins.dest.size == 0]
-      return base_regs[-1] if base_regs else instrs[-1].dest
+      kernel.extend(instrs := [instrs] if not isinstance(instrs, list) else instrs)
+      return next((ins.dest for ins in instrs[::-1] if ins.dest and ins.dest.idx % ins.dest.size == 0), instrs[-1].dest)
 
     def to_var(uop:UOp) -> Union[Register, str]:
       return var if isinstance(var := vals[uop], Register) or "P" in var else to_reg(uop)
 
     def to_reg(uop:UOp, **kwargs) -> Register:
       if isinstance(var := vals[uop], Register): # TODO: replace with better graph rewrite rules
-        return queue(inst_for_op[TernaryOps.WHERE](new_reg(), [var.negate(), vals[0], "0x1"], dtypes.int, uop)) if var.type == "P" else var
-      vals[uop] = dest = queue(self.render_mov(new_reg(uop.dtype.itemsize, **kwargs), var, uop.dtype))
+        return queue(inst_for_alu[TernaryOps.WHERE](new_reg(), [var.negate(), vals[0], "0x1"], dtypes.int, uop)) if var.type == "P" else var
+      vals[uop] = dest = queue(render_mov(new_reg(uop.dtype.itemsize, **kwargs), var, uop.dtype))
       return dest
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> str:
@@ -358,17 +369,12 @@ class SASSRenderer(Renderer):
         dest = replace(g_addr, postfix=f"+{hex(idx.arg * glob.dtype.itemsize)}" if idx.arg != 0 else "")
       else:
         if glob.dtype.itemsize not in vals:
-          vals[glob.dtype.itemsize] = queue(self.render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
+          vals[glob.dtype.itemsize] = queue(render_mov(new_reg(), hex(glob.dtype.itemsize), dtypes.int))
         dest = queue(Instruction("IMAD", new_reg(byte_size=8), ["PT"] + [vals[v] for v in [idx, glob.dtype.itemsize, glob]], mods=["WIDE"], pred=pred)) # TODO: PT = hack, need better isa fuzzing
       return replace(dest, mem_type=f"desc[{vals['DESC'].render()}]", mod="64") # explicit memory descriptor
 
     def memory_mods(dtype:DType):
       return [f"{'' if dtype.itemsize > 4 else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"] if dtype.itemsize != 4 else []
-
-    def dtype_mods(dtype:DType):
-      sig = f"{'F' if dtypes.is_float(dtype) else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"
-      return [sig] if sig not in ["S32", "F32"] else []
-
 
     queue(Instruction(f".text.{name}", None, [], label=True))
     vals[0] = Register(-1)
@@ -387,20 +393,20 @@ class SASSRenderer(Renderer):
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
         val = render_value(arg, dtype)
-        vals[u] = (vals[arg] if arg in vals else val) if dtype.itemsize <= 4 else queue(self.render_mov(new_reg(dtype.itemsize), val, dtype))
+        vals[u] = (vals[arg] if arg in vals else val) if dtype.itemsize <= 4 else queue(render_mov(new_reg(dtype.itemsize), val, dtype))
       elif op is UOps.DEFINE_GLOBAL:
         vals[u] = const_addr(u)
         attr["PARAM_COUNT"] += 1
       elif op is UOps.DEFINE_ACC:
-        vals[u] = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
+        vals[u] = queue(render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
       elif op is UOps.RANGE:
-        vals[u] = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
+        vals[u] = queue(render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
         queue(Instruction(label := new_reg(prefix=".LOOP_").render(), None, [], label=True))
-        update = inst_for_op[BinaryOps.ADD](vals[u], [vals[u], unity() if len(vin) < 3 else to_reg(vin[2])], dtype, u)
+        update = inst_for_alu[BinaryOps.ADD](vals[u], [vals[u], unity() if len(vin) < 3 else to_reg(vin[2])], dtype, u)
         branch = self.render_iter(label, new_reg(prefix="P"), vals[u], to_reg(vin[1]), dtype)
         iter_stack.append([update, *branch])
       elif op is UOps.PHI:
-        vals[u] = queue(self.render_mov(vals[vin[0]], vals[vin[1]], dtype))
+        vals[u] = queue(render_mov(vals[vin[0]], vals[vin[1]], dtype))
       elif op is UOps.ENDRANGE:
         queue(iter_stack.pop(-1))
       elif op is UOps.LOAD:
@@ -408,7 +414,7 @@ class SASSRenderer(Renderer):
           pred = vals[vin[3]] if len(vin) > 3 else None
           vals[u] = queue(ins := Instruction("LDG", new_reg(dtype.itemsize), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"], pred=pred))
           ins.mods.extend(memory_mods(dtype))
-          if pred: queue(self.render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
+          if pred: queue(render_mov(vals[u], vals[vin[2]], dtype, pred=pred.negate()))
         else:
           raise NotImplementedError
       elif op is UOps.STORE:
@@ -418,43 +424,12 @@ class SASSRenderer(Renderer):
         else:
           raise NotImplementedError
       elif op is UOps.CAST:
-        if dtypes.is_int(vin[0].dtype):
-          if dtypes.is_float(dtype):
-            vals[u] = queue(Instruction("I2F", new_reg(dtype.itemsize), [vals[vin[0]]], mods=[] + dtype_mods(vin[0].dtype) + dtype_mods(dtype)))
-          elif dtypes.is_int(dtype):
-            if dtype.itemsize > 4:
-              vals[u] = dest = queue(self.render_mov(new_reg(dtype.itemsize), vals[vin[0]], dtype))
-              if not dtypes.is_unsigned(vin[0].dtype):
-                queue(Instruction("SHF", dest.offset(1), ["RZ", "0x1f", dest], mods=["R", "HI", "S32"]))
-            else:
-              vals[u] = vals[vin[0]]
-          elif dtype is dtypes.bool:
-            vals[u] = queue(ins := Instruction(f"ISETP", dest := new_reg(prefix="P"), ["PT", src := to_reg(vin[0]), "RZ", "PT"], mods=["NE", "AND"]))
-            if dtypes.is_unsigned(vin[0].dtype) or vin[0].dtype.itemsize > 4: ins.mods.extend(["U32"])
-            if vin[0].dtype.itemsize > 4:
-              vals[u] = queue(ins := Instruction(f"ISETP", dest, ["PT", src.offset(1), "RZ", "PT", dest], mods=["NE", "AND", "EX"]))
-              if dtypes.is_unsigned(vin[0].dtype): ins.mods.extend(["U32"])
-        elif dtypes.is_float(vin[0].dtype):
-          if dtypes.is_int(dtype):
-            vals[u] = queue(ins := Instruction("F2I", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=["TRUNC"] + dtype_mods(vin[0].dtype) + dtype_mods(dtype)))
-            if dtype.itemsize <= 4 and vin[0].dtype.itemsize <= 4: ins.mods.extend(["NTZ"])
-          elif vin[0].dtype is dtypes.float and dtype is dtypes.half:
-            vals[u] = queue(Instruction("F2FP", new_reg(dtype.itemsize), ["RZ", to_reg(vin[0])], mods=["F16", "F32", "PACK_AB"]))
-          elif vin[0].dtype is dtypes.half and dtype is dtypes.float:
-            vals[u] = queue(Instruction("HADD2", new_reg(dtype.itemsize), ["-RZ", to_reg(vin[0])], mods=["F32"]))
-          elif (vin[0].dtype is dtypes.double or dtype is dtypes.double) and dtypes.is_float(dtype) and dtypes.half not in [vin[0].dtype, dtype]:
-            vals[u] = queue(Instruction("F2F", new_reg(dtype.itemsize), [to_reg(vin[0])], mods=[f"F{dtype.itemsize*8}"]))
-          elif dtype is dtypes.bool:
-            if vin[0].dtype is dtypes.half:
-              vals[u] = queue(Instruction(f"LOP3", new_reg(prefix="P"), ["RZ", to_reg(vin[0]), "0x7fff", "RZ", lop_code(lambda a, b, c: a & b), "!PT"], mods=["LUT"]))
-            else:
-              vals[u] = queue(Instruction(dtype_op("SETP", vin[0].dtype), new_reg(prefix="P"), ["PT", to_reg(vin[0]), "RZ", "PT"], mods=["NEU", "AND"]))
-          else:
-            raise NotImplementedError
-        elif vin[0].dtype is dtypes.bool:
-          vals[u] = queue(inst_for_op[TernaryOps.WHERE](new_reg(dtype.itemsize), [vals[vin[0]].negate(), vals[0], render_value(1, dtype)], dtype, u))
+        for dti,dto,func in inst_for_cast:
+          if vin[0].dtype in dti and dtype in dto:
+            vals[u] = queue(func(new_reg(dtype.itemsize, prefix="P" if dtype is dtypes.bool else "R"), to_var(vin[0]), vin[0].dtype, dtype))
+            break
         else:
-          raise NotImplementedError
+          vals[u] = vals[vin[0]]
       elif op is UOps.BITCAST:
         assert vin[0].dtype.itemsize == dtype.itemsize, f"bitcast from {vin[0].dtype} to {dtype}: itemsize mismatch"
         vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
@@ -466,7 +441,7 @@ class SASSRenderer(Renderer):
         elif not all(isinstance(vals[v], Register) for v in vin) or not is_contiguous([vals[v] for v in vin]) or not is_aligned(vals[vin[0]], dtype):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
-          queue([inst for i,s in enumerate([vals[v] for v in vin]) for inst in self.render_mov(dest.offset(i*n), s, vin[0].dtype)])
+          queue([inst for i,s in enumerate([vals[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
         else:
           vals[u] = vals[vin[0]]
           for v in vin: vals[v].size = nregs(dtype.itemsize)
@@ -474,8 +449,8 @@ class SASSRenderer(Renderer):
         vals[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg)//4), mod='_'.join([f"H{int(b % 4 != 0)}"]*2) if dtype.itemsize < 4 else "")
       elif op is UOps.ALU:
         srcs = [vals[v] for v in vin]
-        if arg in inst_for_op:
-          vals[u] = queue(inst_for_op[arg](new_reg(dtype.itemsize, prefix="P" if dtype.scalar() is dtypes.bool else "R"), [to_var(v) for v in vin], dtype, u))
+        if arg in inst_for_alu:
+          vals[u] = queue(inst_for_alu[arg](new_reg(dtype.itemsize, prefix="P" if dtype is dtypes.bool else "R"), [to_var(v) for v in vin], dtype, u))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE]:
           assert len(srcs) == 2, f"too many sources for compare: f{len(srcs)}" # TODO: remove
           vals[u] = queue(self.render_cmp(arg, new_reg(prefix="P"), *[to_var(v) for v in vin], vin[0].dtype))
