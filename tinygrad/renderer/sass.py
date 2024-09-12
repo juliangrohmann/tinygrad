@@ -8,7 +8,7 @@ from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.compiler_cuda import SASSCompiler
 from tinygrad.helpers import getenv, all_same, flatten, data64_le, to_function_name
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
-from tinygrad.dtype import dtypes, DType, ConstType
+from tinygrad.dtype import dtypes, DType, ConstType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.renderer.cstyle import CUDARenderer
@@ -22,7 +22,7 @@ class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritiz
   SET_BITS = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
-inf, nan, inf_ext, nan_ext, exp_double = 0x7f800000, 2**31-1, 0x7ff0000000000000, 2**64-1, 0x7ff0000000000000
+inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
 
 def render_binary(x, dtype): # TODO: simplify
   x = abs(x) if (neg := dtypes.is_unsigned(dtype) and x < 0) else x
@@ -30,8 +30,8 @@ def render_binary(x, dtype): # TODO: simplify
   return f"{'-' if neg else ''}0x{''.join(f"{c:>02x}" for c in struct.pack(f"!{overrides[dtype] if dtype in overrides else dtype.fmt}", dtypes.as_const(x, dtype)))}"
 
 def int_like(dt:DType): return dt if dtypes.is_int(dt) else {dtypes.double:dtypes.long, dtypes.float:dtypes.int, dtypes.half:dtypes.short}[dt]
-def is_nan(x:UOp): return -x.bitcast(dtypes.uint).lt(inf + 1)
-def is_inf(x:UOp): return (x.bitcast(dtypes.uint) & nan).eq(inf)
+def is_nan(x:UOp): return -x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}")).lt(inf[x.dtype.itemsize] + 1)
+def is_inf(x:UOp): return (x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}")) & 2**(x.dtype.itemsize*8 - 1) - 1).eq(inf[x.dtype.itemsize])
 def geu(x:UOp, v:ConstType): return (-x.lt(x.const(v))) | is_nan(x)
 def ext_to_vec(x:UOp): return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
 
@@ -56,7 +56,7 @@ def log2(x:UOp) -> UOp: # TODO: fast but only accurate for int operand
 
 def sqrt(x:UOp) -> UOp:
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
-  return x.bitcast(dtypes.uint).eq(inf).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
+  return x.bitcast(dtypes.uint).eq(inf[x.dtype.itemsize]).where(x.const(float("inf")), x.eq(0).where(x.const(0), (-buf * buf + x) * root * 0.5 + buf))
 
 def sin(x:UOp) -> UOp:
   raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
@@ -64,7 +64,7 @@ def sin(x:UOp) -> UOp:
 def recip_single(x:UOp) -> UOp:
   approx = x.alu(SASSOps.RECIP_APPROX)
   dest = approx * (approx * x - 1) * -1 + approx
-  sig_inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, nan)).bitcast(x.dtype) for v in [inf, 0]]
+  sig_inf, zero = [x.bitcast(d := dtypes.uint).alu(SASSOps.SET_BITS, UOp.const(d, v), UOp.const(d, 2**31-1)).bitcast(x.dtype) for v in [inf[x.dtype.itemsize], 0]]
   return is_inf(x).where(zero, x.ne(0).where(dest, sig_inf))
 
 def recip_double(x:UOp) -> UOp:
@@ -77,8 +77,8 @@ def recip_double(x:UOp) -> UOp:
   return it*(-x*it + 1) + it
 
 def idiv(x:UOp, y:UOp) -> UOp:
-  bits = (x.cast(dtypes.double) / y.cast(dtypes.double)).cast(dtypes.double).bitcast(dtypes.ulong)
-  exp = (bits & exp_double).alu(BinaryOps.SHR, bits.const(52)) - (2**10 - 1)
+  bits = (x.cast(dtypes.double) / y.cast(dtypes.double)).bitcast(dtypes.ulong)
+  exp = (bits & inf[bits.dtype.itemsize]).alu(BinaryOps.SHR, bits.const(52)) - (2**10 - 1)
   mask = bits.const(1).alu(BinaryOps.SHL, -exp + 52) - 1
   return exp.lt(0).where(x.const(0), bits.alu(SASSOps.SET_BITS, bits.const(0), mask).bitcast(dtypes.double).cast(x.dtype))
 
@@ -231,6 +231,7 @@ def is_aligned(src:Register, dtype): return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype, allow_reg=True) for i in range(count)]
 def dtype_op(op, dt): return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.half else '')
 def nregs(byte_size): return (byte_size + 3) // 4
+def prmt_code(a:Register, b:Register): return "0x"+"".join(str(i+j+(2 if r.mod == "H1_H1" else 0)) for i in [0, 4] for j,r in enumerate([a, b]))[::-1]
 def lop_code(func:Callable[[int, int, int], int]): return hex(func(0xF0, 0xCC, 0xAA))
 def lop_inst(d, s, dt, code):
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
@@ -368,8 +369,6 @@ class SASSRenderer(Renderer):
       sig = f"{'F' if dtypes.is_float(dtype) else 'U' if dtypes.is_unsigned(dtype) else 'S'}{dtype.itemsize*8}"
       return [sig] if sig not in ["S32", "F32"] else []
 
-    def render_permute(dest, msb, lsb, byte_size):
-      return [Instruction("PRMT", dest.offset(i), [msb, "0x5410" if byte_size == 2 else "0x6420", lsb]) for i in range(dest.size)]
 
     queue(Instruction(f".text.{name}", None, [], label=True))
     vals[0] = Register(-1)
@@ -460,13 +459,10 @@ class SASSRenderer(Renderer):
         assert vin[0].dtype.itemsize == dtype.itemsize, f"bitcast from {vin[0].dtype} to {dtype}: itemsize mismatch"
         vals[u] = f"0f{v[2:]}" if isinstance(v := vals[vin[0]], str) and v.startswith("0x") and dtypes.is_float(dtype) else v
       elif op is UOps.VECTORIZE:
-        if vin[0].dtype.itemsize < 4:
-          for nb in range(2, vin[0].dtype.itemsize - 1, -1):
-            vals[u] = dest = new_reg(len(vin)*2)
-            queue(flatten([render_permute(dest.offset(i), to_reg(vin[i*2]), to_reg(vin[i*2+1]), 2) for i in range(dest.size)]))
-            if vin[0].dtype.itemsize == 1:
-              vals[u] = dest = new_reg(len(vin))
-              queue(flatten([render_permute(dest.offset(i), dest.offset(0), dest.offset(1), 1) for i in range(dest.size)]))
+        if vin[0].dtype is dtypes.half:
+          assert len(vin) % 2 == 0, f"cannot vectorize {len(vin)} {vin[0].dtype} to {dtype}"
+          dest, srcs = new_reg(dtype.itemsize), [to_reg(v) for v in vin]
+          vals[u] = queue([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
         elif not all(isinstance(vals[v], Register) for v in vin) or not is_contiguous([vals[v] for v in vin]) or not is_aligned(vals[vin[0]], dtype):
           vals[u] = dest = new_reg(dtype.itemsize)
           n = nregs(vin[0].dtype.itemsize)
