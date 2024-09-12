@@ -1,20 +1,14 @@
-import tempfile, subprocess, struct, re, math
+import struct, re, math
 from enum import Enum, auto
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Dict, List, Tuple, Set, Sequence, Union, Optional, Callable, cast
-from tinygrad.runtime.support.elf import elf_loader
-from tinygrad.runtime.support.compiler_cuda import SASSCompiler
-from tinygrad.helpers import getenv, data64_le, to_function_name
+from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
-from tinygrad.renderer.cstyle import CUDARenderer
-from tinygrad.engine.graph import graph_uops
 from tinygrad.codegen.transcendental import xlog2
-from CuAsm import CubinFile
 
 class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
@@ -36,7 +30,7 @@ def exp2(x:UOp) -> UOp:
   dest = valid.where(x, x * x.const(0.5)).alu(SASSOps.EXP2_APPROX)
   return valid.where(dest, dest * dest)
 
-def log2(x:UOp) -> UOp: # TODO: fast but only accurate for int operand
+def log2(x:UOp) -> UOp: # TODO: faster than transcendental.py for int operands
   denorm = geu(x, 1.175494350822287508e-38)
   src = denorm.where(x, x * 8388608).bitcast(dtypes.uint)
   high = (src - 0x3f3504f3) & 0xff800000
@@ -53,9 +47,6 @@ def sqrt(x:UOp) -> UOp:
   assert x.dtype in numeric - {dtypes.half}, f"unsupported dtype for SQRT: {x.dtype}"
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
   return x.bitcast(dtypes.uint).eq(inf[x.dtype.itemsize]).where(x.const(float("inf")), x.eq(0).where(x.const(0), 0.5*(-buf*buf + x)*root + buf))
-
-def sin(x:UOp) -> UOp:
-  raise NotImplementedError("SIN not implemented for SASS backend.") # TODO
 
 def recip_single(x:UOp) -> UOp:
   assert x.dtype is dtypes.float, f"unsupported dtype for single width SQRT: {x.dtype}"
@@ -142,7 +133,7 @@ sass_matcher = PatternMatcher([
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MAX, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
-  (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))), # TODO
+  (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
   (UPat(UOps.CAST, name="root", dtype={dtypes.double, dtypes.half}, src=(UPat(name="x", dtype={dtypes.double, dtypes.half}))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.float),))),
@@ -152,7 +143,7 @@ sass_matcher = PatternMatcher([
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.uint if dtypes.is_unsigned(root.dtype) else dtypes.int),))),
   (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
-  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), mul_long),
+  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), mul_long),  # TODO: refactor
   (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), add_long),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), shf_long),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), shf_long),
@@ -167,7 +158,6 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, UnaryOps.EXP2, dtype=not_half, src=(UPat(name="x"),)), exp2),
   (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="d"),)), xlog2),
   (UPat(UOps.ALU, UnaryOps.SQRT, dtype=not_half, src=(UPat(name="x"),)), sqrt),
-  # (UPat(UOps.ALU, UnaryOps.SIN, dtype=not_half, src=(UPat(name="x"))), sin),
   (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
   (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
   *[(UPat(UOps.ALU, op, dtype=dtypes.half, name="x"),
@@ -224,7 +214,7 @@ def render_mov(dest:Register, src:Union[Register,str], dtype:DType, pred:Optiona
     srcs = [render_binary(v, dtypes.uint) if v != 0 else "RZ" for v in ([val] if dtype.itemsize <= 4 else data64_le(val))]
   return [Instruction("MOV", dest.offset(i), [s], pred=pred) for i,s in enumerate(srcs)]
 
-def render_cmp(arg:BinaryOps, dest:Register, srcs:List[Register], dtype:DType) -> List[Instruction]: # TODO: refactor
+def render_cmp(arg:BinaryOps, dest:Register, srcs:List[Register], dtype:DType) -> List[Instruction]:
   if dtypes.is_int(dtype) or dtypes.is_float(dtype):
     ret = []
     op = dtype_op("SETP", dtype)
@@ -273,13 +263,13 @@ inst_for_alu: Dict[Union[Op,SASSOps], Callable] = {
   SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
   SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
   SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
-  SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]), # TODO: move mufu mod to arg
+  SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.RECIP_HI: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP64H"]),
   SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
   SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
-  BinaryOps.AND: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a, b, c: a & b if len(s) == 2 else a & b & c)),
-  BinaryOps.OR: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a, b, c: a | b if len(s) == 2 else a | b | c)),
-  BinaryOps.XOR: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a, b, c: a ^ b if len(s) == 2 else a ^ b ^ c)),
+  BinaryOps.AND: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a,b,c: a & b if len(s) == 2 else a & b & c)),
+  BinaryOps.OR: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a,b,c: a | b if len(s) == 2 else a | b | c)),
+  BinaryOps.XOR: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a,b,c: a ^ b if len(s) == 2 else a ^ b ^ c)),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
 inst_for_cast: Tuple[Tuple[Set, Set, Callable],...] = (
@@ -306,15 +296,10 @@ class SASSRenderer(Renderer):
   shared_max = 49152
   tensor_cores = [TensorCore(dims=(8,16,16), threads=[(0,2)]*2 + [(1,2)]*3, dtype_in=di, dtype_out=do) for di,do in [(dtypes.half, dtypes.float)]]
   extra_matcher = sass_matcher
-  code_for_op = {op: lambda x: "" for op in [UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN]} # HACK: transcendental override in sass matcher TODO
+  code_for_op = {op: lambda x: "" for op in [UnaryOps.EXP2, UnaryOps.LOG2]} # HACK: transcendental override in sass matcher
   def __init__(self, arch:str, device="CUDA"): self.device, self.tensor_cores = device, SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
 
   def render(self, name:str, uops:List[UOp]) -> str:
-    if getenv("GRAPHUOPS"): # TODO: remove
-      graph_uops(uops)
-    if debug_sass := getenv("DEBUG_SASS", ""):
-      with open(debug_sass) as f: return f.read()
-
     attr: Dict[str, int] = {"PARAM_COUNT": 0}
     kernel: List[Instruction] = []
     iter_stack: List[List[Instruction]] = []
@@ -361,10 +346,6 @@ class SASSRenderer(Renderer):
 
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
-      if getenv("PRINT_UOPS", 0): # TODO: remove
-        print(f"{op=}, {arg=}, {dtype=}")
-        for v in vin:
-          print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
       if op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_GLOBAL:
           assert vin[2].dtype
@@ -429,46 +410,18 @@ class SASSRenderer(Renderer):
     kk(Instruction("EXIT", None, []))
     kk(Instruction(buf_lab := ".L_BUF", None, [], label=True))
     kk(Instruction("BRA", None, [f"`({buf_lab})"]))
-    for _ in range(10): kk(Instruction("NOP", None, [])) # TODO: pad to multiple of 8
+    for _ in range(10): kk(Instruction("NOP", None, []))
     kk(Instruction(".L_END", None, [], label=True))
 
-    for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = i*16
-    set_ctrl(kernel)
-    attr["SHI_REGISTERS"] = c["R"] + 3 # two internal registers on sm >= 8x, and RZ
-    ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel) # debug TODO: remove
-
+    rewrite_registers(kernel, "P")
+    spill_to_flags(kernel)
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
-    sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+    set_ctrl(kernel)
+    for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
+    return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
-    # debug TODO: remove
-    if out_dir := getenv("WRITE_SRC", ""):
-      try:
-        cuda_src = CUDARenderer("sm_89").render(to_function_name(name), uops)
-        with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
-        subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(), (Path(out_dir) / "nvcc.cu").as_posix()],
-                       check=False)
-        with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
-          subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f, check=False)
-        with open(Path(out_dir) / "nvcc.cubin", "rb") as fv: cuda_blob = fv.read()
-        cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
-        with open(Path(out_dir) / "nvcc.bin", "wb") as fr: fr.write(cuda_kernel)
-        with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
-          tmp.close()
-          subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-          CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
-      except Exception:
-        pass
-      with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
-      with open(Path(out_dir) / "rendered_ssa.sass", "w") as f: f.write(ssa_src)
-      elf = SASSCompiler("sm_89").compile(sass_src)
-      with open(Path(out_dir) / "rendered.cubin", "wb") as fx: fx.write(elf)
-      with open(Path(out_dir) / "rendered_cuobjdump.sass", "w") as f:
-        subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "rendered.cubin").as_posix()], stdout=f, check=False)
-    return ssa_src if getenv("SSA") else sass_src
-
-def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
-  def alloc(size):
-    return next((i for i in range(*((1,7) if reg_type == "P" else (0,255))) if i%size == 0 and all(i+j not in allocated for j in range(size))), None)
+def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
+  def alloc(size): return next((i for i in range(reg_type == "P", 256) if i % size == 0 and all(i+j not in allocated for j in range(size))), None)
   unrolled = []
   loops: Dict[str, List[Instruction]] = {}
   for inst in kernel:
@@ -482,7 +435,7 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
       for v in loops.values(): v.extend(loop_inst)
   locs, all_reg = defaultdict(list), set()
   for i,r in enumerate([src for inst in unrolled for src in [inst.pred, *inst.srcs, inst.dest]]):
-    if isinstance(r, Register) and r.idx >= 0 and r.type == reg_type:
+    if isinstance(r, Register) and r.idx != -1 and r.type == reg_type:
       locs[r.base().idx, r.size].append(i)
       all_reg.add(r)
   events = sorted([(k, max(v), False) for k,v in locs.items()] + [(k, min(v), True) for k,v in locs.items()], key=lambda x: x[1])
@@ -498,10 +451,38 @@ def rewrite_registers(kernel:Sequence[Instruction], reg_type:str):
       reg.idx = repl[bidx] + reg.idx - bidx
   return max([r.base().idx + r.size for r in all_reg] + [0])
 
+def pred_cap(kernel:Sequence[Instruction]) -> int:
+  cap = 6
+  while True:
+    cnt = max(len([r for r in [*inst.srcs, inst.pred] if isinstance(r, Register) and r.type == "P" and r.idx > cap]) for inst in kernel)
+    if cnt + cap <= 6: return cap
+    cap = 6 - cnt
+
+def spill_to_flags(kernel:List[Instruction]):
+  def is_spill(r): return isinstance(r, Register) and r.type == "P" and r.idx > cap
+  def flag_idx(p): return p.idx - cap - 1
+  cap, flags, buf, bit_src = pred_cap(kernel), Register(-2), Register(-3), Register(-4)
+  for inst in kernel: # decouple registers
+    if isinstance(inst.dest, Register): inst.dest = replace(inst.dest)
+    if isinstance(inst.pred, Register): inst.pred = replace(inst.pred)
+    inst.srcs = [replace(s) if isinstance(s, Register) else s for s in inst.srcs]
+  if cap >= 6: return
+  kernel[1:1] = [Instruction("MOV", bit_src, [render_value(2**32 - 1, dtypes.uint)]), Instruction("MOV", flags, ["RZ"])]
+  for i in range(len(kernel) - 1, -1, -1):
+    if (dp := kernel[i].dest) and is_spill(dp):
+      kernel[i+1:i+1] = [Instruction("SEL", buf, [bit_src, "RZ", dp]),
+                         Instruction("LOP3", flags, [flags,render_value(1<<flag_idx(dp),dtypes.uint),buf,lop_code(lambda a,b,c: (b&c)|(~b&a)),"!PT"])]
+      dp.idx = cap + 1
+    reads = [r for r in [*kernel[i].srcs, kernel[i].pred] if is_spill(r)]
+    for j,sp in enumerate(reads):
+      kernel[i:i] = [*inst_for_alu[BinaryOps.AND](buf, [flags, render_value(1 << flag_idx(sp), dtypes.uint)], dtypes.uint, None),
+                     Instruction("ISETP", Register(cap + j + 1, type="P"), ["PT", buf, "RZ", "PT"], mods=["NE", "AND", "U32"])]
+      cast(Register, sp).idx = cap + j + 1
+
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL"} # TODO: I2F, F2I, F2F only variable latency for double width
 read_latency_ops = {"MUFU", "DSETP"}
 
-def set_ctrl(kernel):
+def set_ctrl(kernel:List[Instruction]):
   def new_bar():
     return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
   def set_bar(deps, bar_tab):
@@ -514,11 +495,11 @@ def set_ctrl(kernel):
     for k,v in list(bar_tab.items()):
       if v in bars: bar_tab.pop(k, None)
     for b in bars: active_bar.remove(b)
-  active_bar = []
+  active_bar: List[int] = []
   write_bar: Dict[str,int] = {}
   read_bar: Dict[str,int] = {}
   for inst in kernel:
-    inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_latency_ops else None
-    inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_latency_ops else None
     wait_bar(inst.srcs, write_bar), wait_bar([inst.dest], read_bar)
+    inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_latency_ops else None
+    inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_latency_ops else None
     inst.ctrl.yield_ |= inst.ctrl.stall >= 12
