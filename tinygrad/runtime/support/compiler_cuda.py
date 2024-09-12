@@ -1,11 +1,10 @@
-import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, io, json
-from typing import Callable, Sequence
+import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, json
+from typing import Callable
 from tinygrad.helpers import to_char_p_p, colored, init_c_var, getenv
 import tinygrad.runtime.autogen.nvrtc as nvrtc
 from tinygrad.runtime.support.assembler_sass import SASSParser, SASSAssembler
 from tinygrad.runtime.support.cubin import make_cubin
 from tinygrad.device import Compiler, CompileError
-from CuAsm import CuAsmParser
 
 PTX = getenv("PTX")  # this shouldn't be here, in fact, it shouldn't exist
 
@@ -83,14 +82,12 @@ class NVPTXCompiler(PTXCompiler):
 
 class SASSCompiler(CUDACompiler):
   def __init__(self, arch:str):
-    with open(pathlib.Path(__file__).parent / f"isa.sm_89.json") as f:
-      self.assembler = SASSAssembler(json.load(f))
+    with open(pathlib.Path(__file__).parent / f"isa.{arch}.json") as f: self.assembler = SASSAssembler(json.load(f))
     super().__init__(arch, cache_key="sass")
-
   def compile(self, src:str) -> bytes:
     parser, kernel = SASSParser(src), bytearray()
     for line in src.split('\n'):
       if line.strip().startswith('['):
         kernel += self.assembler.assemble(*parser.parse(line))
-    (attr := {k:v for k,v in parser.eiattr.items()}).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
+    (attr := dict(parser.eiattr)).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
     return bytes(make_cubin(kernel, attr, parser, self.arch))

@@ -1,7 +1,6 @@
 from __future__ import annotations
-from typing import Tuple, List, Any
+from typing import Tuple, List, Any, Optional
 from dataclasses import dataclass
-import io
 import tinygrad.runtime.autogen.libc as libc
 
 @dataclass(frozen=True)

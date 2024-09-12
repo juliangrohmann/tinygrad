@@ -1,11 +1,10 @@
-import json, pathlib, struct, re
+import json, struct, re
 from enum import StrEnum, auto
-from typing import List, Dict, Set, Sequence, FrozenSet, Union, Any, Optional
+from typing import List, Dict, DefaultDict, Sequence, Tuple, FrozenSet, Callable, Pattern, Union, Any, Optional
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from tinygrad.dtype import ConstType
 from tinygrad.helpers import flatten
-from instruction_solver import ISASpec, EncodingRangeType
-from parser import InstructionParser
 
 addr_ops = {'BRA', 'BRX', 'BRXU', 'CALL', 'JMP', 'JMX', 'JMXU', 'RET', 'BSSY', 'SSY', 'CAL', 'PRET', 'PBK'}
 cast_ops = {'I2F', 'I2I', 'F2I', 'F2F', 'I2FP', 'I2IP', 'F2IP', 'F2FP', 'FRND'}
@@ -14,7 +13,7 @@ pos_dep_ops = {'HMMA', 'IMMA', 'I2IP', 'F2FP', 'I2I', 'F2F', 'IDP', 'TLD4', 'VAD
 const_tr = {r'(?<!\.)\bRZ\b': 'R255', r'\bURZ\b': 'UR63', r'\bPT\b': 'P7', r'\bUPT\b': 'UP7', r'\bQNAN\b': 'NAN'}
 pre_mod = {'!': 'cNOT', '-': 'cNEG', '|': 'cABS', '~': 'cINV'}
 float_fmt = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)}
-sr_vals = {"SR_LANEID": 0, "SR_TID": 32, "SR_TID.X": 33, "SR_TID.Y": 34, "SR_TID.Z": 35, "SR_CTAID.X": 37, "SR_CTAID.Y": 38, "SR_CTAID.Z": 39, "SR_NTID": 40}
+sr_vals = {"SR_TID": 32, "SR_TID.X": 33, "SR_TID.Y": 34, "SR_TID.Z": 35, "SR_CTAID.X": 37, "SR_CTAID.Y": 38, "SR_CTAID.Z": 39, "SR_NTID": 40}
 ins_pat = re.compile(r'(?P<Pred>@!?U?P\w\s+)?\s*(?P<Op>[\w\.\?]+)(?P<Operands>.*)')
 text_pat = re.compile(r'\[([\w:-]+)\](.*)')
 ins_addr = re.compile(r'/\*([\da-fA-F]{4})\*/')
@@ -32,10 +31,10 @@ class EncodingType(StrEnum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = aut
 class Encoding: type:str; key:str; start:int; length:int; value:int; idx:int; shift:int; inverse:bool # noqa: E702
 @dataclass(frozen=True)
 class OpCodeSpec:
-  enc:List[Dict]; cmods:List[str]; all_mods:FrozenSet[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
+  enc:List[Encoding]; cmods:List[str]; all_mods:FrozenSet[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
   @classmethod
-  def from_json(cls, code:int, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,List[Dict[str,int]]]):
-    return cls([Encoding(**p) for p in enc], cmods, frozenset([m for g in op_mods for m in g.keys()] + cmods), op_mods, {int(k):v for k,v in vmods.items()})
+  def from_json(cls, code, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,List[Dict[str,int]]]):
+    return cls([Encoding(**p) for p in enc],cmods,frozenset([m for g in op_mods for m in g.keys()]+cmods),op_mods,{int(k):v for k,v in vmods.items()})
 
 class InstructionSpec:
   def __init__(self, specs:Sequence[OpCodeSpec]):
@@ -43,27 +42,24 @@ class InstructionSpec:
     self.code_mods = frozenset({mod for s in specs for mod in s.cmods}) # if mod and not "INVALID" in mod and not "??" in mod})
 
 class SASSAssembler:
-  def __init__(self, json_obj:Dict[str, Any]):
+  def __init__(self, json_obj:Dict[str,Any]):
     self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
 
-  def assemble(self, ctrl:str, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int, Sequence[str]]]=None):
+  def assemble(self, ctrl:str, key:str, values:List[Union[int,float]], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int,Sequence[str]]]=None):
     ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
     return ((ctrl_code << 105) | inst_code).to_bytes(16, "little")
 
-  def encode_instruction(self, key:str, values:List[Union[int, float]], op_mods:Sequence[str]=(), operand_mods:Dict[int, Sequence[str]]=None) -> int:
+  def encode_instruction(self, key:str, values:List[ConstType], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int,Sequence[str]]]=None) -> int:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
     def choose_mod(explicit_mods, spec_mods):
       valid_mods = [m for m in explicit_mods if m in spec_mods]
-      assert len(valid_mods) <= 1, f"ambiguous modifier for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {explicit_mods=}, {valid_mods=}, {spec_mods=}"
-      mod_key = valid_mods[0] if len(valid_mods) else ''
-      assert mod_key in spec_mods, f"default modifier not allowed for {key=}, {enc.type=}, {enc.idx=}, {enc.value=}. {spec_mods=}, {spec.op_mods=}"
-      return mod_key
+      return valid_mods[0] if len(valid_mods) else ''
 
-    predicate, values = values[0], values[1:]
-    inst, seen = self.isa[key], defaultdict(int)
+    inst, predicate, values = self.isa[key], values[0], values[1:]
+    seen:DefaultDict[int,int] = defaultdict(int)
     spec_group = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
     valid_specs = [s for s in spec_group if all(m in s.all_mods for m in op_mods)]
-    assert len(valid_specs), (f"invalid sass instruction:\n{key=}, {values=}, {op_mods=}\n"
+    assert len(valid_specs), (f"invalid SASS instruction spec:\n{key=}, {values=}, {op_mods=}\n"
                               f"spec group:\n{'\n'.join([f"{i}: {spec.all_mods}" for i,spec in enumerate(spec_group)])}")
     spec, code = valid_specs[0], set_bits(predicate, 12, 4)
     for enc in spec.enc:
@@ -96,35 +92,35 @@ class SASSAssembler:
 
 class SASSParser:
   def __init__(self, src:str):
-    self.function_name, self.param_cnt, self.c_mem_sz = None, None, None
-    self.labels = {}
-    self.eiattr = defaultdict(list)
+    self.eiattr: DefaultDict[str,List] = defaultdict(list)
+    self.labels: Dict[str,str] = dict()
     self.parse_labels(src)
     self.parse_attributes(src)
 
-  def parse(self, line):
+  def parse(self, line:str):
     r = text_pat.match(strip_comments(line).strip())
+    assert r, f"invalid SASS line: {line}"
     ctrl, ins = r.groups()
     ins = self.labels_to_addr(ins.strip())
     addr = parse_inst_addr(line)
     key, vals, op_mods, vmods = parse_inst(ins, addr=addr)
     return ctrl, key, vals, op_mods, vmods
 
-  def labels_to_addr(self, s):
+  def labels_to_addr(self, s:str):
     r = ins_label.search(s)
     return ins_label.sub(self.labels[r.groups()[0]], s) if r else s
 
-  def parse_labels(self, src):
+  def parse_labels(self, src:str):
     addr = None
     for line in src.split('\n'):
       if a := parse_inst_addr(line):
         addr = a
       if r := def_label.match(line.strip()):
         if addr: self.labels[r.groups()[0]] = hex(addr + 16)
-        elif not self.function_name and r.groups()[0].startswith(".text."): self.function_name = r.groups()[0].replace(".text.", "", 1)
+        elif r.groups()[0].startswith(".text."): self.function_name = r.groups()[0].replace(".text.", "", 1)
         else: raise ValueError
 
-  def parse_attributes(self, src):
+  def parse_attributes(self, src:str):
     block_dims = [1, 1, 1]
     for line in src.split('\n'):
       if dim_match := re.match(r"BLOCK_DIM_(\d)=(\d+)", line):
@@ -137,7 +133,6 @@ class SASSParser:
           self.eiattr["EIATTR_KPARAM_INFO"].append([0, (8*i << 16) + i, 0x21f000])
         self.eiattr["EIATTR_PARAM_CBANK"].append([".nv.constant0.FUNC", (8*n << 16) + 0x160])
         self.eiattr["EIATTR_CBANK_PARAM_SIZE"].append(8*n)
-        self.c_mem_sz = 0x160 + 8*n
       text_match = text_pat.match(strip_comments(line).strip())
       if not text_match: continue
       ins = text_match.groups()[1].strip()
@@ -146,12 +141,12 @@ class SASSParser:
     self.eiattr["EIATTR_MAX_THREADS"].append(block_dims)
     self.eiattr["EIATTR_MAXREG_COUNT"].append(255)
 
-def parse_inst(ins:str, addr:int=None):
+def parse_inst(ins:str, addr:Optional[int]=None):
   for k,v in const_tr.items():
     ins = re.sub(k, v, ins)
-  # TODO: translate scoreboard for DEPBAR?
-  ins = insig_whitespace.sub('', whitespace.sub(' ', ins)).strip(' {};') # TODO: needed?
+  ins = insig_whitespace.sub('', whitespace.sub(' ', ins)).strip(' {};')
   r = ins_pat.match(ins)
+  assert r, f"invalid SASS instruction: {ins}"
   op_toks = r.group('Op').split('.')
   op, op_mods = op_toks[0], op_toks[1:]
   keys, vals, vmods = parse_operands(split_operands(r.group('Operands'), op))
@@ -174,11 +169,11 @@ def parse_inst_addr(s:str):
 def parse_operands(operands:Sequence[str]):
   parsed = [parse_token(tok) for tok in operands]
   idx_mods = defaultdict(list)
-  for i, (keys, vals, mods) in enumerate(parsed):
+  for i, (_, _, mods) in enumerate(parsed):
     for j, v in mods.items(): idx_mods[i + j].extend(v)
   return flatten(p[0] for p in parsed), flatten(p[1] for p in parsed), idx_mods
 
-def parse_token(token):
+def parse_token(token:str):
   for parser, regex in token_formats:
     if r := regex.match(token): return parser(*r.groupdict().values())
   raise ValueError(f"Unexpected token: \"{token}\"")
@@ -194,53 +189,50 @@ def parse_addr(prefix:str, addr:str):
   keys, vals, mods = parse_operands(operands)
   return [f"{prefix}[{''.join(keys)}]"], vals, mods
 
-def parse_int(value):
+def parse_int(value:str):
   return ["I"], [int(value, 16)], {}
 
-def parse_float(value):
+def parse_float(value:str):
   value = "0f7fffffff" if value == "NAN" else "0f7f800000" if value == "INF" else value
   return ["FI"], [int(value[2:], 16) if value.startswith('0f') else float(value)], {}
 
-def parse_special_reg(label):
+def parse_special_reg(label:str):
   return ["SR"], [sr_vals[label]], {}
 
-def parse_indexed_token(prefix, label, index, post_mods): # TODO: how to encode negative registers?
+def parse_indexed_token(prefix:str, label:str, index:str, post_mods:str): # TODO: how to encode negative registers?
   mods = [c for c in post_mods.split('.') if len(c)] + [pre_mod[c] for c in prefix]
   return [label], [int(index)], {0: mods} if mods else {}
 
-def parse_pred(s):
+def parse_pred(s:str) -> int:
   if not s: return 7
   v = parse_token(s.strip('@ '))[1]
   return v[0] + 8 if '!' in s else v[0]
 
-def strip_comments(s):
-  s = cpp_comment.subn(' ', s)[0] # TODO: needed?
-  s = cc_comment.subn(' ', s)[0]
-  s = re.subn(r'\s+', ' ', s)[0]
-  return s.strip()
+def strip_comments(s:str) -> str:
+  return re.subn(r'\s+', ' ', cc_comment.subn(' ', cpp_comment.subn(' ', s)[0])[0])[0].strip()
 
-def split_operands(s, op):
+def split_operands(s:str, op:str) -> List[str]:
   s = s.strip()
   if op in addr_ops and (res := reg_imme_addr.search(s)):
     s = s.replace(res.group(), res.group('R')+','+res.group('II'))
   return s.split(',') if s else []
 
-def encode_float(val, op, mods):
+def encode_float(val:float, op:str, mods:Sequence[str]):
   if op[0] in {'H', 'F', 'D'}: prec = op[0]
   else: prec = 'D' if '64' in mods else 'H' if '16' in mods else 'F'
   nbits = 32 if '32I' in mods else -1
   ifmt, ofmt, fullbits, keepbits = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)}[prec]
-  fb = struct.pack(ifmt, float(val))
+  fb = struct.pack(ifmt, val)
   ival = struct.unpack(ofmt, fb)[0]
   trunc_bits = fullbits - max(nbits, keepbits)
   return ival >> trunc_bits if trunc_bits > 0 else ival
 
-token_formats = (
+token_formats: Tuple[Tuple[Callable,Pattern],...] = (
   (parse_special_reg, re.compile(r'(?P<Label>SR_[\w\.]+)')),
   (parse_indexed_token, re.compile(r'(?P<Prefix>[!\-|~]?)(?P<Label>R|UR|P|UP|B|SB|SBSET|SR)(?P<Index>\d+)(?P<PostMod>(\.\w+)*)')),
   (parse_const_memory, re.compile(r'(?P<Prefix>\w*)\[(?P<Bank>[\w\.]+)\]\[(?P<Addr>[+-?\w\.]+)\]')),
   (parse_addr, re.compile(r'(?P<Prefix>\w*)\[(?P<Addr>[^\]]+)\]$')),
-  (parse_int, re.compile(f'(?P<Value>[-+]?0x[0-9a-fA-F]+)')),
+  (parse_int, re.compile(r'(?P<Value>[-+]?0x[0-9a-fA-F]+)')),
   (parse_float, re.compile(r'^(?P<Value>((-?\d+)(\.\d*)?((e|E)[-+]?\d+)?)|([+-]?INF)|([+-]?NAN)|-?(0[fF][0-9a-fA-F]+))'
                            r'(\.[a-zA-Z]\w*)*$')),
 )
