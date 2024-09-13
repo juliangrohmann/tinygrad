@@ -10,7 +10,7 @@ from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 from tinygrad.codegen.transcendental import xlog2
 
-class SASSOps(Enum): # NOTE: these need to shadow exec_alu patterns to prioritize const folding
+class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
   SET_BITS = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
@@ -347,15 +347,20 @@ class SASSRenderer(Renderer):
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
       if op is UOps.STORE:
-        if vin[0].op is UOps.DEFINE_GLOBAL:
-          assert vin[2].dtype
+        assert vin[2].dtype and vin[0].dtype
+        if vin[0].op is UOps.DEFINE_LOCAL:
+          kk(Instruction("STS", None, [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}"), to_reg(vin[2])]))
+        else:
           kk(Instruction("STG", None, [glob_addr(vin[1], vin[0]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
-        else: raise NotImplementedError
       elif op is UOps.ENDRANGE:
         kk(iter_stack.pop(-1))
+      elif op is UOps.BARRIER:
+        kk(Instruction("BAR", None, ["0x0"], mods=["SYNC", "DEFER_BLOCKING"]))
       else:
         assert dtype, f"None dtype for uop {u}"
-        if op is UOps.SPECIAL:
+        if op is UOps.DEFINE_LOCAL:
+          attr["SHM_SIZE"] = arg[1]*dtype.itemsize
+        elif op is UOps.SPECIAL:
           kk(Instruction("S2R", ssa(u), [('SR_TID.' if (tid := arg[0][:3] == "lid") else 'SR_CTAID.') + "XYZ"[dim := int(arg[0][-1])]]))
           if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
         elif op is UOps.CONST:
@@ -367,19 +372,20 @@ class SASSRenderer(Renderer):
         elif op is UOps.DEFINE_ACC:
           kk(render_mov(ssa(u), r[vin[0]], dtype))
         elif op is UOps.RANGE:
-          kk(render_mov(ssa(u), r[vin[0]], dtype))
-          kk(Instruction(label := ssa(None, byte_size=4, prefix=".LOOP_").render(), None, [], label=True))
+          kk([*render_mov(ssa(u), r[vin[0]], dtype), Instruction(label := ssa(None, byte_size=4, prefix=".LOOP_").render(), None, [], label=True)])
           update = inst_for_alu[BinaryOps.ADD](r[u], [r[u], "0x1" if len(vin) < 3 else to_reg(vin[2])], dtype, u)
           branch = render_iter(label, ssa(None, byte_size=4, prefix="P"), to_reg(u), to_reg(vin[1]), dtype)
           iter_stack.append([update, *branch])
         elif op is UOps.PHI:
           r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
         elif op is UOps.LOAD:
-          if vin[0].op is UOps.DEFINE_GLOBAL:
+          assert vin[0].dtype
+          if vin[0].op is UOps.DEFINE_LOCAL:
+            kk(Instruction("LDS", ssa(u), [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}")]))
+          elif vin[0].op is UOps.DEFINE_GLOBAL:
             pred = to_reg(vin[3]) if len(vin) > 3 else None
             kk(Instruction("LDG", ssa(u), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"] + mem_mods(dtype), pred=pred))
             if pred: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=pred.negate()))
-          else: raise NotImplementedError
         elif op is UOps.CAST:
           for dti,dto,func in inst_for_cast:
             if vin[0].dtype in dti and dtype in dto:
@@ -479,8 +485,8 @@ def spill_to_flags(kernel:List[Instruction]):
                      Instruction("ISETP", Register(cap + j + 1, type="P"), ["PT", buf, "RZ", "PT"], mods=["NE", "AND", "U32"])]
       cast(Register, sp).idx = cap + j + 1
 
-write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL"} # TODO: I2F, F2I, F2F only variable latency for double width
-read_latency_ops = {"MUFU", "DSETP"}
+write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS"} # TODO: casts are only variable lat for double width
+read_latency_ops = {"MUFU", "DSETP", "STS"}
 
 def set_ctrl(kernel:List[Instruction]):
   def new_bar():

@@ -209,7 +209,8 @@ class TestFloatDType(TestDType):
 
 class TestDoubleDType(TestDType):
   DTYPE = dtypes.double
-  @unittest.skipIf((CI and Device.DEFAULT in {"CUDA", "NV"}) or getenv("PTX"), "conversion not supported on CI CUDA and PTX")  # TODO: why not?
+  @unittest.skipIf((CI and Device.DEFAULT in {"CUDA", "NV"}) or getenv("PTX") or getenv("SASS"),
+                   "conversion not supported on CI CUDA, PTX, and SASS")  # TODO: why not?
   def test_float64_increased_precision(self):
     for func in [
       lambda t: t.exp(),

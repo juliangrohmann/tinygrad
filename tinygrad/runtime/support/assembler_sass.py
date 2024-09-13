@@ -127,17 +127,21 @@ class SASSParser:
         block_dims[int(dim_match.groups()[0])] = int(dim_match.groups()[1])
       if reg_match := re.match(r"SHI_REGISTERS=(\d+)", line):
         self.eiattr["EIATTR_REGCOUNT"].append(["FUNC", int(reg_match.groups()[0])])
+      if reg_match := re.match(r"SHM_SIZE=(\d+)", line):
+        self.eiattr["SHM_SIZE"].append([int(reg_match.groups()[0])])
       if param_match := re.match(r"PARAM_COUNT=(\d+)", line):
         n = int(param_match.groups()[0])
         for i in range(n-1, -1, -1):
           self.eiattr["EIATTR_KPARAM_INFO"].append([0, (8*i << 16) + i, 0x21f000])
         self.eiattr["EIATTR_PARAM_CBANK"].append([".nv.constant0.FUNC", (8*n << 16) + 0x160])
         self.eiattr["EIATTR_CBANK_PARAM_SIZE"].append(8*n)
-      text_match = text_pat.match(strip_comments(line).strip())
-      if not text_match: continue
+      if not (text_match := text_pat.match(strip_comments(line).strip())):
+        continue
       ins = text_match.groups()[1].strip()
       if ins.startswith("EXIT"):
         self.eiattr["EIATTR_EXIT_INSTR_OFFSETS"].append([parse_inst_addr(line)])
+      elif ins.startswith("BAR"):
+        self.eiattr["SHF_BARRIERS"].append([parse_inst_addr(line)])
     self.eiattr["EIATTR_MAX_THREADS"].append(block_dims)
     self.eiattr["EIATTR_MAXREG_COUNT"].append(255)
 
