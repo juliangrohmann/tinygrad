@@ -529,17 +529,17 @@ def spill_to_flags(kernel:List[Instruction]):
       cast(Register, sp).idx = cap + j + 1
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS"} # TODO: casts are only variable lat for double width
-read_latency_ops = {"MUFU", "DSETP", "STS"}
+read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F"}
 
 def set_ctrl(kernel:List[Instruction]):
-  def new_bar():
-    return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
+  def new_bar(): return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
+  def all_ids(dep): return [dep.base().offset(i).identity() for i in range(dep.size if isinstance(dep, Register) else 0)]
   def set_bar(deps, bar_tab):
     active_bar.append(bar := new_bar())
-    bar_tab.update({d.base().identity(): bar for d in deps if isinstance(d, Register)})
+    bar_tab.update({rid: bar for d in deps for rid in all_ids(d)})
     return bar
   def wait_bar(deps, bar_tab):
-    bars = {bar_tab[d.base().identity()] for d in deps if isinstance(d, Register) and d.base().identity() in bar_tab}
+    bars = {bar_tab[rid] for d in deps for rid in all_ids(d) if rid in bar_tab}
     inst.ctrl.wait.extend(list(bars))
     for k,v in list(bar_tab.items()):
       if v in bars: bar_tab.pop(k, None)
