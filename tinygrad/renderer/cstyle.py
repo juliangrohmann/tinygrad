@@ -1,8 +1,8 @@
-from typing import Dict, List, Optional, Tuple, Union, DefaultDict, cast, Literal, Callable
+from typing import Dict, List, Optional, Tuple, Union, DefaultDict, Literal, Callable
 import os, math
 from collections import defaultdict, Counter
 from tinygrad.ops import UnaryOps, BinaryOps, TernaryOps, UOps, UOp
-from tinygrad.helpers import strip_parens, getenv, prod, dedup
+from tinygrad.helpers import strip_parens, getenv, prod, dedup, AMX
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType, ConstType
 from tinygrad.renderer import Renderer, TensorCore
 
@@ -123,20 +123,18 @@ class CStyleLanguage(Renderer):
         depth -= 1
         kk("}")
       elif uop is UOps.STORE:
-        assert src[0].dtype is not None and src[2].dtype is not None
         # mark DEFINE_GLOBAL buf as writable
         if src[0].op is UOps.DEFINE_GLOBAL: bufs[src[0]] = (bufs[src[0]][0], (bufs[src[0]][1][0], True))
         rendered_store = self.render_store(r[src[0]], src[0].dtype, r[src[2]], src[2].dtype, strip_parens(r[src[1]]), src[0].op is UOps.DEFINE_LOCAL)
-        kk(f"if ({r[src[3]]}) {{ {rendered_store} }}" if len(src) > 3 else rendered_store)
+        kk(f"if ({r[src[3]]}) {{ {rendered_store} }}" if len(src) > 3 and src[3].op is not UOps.IF else rendered_store)
       else:
-        assert dtype is not None, f"None dtype for uop {uop}"
         if uop is UOps.RANGE:
           kk(f"for (int {(expr := ssa('ridx',u))} = {r[src[0]]}; {expr} < {r[src[1]]}; {expr}++) {{")
           depth += 1
         elif uop is UOps.ALU:
           # remove parens if ALU types are the same. TODO: can do more here
           if args in {BinaryOps.ADD,BinaryOps.MUL,BinaryOps.XOR}: operands = [strip_parens(r[v]) if v.arg == args else r[v]for v in src]
-          elif args is BinaryOps.MAX: operands = [self.render_cast(r[v], cast(DType, v.dtype)) if v.op is UOps.CONST else r[v] for v in src]
+          elif args is BinaryOps.MAX: operands = [self.render_cast(r[v], v.dtype) if v.op is UOps.CONST else r[v] for v in src]
           else: operands = [r[v] for v in src]
           val = self.code_for_op[args](*operands, dtype)
           assert child_count[u] != 0, f"childless ALU op found {u}"
@@ -147,23 +145,23 @@ class CStyleLanguage(Renderer):
           kk(f"int {args[0]} = {self.code_for_workitem[args[0][0]](args[0][-1])}; /* {args[1]} */")
           r[u] = args[0]
         elif uop is UOps.DEFINE_VAR:
-          assert args.expr not in seen_vars, f"duplicate variable {args.expr}"
-          seen_vars.add(args.expr)
-          bufs[u] = (args.expr, (dtype,False))
-          r[u] = args.expr
+          assert args[0] not in seen_vars, f"duplicate variable {args[0]}"
+          seen_vars.add(args[0])
+          bufs[u] = (args[0], (dtype,False))
+          r[u] = args[0]
         elif uop is UOps.LOAD:
           val = self.render_load(dtype, r[src[0]], src[0].dtype, strip_parens(r[src[1]]), src[0].op is UOps.DEFINE_LOCAL)
           # NOTE: this relies on the load not happening if it's in the unselected branch
           if len(src) > 3 and src[3].op is UOps.ALU: val = self.code_for_op[TernaryOps.WHERE](r[src[3]], val, r[src[2]], dtype)
           kk(f"{self.render_dtype(dtype)} {ssa('val',u)} = {val};")
-        elif uop is UOps.PHI:
+        elif uop is UOps.ASSIGN:
           kk(f"{r[src[0]]} = {r[src[1]]};")
           r[u] = r[src[0]]
         elif uop in {UOps.CAST, UOps.BITCAST, UOps.VECTORIZE}:
           assert len(src) == 1 or (uop is UOps.VECTORIZE and len(src) > 1), "Invalid source length for operation"
           if uop is UOps.BITCAST:
             precast = ssa('precast')
-            kk(f"{self.render_dtype(cast(DType, src[0].dtype))} {precast} = {r[src[0]]};")
+            kk(f"{self.render_dtype(src[0].dtype)} {precast} = {r[src[0]]};")
             val = self.render_cast(precast, dtype, bitcast=True)
           elif uop is UOps.CAST: val = self.render_cast(r[src[0]], dtype, bitcast=False)
           else: val = self.render_vectorize([r[x] for x in src], dtype)
@@ -179,10 +177,11 @@ class CStyleLanguage(Renderer):
         elif uop is UOps.DEFINE_ACC: kk(f"{self.render_dtype(dtype)} {ssa('acc',u)} = {r[src[0]]};")
         elif uop is UOps.CONST: r[u] = self.render_const(args, dtype) if args >= 0 else f"({self.render_const(args, dtype)})"
         elif uop is UOps.GEP:
-          assert src[0].dtype is not None
+          assert len(args) == 1
           from_ssa = src[0].op in {UOps.LOAD, UOps.WMMA, UOps.DEFINE_ACC}
           r[u] = (r[src[0]] if from_ssa else f"{(r[src[0]])}") + \
-            (f"[{args}]" if src[0].dtype.count > (8 if self.device in {"CUDA", "NV"} else 4) or self.device == 'CLANG' else f".{'xyzwabcd'[args]}")
+            (f"[{args[0]}]" if src[0].dtype.count > (8 if self.device in {"CUDA", "NV"} else 4) \
+             or self.device == 'CLANG' else f".{'xyzwabcd'[args[0]]}")
         else: raise RuntimeError(f"failed to render {u}")
 
     # NOTE: this relies on bufs dict preserving order
@@ -203,12 +202,26 @@ class ClangRenderer(CStyleLanguage):
                  UnaryOps.SQRT: lambda x,dtype: f"__builtin_sqrtl({x})" if dtype == dtypes.float64 else f"__builtin_sqrtf({x})",
                  BinaryOps.MAX: lambda a,b,dtype: f"(({a}>{b})?{a}:{b})"}
 
+  if AMX:
+    tc_types = [(dtype, amx_size//dtype.itemsize) for dtype, amx_size in zip([dtypes.float], [64])]
+    tensor_cores = [TensorCore(dims=(sz,sz,sz), threads=[(0,sz),(1,sz)], dtype_in=dtype, dtype_out=dtype) for dtype, sz in tc_types]
+
   def render_vector_prefix(self, dt:DType) -> str:
     return f"typedef {self.render_dtype(dt.scalar())} {self.render_dtype(dt)} __attribute__((aligned({(sz:=dt.itemsize)}),vector_size({sz})));"
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
-    prefix = [self.render_vector_prefix(dtype) for dtype in dedup(uop.dtype for uop in uops if uop.dtype is not None and uop.dtype.count>1)]
-    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+    prefix, macros = [self.render_vector_prefix(dt) for dt in dedup(uop.dtype for uop in uops if uop.dtype.count>1)], []
+    # https://github.com/corsix/amx
+    for name, (N, M, K), dtype_in, _, _, _, _, _ in dedup([uop.arg for uop in uops if uop.op is UOps.WMMA]):
+      macros = [
+        '#define AMX_SET(imm5) __asm("nop\\nnop\\nnop\\n.word (0x201000+(%0<<5)+%1)" : : "i"(17), "i"(imm5) : "memory")',
+        '#define AMX(op, gpr, btf) __asm(".word (0x201000+(%0 << 5)+0%1-((0%1>>4)*6))" : : "i"(op), "r"((unsigned long long)(gpr)+(btf)) : "memory")',
+      ]
+      prefix += [f"""{(out := self.render_dtype(dtype_in.vec(K*K)))} __{name}({self.render_dtype(dtype_in.vec(N))} data1, {self.render_dtype(dtype_in.vec(M))} data2, {out} data0){{
+  AMX_SET(0);\n  for(int ridx0 = 0; ridx0 < 16; ridx0++){{ AMX(4, (int *)(&data0), 0ull<<62 | (ridx0*4ull)<<56 | ridx0*64ull); }}
+  AMX(0, (int *)(&data2), 0ull<<62); AMX(1, (int *)(&data1), 0ull<<62); AMX(12, 0, 0ull);
+  for(int ridx0 = 0; ridx0 < 16; ridx0++){{ AMX(5, (int *)(&data0), 0ull<<62 | (ridx0*4ull)<<56 | ridx0*64ull); }}\n  AMX_SET(1);\n  return data0;\n}}"""] # noqa: E501
+    return super().render_kernel(function_name, kernel, bufs, uops, macros + prefix)
 
 class OpenCLRenderer(CStyleLanguage):
   device = "GPU"
@@ -321,7 +334,7 @@ class CUDARenderer(CStyleLanguage):
     # TODO: why is dtypes.bfloat16.name == "__bf16"? would be easier not override dtypes.name
     prefix = ["#define INFINITY (__int_as_float(0x7f800000))","#define NAN (__int_as_float(0x7fffffff))"]
 
-    for dtype in dedup(uop.dtype for uop in uops if uop.dtype is not None and uop.dtype in (dtypes.half, dtypes.bfloat16)):
+    for dtype in dedup(uop.dtype for uop in uops if uop.dtype in {dtypes.half, dtypes.bfloat16}):
       prefix += [f"#include <cuda_{'fp' if dtype == dtypes.half else 'bf'}16.h>"] + [self.render_vector_prefix(dtype.vec(sz)) for sz in [4, 8]]
 
     # TODO: this has to be way better to generate for arbitrary M,N,K: use arg[1] for MNK, use arg[4] for vec sizes, encode register packing
@@ -406,7 +419,7 @@ static inline __attribute__((device)) bool operator<(hip_bfloat16 a, hip_bfloat1
 static inline __attribute__((device)) bool operator==(hip_bfloat16 a, hip_bfloat16 b) { return ((float)a) == ((float)b); }
 """)
 
-    for dtype in dedup(uop.dtype for uop in uops if uop.dtype is not None and uop.dtype.count > 1): prefix.append(self.render_vector_prefix(dtype))
+    for dtype in dedup(uop.dtype for uop in uops if uop.dtype.count > 1): prefix.append(self.render_vector_prefix(dtype))
 
     for arg in dedup([uop.arg for uop in uops if uop.op is UOps.WMMA]): # TODO: handle TCs f32_bf16 and bf16_bf16 w/ wrapper
       if arg[3] == dtypes.float: prefix.append(f"#define __{arg[0]} __builtin_amdgcn_wmma_f32_16x16x16_f16_w32")

@@ -2,7 +2,7 @@ import struct, re, math
 from enum import Enum, auto
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple, Set, Sequence, Union, Optional, Callable, cast
+from typing import Any, Dict, List, Tuple, Sequence, Union, Optional, Callable, cast
 from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
@@ -17,42 +17,43 @@ class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SAS
 ext_to_word_dt = {dtypes.long:dtypes.int, dtypes.ulong:dtypes.uint, dtypes.double:dtypes.float}
 inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
 
-def raw(x:UOp) -> UOp: return x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}")) if x.dtype else x
-def is_nan(x:UOp) -> UOp: return -raw(x).lt(inf[x.dtype.itemsize] + 1) if x.dtype else UOp.const(dtypes.bool, False)
-def is_inf(x:UOp) -> UOp: return (raw(x) & 2**(x.dtype.itemsize*8 - 1) - 1).eq(inf[x.dtype.itemsize]) if x.dtype else UOp.const(dtypes.bool, False)
-def geu(x:UOp, v:ConstType) -> UOp: return (-x.lt(x.const(v))) | is_nan(x)
+def raw(x:UOp) -> UOp: return x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}"))
+def is_nan(x:UOp) -> UOp: return -raw(x).lt(inf[x.dtype.itemsize] + 1)
+def is_inf(x:UOp) -> UOp: return (raw(x) & 2**(x.dtype.itemsize*8 - 1) - 1).eq(inf[x.dtype.itemsize])
+def geu(x:UOp, v:ConstType) -> UOp: return (-x.lt(x.const_like(v))) | is_nan(x)
+def uabs(x:UOp): return x * x.cast(dtypes.bool).where(x.lt(x.const_like(0)).where(x.const_like(-1), x.const_like(1)), x.const_like(0))
 def ext_to_vec(x:UOp) -> UOp:
   assert x.dtype in ext_to_word_dt, f"cannot bitcast {x.dtype} to vector: expected double width dtype"
   return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
 
 def exp2(x:UOp) -> UOp:
   valid = geu(x, -126.0)
-  dest = valid.where(x, x * x.const(0.5)).alu(SASSOps.EXP2_APPROX)
+  dest = valid.where(x, x * x.const_like(0.5)).alu(SASSOps.EXP2_APPROX)
   return valid.where(dest, dest * dest)
 
 def log2(x:UOp) -> UOp: # TODO: faster than transcendental.py for int operands
   denorm = geu(x, 1.175494350822287508e-38)
-  src = denorm.where(x, x * 8388608).bitcast(dtypes.uint)
+  src = raw(denorm.where(x, x * 8388608))
   high = (src - 0x3f3504f3) & 0xff800000
   coeff = (src - high).bitcast(x.dtype) - 1
-  buf = coeff + x.const(0.0970201) - x.const(0.16845393180847167969)
+  buf = coeff + x.const_like(0.0970201) - x.const_like(0.16845393180847167969)
   params = [0.1716887056827545166, -0.17900948226451873779, 0.20512372255325317383, -0.24046532809734344482,
             0.28857114911079406738, -0.36067417263984680176, 0.48089820146560668945, -0.72134751081466674805]
   for p in params: buf *= coeff + p
   for _ in range(2): buf *= coeff
-  result = high.cast(x.dtype) * 1.1920928955078125e-07 + denorm.where(x.const(0), x.const(-23)) + buf + coeff * 1.4426950216293334961
-  return (-x.bitcast(dtypes.uint).lt(0x7f800000)).where(x.const(float("nan")), x.eq(0).where(x.const(-float("inf")), result))
+  result = high.cast(x.dtype) * 1.1920928955078125e-07 + denorm.where(x.const_like(0), x.const_like(-23)) + buf + coeff * 1.4426950216293334961
+  return (-raw(x).lt(0x7f800000)).where(x.const_like(float("nan")), x.eq(0).where(x.const_like(-float("inf")), result))
 
 def sqrt(x:UOp) -> UOp:
-  assert x.dtype in numeric - {dtypes.half}, f"unsupported dtype for SQRT: {x.dtype}"
+  assert x.dtype in set(numeric) - {dtypes.half}, f"unsupported dtype for SQRT: {x.dtype}"
   buf = (root := x.alu(SASSOps.SQRT_APPROX)) * x
-  return x.bitcast(dtypes.uint).eq(inf[x.dtype.itemsize]).where(x.const(float("inf")), x.eq(0).where(x.const(0), 0.5*(-buf*buf + x)*root + buf))
+  return raw(x).eq(inf[x.dtype.itemsize]).where(x.const_like(float("inf")), x.eq(0).where(x.const_like(0), 0.5*(-buf*buf + x)*root + buf))
 
 def recip_single(x:UOp) -> UOp:
   assert x.dtype is dtypes.float, f"unsupported dtype for single width SQRT: {x.dtype}"
   approx = x.alu(SASSOps.RECIP_APPROX)
   dest = -approx*(approx*x - 1) + approx
-  sinf, zero = [(r:=raw(x)).alu(SASSOps.SET_BITS, r.const(v), r.const(2**31 - 1)).bitcast(x.dtype) for v in [inf[x.dtype.itemsize], 0]]
+  sinf, zero = [(r:=raw(x)).alu(SASSOps.SET_BITS, r.const_like(v), r.const_like(2**31 - 1)).bitcast(x.dtype) for v in [inf[x.dtype.itemsize], 0]]
   return is_inf(x).where(zero, x.ne(0).where(dest, sinf))
 
 def recip_double(x:UOp) -> UOp:
@@ -68,9 +69,9 @@ def recip_double(x:UOp) -> UOp:
 def idiv(x:UOp, y:UOp) -> UOp:
   bits = raw(x.cast(fdt := dtypes.double) / y.cast(fdt))
   assert x.dtype in ints and y.dtype in ints and bits.dtype, f"unsupported dtypes for IDIV: x={x.dtype}, y={y.dtype}"
-  exp = (bits & inf[bits.dtype.itemsize]).alu(BinaryOps.SHR, bits.const(52)) - (2**10 - 1)
-  mask = bits.const(1).alu(BinaryOps.SHL, -exp + 52) - 1
-  return exp.lt(0).where(x.const(0), bits.alu(SASSOps.SET_BITS, bits.const(0), mask).bitcast(fdt).cast(x.dtype))
+  exp = (bits & inf[bits.dtype.itemsize]).alu(BinaryOps.SHR, bits.const_like(52)) - (2**10 - 1)
+  mask = bits.const_like(1).alu(BinaryOps.SHL, -exp + 52) - 1
+  return exp.lt(0).where(x.const_like(0), bits.alu(SASSOps.SET_BITS, bits.const_like(0), mask).bitcast(fdt).cast(x.dtype))
 
 def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
@@ -83,7 +84,7 @@ def mul_long(x:UOp, y:UOp) -> UOp:
 
 def add_long(x:UOp, y:UOp) -> UOp:
   xv = ext_to_vec(x)
-  base = (fac := raw(xv.gep(0))).alu(SASSOps.WIDE, fac.const(1), y).bitcast(xv.dtype)
+  base = (fac := raw(xv.gep(0))).alu(SASSOps.WIDE, fac.const_like(1), y).bitcast(xv.dtype)
   return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(1) + base.gep(1))).bitcast(x.dtype)
 
 def shf_long(root:UOp, x:UOp, y:UOp) -> UOp:
@@ -91,7 +92,7 @@ def shf_long(root:UOp, x:UOp, y:UOp) -> UOp:
   assert x.dtype in longs and y.dtype in ints, f"unsupported dtypes for double width shift funnel: root={root.dtype}, x={x.dtype}, y={y.dtype}"
   ext = UOp(UOps.ALU, wdt := ext_to_word_dt[x.dtype], (x, y), SASSOps.SHR_HI if (shr := root.arg == BinaryOps.SHR) else SASSOps.SHL_HI)
   base = UOp(UOps.ALU, wdt, (xv.gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), SASSOps.SHR_LO if shr else root.arg)
-  return UOp(UOps.VECTORIZE, cast(DType, base.dtype).vec(2), (base, ext)).bitcast(x.dtype)
+  return UOp(UOps.VECTORIZE, base.dtype.vec(2), (base, ext)).bitcast(x.dtype)
 
 def set_bits_long(x:UOp, y:UOp, z:UOp) -> UOp:
   xv, yv, zv = ext_to_vec(x), ext_to_vec(y), ext_to_vec(z)
@@ -99,33 +100,29 @@ def set_bits_long(x:UOp, y:UOp, z:UOp) -> UOp:
 
 def bitwise_long(root:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
-  base, ext = (b := xv.gep(0)).bitcast(dtypes.uint).alu(root.arg, yv.gep(0).bitcast(dtypes.uint)).bitcast(b.dtype), xv.gep(1).alu(root.arg, yv.gep(1))
+  base, ext = raw(b := xv.gep(0)).alu(root.arg, raw(yv.gep(0))).bitcast(b.dtype), xv.gep(1).alu(root.arg, yv.gep(1))
   return UOp(UOps.VECTORIZE, xv.dtype, (base, ext)).bitcast(x.dtype)
 
 shift_consts = set(2 ** i for i in range(64))
 r_shift = set(1/i for i in range(2, 64))
-half_not_supported = [UnaryOps.RECIP, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN, UnaryOps.SQRT]
-not_half = {dt for dt in dtypes.fields().values() if dt is not dtypes.half}
-ints, floats = set(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), set(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
-usig, longs = set(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt)), {dtypes.long, dtypes.ulong}
-numeric = ints|floats
+half_not_supported = (UnaryOps.RECIP, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN, UnaryOps.SQRT)
+not_half = tuple(dt for dt in dtypes.fields().values() if dt is not dtypes.half)
+ints, floats = tuple(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), tuple(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
+usig, longs = tuple(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt)), (dtypes.long, dtypes.ulong)
+numeric = ints + floats
 
 sass_matcher = PatternMatcher([
-  (UPat(UOps.ALU, BinaryOps.MUL, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
-        src=[UPat(UOps.CONST,  name="const"), UPat(name="mul")]),
-   lambda root, mul, const: UOp(UOps.ALU, root.dtype,
-                                (mul, UOp.const(dtypes.int, int(math.log2(const.arg)))), BinaryOps.SHL) if const.arg in shift_consts else None),
-  (UPat(UOps.ALU, BinaryOps.IDIV, name="root", dtype=set([dt for dt in dtypes.fields().values() if dtypes.is_int(dt)]),
-        src=[UPat(UOps.CONST, name="const"), UPat(name="div")]),
-   lambda root, div, const: UOp(UOps.ALU, root.dtype,
-                                (div, UOp.const(dtypes.int, int(abs(math.log2(const.arg))))), BinaryOps.SHR) if const.arg in shift_consts else None),
-  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"),UPat(name="k"))),
+  (UPat(UOps.ALU, arg=BinaryOps.MUL, name="root", dtype=ints, src=[UPat(UOps.CONST, name="c"), UPat.var("x")]),
+   lambda root, x, c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHL) if c.arg in shift_consts else None),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, name="root", dtype=ints, src=[UPat(UOps.CONST, name="c"), UPat.var("x")]),
+   lambda root, x, c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(abs(math.log2(c.arg))))), BinaryOps.SHR) if c.arg in shift_consts else None),
+  (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"),UPat.var("k"))),
    lambda root,x,y,z,k: UOp(root.op, dtypes.uchar, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())),
    lambda root: UOp(root.op, dtypes.uchar, root.src, root.arg).cast(dtypes.bool)),
-  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool), UPat())),
+  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat.var("z",dtypes.bool), UPat())),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
-  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat(name="z",dtype=dtypes.bool))),
+  (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat.var("z",dtypes.bool))),
    lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MUL, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.AND)),
@@ -133,36 +130,36 @@ sass_matcher = PatternMatcher([
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
   (UPat(UOps.ALU, name="root", arg=BinaryOps.MAX, dtype=dtypes.bool),
    lambda root: UOp(root.op, root.dtype, root.src, BinaryOps.OR)),
-  (UPat(UOps.CAST, name="root", dtype={dt for dt in dtypes.fields().values() if dt.itemsize != 4}, src=(UPat(name="x", dtype=dtypes.bool))),
+  (UPat(UOps.CAST, name="root", dtype=tuple(dt for dt in dtypes.fields().values() if dt.itemsize != 4), src=(UPat.var("x", dtypes.bool))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int),))),
-  (UPat(UOps.CAST, name="root", dtype={dtypes.double, dtypes.half}, src=(UPat(name="x", dtype={dtypes.double, dtypes.half}))),
+  (UPat(UOps.CAST, name="root", dtype=(dtypes.double, dtypes.half), src=(UPat(name="x", dtype=(dtypes.double, dtypes.half)))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.float),))),
-  (UPat(UOps.CAST, name="root", dtype={dtypes.double, dtypes.float, dtypes.half}, src=(UPat(name="x", dtype={dtypes.char, dtypes.uchar}))),
+  (UPat(UOps.CAST, name="root", dtype=(dtypes.double, dtypes.float, dtypes.half), src=(UPat(name="x", dtype=(dtypes.char, dtypes.uchar)))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.short),))),
-  (UPat(UOps.CAST, name="root", dtype={dt for dt in ints if dt.itemsize < 4}, src=(UPat(name="x", dtype={dtypes.double, dtypes.float}))),
+  (UPat(UOps.CAST, name="root", dtype=tuple(dt for dt in ints if dt.itemsize < 4), src=(UPat(name="x", dtype=(dtypes.double, dtypes.float)))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.uint if dtypes.is_unsigned(root.dtype) else dtypes.int),))),
-  (UPat(UOps.ALU, BinaryOps.MAX, dtype=dtypes.double, src=(UPat(name="x"),UPat(name="y"))),
+  (UPat(UOps.ALU, arg=BinaryOps.MAX, dtype=dtypes.double, src=(UPat.var("x"),UPat.var("y"))),
    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
-  (UPat(UOps.ALU, BinaryOps.MUL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), mul_long),  # TODO: refactor
-  (UPat(UOps.ALU, BinaryOps.ADD, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), add_long),
-  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), shf_long),
-  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))), shf_long),
-  (UPat(UOps.ALU, arg=SASSOps.SET_BITS, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))), set_bits_long),
-  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=set(ext_to_word_dt.keys()), src=(UPat(name="p"),UPat(name="x"),UPat(name="y"))), where_ext),
-  (UPat(UOps.ALU, TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat(name="x"),UPat(name="y"),UPat(name="z"))),
+  (UPat(UOps.ALU, arg=BinaryOps.MUL, dtype=(dtypes.long, dtypes.ulong), src=(UPat.var("x"),UPat.var("y"))), mul_long),  # TODO: refactor
+  (UPat(UOps.ALU, arg=BinaryOps.ADD, dtype=(dtypes.long, dtypes.ulong), src=(UPat.var("x"),UPat.var("y"))), add_long),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHL, dtype=(dtypes.long, dtypes.ulong), src=(UPat.var("x"),UPat.var("y"))), shf_long),
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.SHR, dtype=(dtypes.long, dtypes.ulong), src=(UPat.var("x"),UPat.var("y"))), shf_long),
+  (UPat(UOps.ALU, arg=SASSOps.SET_BITS, dtype=(dtypes.long, dtypes.ulong), src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), set_bits_long),
+  (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=tuple(ext_to_word_dt.keys()), src=(UPat.var("p"),UPat.var("x"),UPat.var("y"))), where_ext),
+  (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))),
    lambda x,y,z: (x & y) | (x.ne(True) & z)),
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.float}, src=(UPat(name="x"))), recip_single),
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dtypes.double}, src=(UPat(name="x"))), recip_double),
-  (UPat(UOps.ALU, UnaryOps.RECIP, dtype={dt for dt in ints if dt.itemsize <= 4}, src=(UPat(name="x"))),
-   lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))),
-  (UPat(UOps.ALU, UnaryOps.EXP2, dtype=not_half, src=(UPat(name="x"),)), exp2),
-  (UPat(UOps.ALU, UnaryOps.LOG2, dtype=not_half, src=(UPat(name="d"),)), xlog2),
-  (UPat(UOps.ALU, UnaryOps.SQRT, dtype=not_half, src=(UPat(name="x"),)), sqrt),
-  (UPat(UOps.ALU, BinaryOps.IDIV, src=(UPat(name="x"),UPat(name="y"))), idiv),
-  (UPat(UOps.ALU, BinaryOps.MOD, src=(UPat(name="x"),UPat(name="y"))), lambda x,y: x - idiv(x, y)),
-  *[(UPat(UOps.ALU, op, dtype=dtypes.half, name="x"),
-     lambda x: (UOp(x.op, dtypes.float, tuple([vv.cast(dtypes.float) for vv in x.src]), x.arg).cast(dtypes.half))) for op in half_not_supported],
-  *[(UPat(UOps.ALU, name="root", arg=op, dtype={dtypes.long, dtypes.ulong}, src=(UPat(name="x"),UPat(name="y"))),
+  (UPat(UOps.ALU, arg=UnaryOps.RECIP, dtype=dtypes.float, src=(UPat.var("x"))), recip_single),
+  (UPat(UOps.ALU, arg=UnaryOps.RECIP, dtype=dtypes.double, src=(UPat.var("x"))), recip_double),
+  (UPat(UOps.ALU, arg=UnaryOps.RECIP, dtype=tuple(dt for dt in ints if dt.itemsize <= 4), src=(UPat.var("x"))),
+   lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.half))),
+  (UPat(UOps.ALU, arg=UnaryOps.EXP2, dtype=not_half, src=(UPat.var("x"),)), exp2),
+  (UPat(UOps.ALU, arg=UnaryOps.LOG2, dtype=not_half, src=(UPat.var("d"),)), xlog2),
+  (UPat(UOps.ALU, arg=UnaryOps.SQRT, dtype=not_half, src=(UPat.var("x"),)), sqrt),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.var("y"))), idiv),
+  (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - idiv(x, y)),
+  *[(UPat(UOps.ALU, arg=op, dtype=dtypes.half, name="x"),
+     lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.half))) for op in half_not_supported],
+  *[(UPat(UOps.ALU, name="root", arg=op, dtype=(dtypes.long, dtypes.ulong), src=(UPat.var("x"),UPat.var("y"))),
      bitwise_long) for op in {BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR}],
 ])
 
@@ -272,18 +269,18 @@ inst_for_alu: Dict[Union[Op,SASSOps], Callable] = {
   BinaryOps.XOR: lambda d,s,dt,u: render_lop(d, s, dt, lop_code(lambda a,b,c: a ^ b if len(s) == 2 else a ^ b ^ c)),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
-inst_for_cast: Tuple[Tuple[Set, Set, Callable],...] = (
+inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
   (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
   (ints, longs, lambda d,s,di,do: render_mov(d,s,do) + ([Instruction("SHF", d.offset(1), ["RZ","0x1f",d], mods=["R","HI","S32"])], [])[di in usig]),
   (floats, ints, lambda d,s,di,do: Instruction("F2I", d, [s], mods=["TRUNC"] + dtype_mods(di) + dtype_mods(do) +
                                                                       (["NTZ"] if do not in longs and di is not dtypes.double else []))),
-  ({dtypes.float}, {dtypes.half}, lambda d,s,di,do: Instruction("F2FP", d, ["RZ", s], mods=["F16","F32","PACK_AB"])),
-  ({dtypes.half}, {dtypes.float}, lambda d,s,di,do: Instruction("HADD2", d, ["-RZ", s], mods=["F32"])),
-  ({dtypes.double, dtypes.float}, {dtypes.double, dtypes.float}, lambda d,s,di,do: Instruction("F2F", d, [s], mods=[f"F{do.itemsize * 8}"])),
-  ({dtypes.half}, {dtypes.bool}, lambda d,s,di,do: Instruction("LOP3", d, ["RZ",s,"0x7fff","RZ",lop_code(lambda a,b,c: a&b),"!PT"], mods=["LUT"])),
-  (floats, {dtypes.bool}, lambda d,s,di,do: Instruction(dtype_op("SETP",di), d, ["PT",s,"RZ","PT"], mods=["NEU","AND"])),
-  ({dtypes.bool}, ints|floats, lambda d,s,di,do: inst_for_alu[TernaryOps.WHERE](d, [s.negate(),"RZ",render_value(1, do)], do, None)),
-  (ints, {dtypes.bool}, lambda d,s,di,do:
+  ((dtypes.float,), (dtypes.half,), lambda d,s,di,do: Instruction("F2FP", d, ["RZ", s], mods=["F16","F32","PACK_AB"])),
+  ((dtypes.half,), (dtypes.float,), lambda d,s,di,do: Instruction("HADD2", d, ["-RZ", s], mods=["F32"])),
+  ((dtypes.double, dtypes.float), (dtypes.double, dtypes.float), lambda d,s,di,do: Instruction("F2F", d, [s], mods=[f"F{do.itemsize * 8}"])),
+  ((dtypes.half,), (dtypes.bool,), lambda d,s,di,do: Instruction("LOP3", d, ["RZ",s,"0x7fff","RZ",lop_code(lambda a,b,c: a&b),"!PT"], mods=["LUT"])),
+  (floats, (dtypes.bool,), lambda d,s,di,do: Instruction(dtype_op("SETP",di), d, ["PT",s,"RZ","PT"], mods=["NEU","AND"])),
+  ((dtypes.bool,), ints+floats, lambda d,s,di,do: inst_for_alu[TernaryOps.WHERE](d, [s.negate(),"RZ",render_value(1, do)], do, None)),
+  (ints, (dtypes.bool,), lambda d,s,di,do:
     [Instruction("ISETP", d, ["PT",s,"RZ","PT"], mods=["NE","AND"] + (["U32"] if di in usig or di in longs else []))] +
     ([Instruction("ISETP", d, ["PT",s.offset(1),"RZ","PT",d], mods=["NE","AND","EX"] + (["U32"] if di in usig else []))] if di in longs else [])),
 )
@@ -320,11 +317,9 @@ class SASSRenderer(Renderer):
 
     def to_reg(uop:UOp) -> Register:
       if isinstance(var := r[uop], Register): return var
-      assert uop.dtype, f"cannot move untyped uop to register: {uop=}"
       return Register(-1, type="P") if "PT" in var else kk(render_mov(ssa(uop), var, uop.dtype))
 
     def glob_addr(idx:UOp, glob:UOp, pred=None) -> Register:
-      assert glob.dtype, f"cannot render untyped uop as global address: {glob=}"
       if idx.op is UOps.CONST:
         if not isinstance(g_addr := r[glob], Register):
           g_addr = ssa(glob)
@@ -347,7 +342,6 @@ class SASSRenderer(Renderer):
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
       if op is UOps.STORE:
-        assert vin[2].dtype and vin[0].dtype
         if vin[0].op is UOps.DEFINE_LOCAL:
           kk(Instruction("STS", None, [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}"), to_reg(vin[2])]))
         else:
@@ -356,62 +350,59 @@ class SASSRenderer(Renderer):
         kk(iter_stack.pop(-1))
       elif op is UOps.BARRIER:
         kk(Instruction("BAR", None, ["0x0"], mods=["SYNC", "DEFER_BLOCKING"]))
-      else:
-        assert dtype, f"None dtype for uop {u}"
-        if op is UOps.DEFINE_LOCAL:
-          attr["SHM_SIZE"] = arg[1]*dtype.itemsize
-        elif op is UOps.SPECIAL:
-          kk(Instruction("S2R", ssa(u), [('SR_TID.' if (tid := arg[0][:3] == "lid") else 'SR_CTAID.') + "XYZ"[dim := int(arg[0][-1])]]))
-          if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
-        elif op is UOps.CONST:
-          if dtype.itemsize <= 4: r[u] = r[arg] if arg in r else render_value(arg, dtype)
-          else: kk(render_mov(ssa(u), render_value(arg, dtype), dtype))
-        elif op is UOps.DEFINE_GLOBAL:
-          r[u] = const_addr(u)
-          attr["PARAM_COUNT"] += 1
-        elif op is UOps.DEFINE_ACC:
-          kk(render_mov(ssa(u), r[vin[0]], dtype))
-        elif op is UOps.RANGE:
-          kk([*render_mov(ssa(u), r[vin[0]], dtype), Instruction(label := ssa(None, byte_size=4, prefix=".LOOP_").render(), None, [], label=True)])
-          update = inst_for_alu[BinaryOps.ADD](r[u], [r[u], "0x1" if len(vin) < 3 else to_reg(vin[2])], dtype, u)
-          branch = render_iter(label, ssa(None, byte_size=4, prefix="P"), to_reg(u), to_reg(vin[1]), dtype)
-          iter_stack.append([update, *branch])
-        elif op is UOps.PHI:
-          r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
-        elif op is UOps.LOAD:
-          assert vin[0].dtype
-          if vin[0].op is UOps.DEFINE_LOCAL:
-            kk(Instruction("LDS", ssa(u), [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}")]))
-          elif vin[0].op is UOps.DEFINE_GLOBAL:
-            pred = to_reg(vin[3]) if len(vin) > 3 else None
-            kk(Instruction("LDG", ssa(u), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"] + mem_mods(dtype), pred=pred))
-            if pred: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=pred.negate()))
-        elif op is UOps.CAST:
-          for dti,dto,func in inst_for_cast:
-            if vin[0].dtype in dti and dtype in dto:
-              kk(func(ssa(u), to_reg(vin[0]), vin[0].dtype, dtype))
-              break
-          else: r[u] = r[vin[0]]
-        elif op is UOps.BITCAST:
-          r[u] = f"0f{vr[2:]}" if isinstance(vr := r[vin[0]], str) and vr.startswith("0x") and dtypes.is_float(dtype) else vr
-        elif op is UOps.VECTORIZE:
-          if vin[0].dtype is dtypes.half:
-            dest, srcs = ssa(u), [to_reg(v) for v in vin]
-            kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
-          elif not all(isinstance(r[v],Register) for v in vin) or not is_contiguous([to_reg(v) for v in vin]) or not is_aligned(to_reg(vin[0]),dtype):
-            assert vin[0].dtype
-            dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
-            kk([inst for i,s in enumerate([r[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
-          else:
-            r[u] = r[vin[0]]
-            for v in vin: to_reg(v).size = nregs(dtype.itemsize)
-        elif op is UOps.GEP:
-          r[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg)//4), mod='_'.join([f"H{int(b % 4 != 0)}"]*2) if dtype.itemsize < 4 else "")
-        elif op is UOps.ALU:
-          if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), [to_reg(v) for v in vin], dtype, u))
-          elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE] and vin[0].dtype: kk(render_cmp(arg, ssa(u), [to_reg(v) for v in vin], vin[0].dtype))
-          else: raise NotImplementedError
+      elif op is UOps.DEFINE_LOCAL:
+        attr["SHM_SIZE"] = arg[1]*dtype.itemsize
+      elif op is UOps.SPECIAL:
+        kk(Instruction("S2R", ssa(u), [('SR_TID.' if (tid := arg[0][:3] == "lid") else 'SR_CTAID.') + "XYZ"[dim := int(arg[0][-1])]]))
+        if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
+      elif op is UOps.CONST:
+        if dtype.itemsize <= 4: r[u] = r[arg] if arg in r else render_value(arg, dtype)
+        else: kk(render_mov(ssa(u), render_value(arg, dtype), dtype))
+      elif op is UOps.DEFINE_GLOBAL:
+        r[u] = const_addr(u)
+        attr["PARAM_COUNT"] += 1
+      elif op is UOps.DEFINE_ACC:
+        kk(render_mov(ssa(u), r[vin[0]], dtype))
+      elif op is UOps.RANGE:
+        kk([*render_mov(ssa(u), r[vin[0]], dtype), Instruction(label := ssa(None, byte_size=4, prefix=".LOOP_").render(), None, [], label=True)])
+        update = inst_for_alu[BinaryOps.ADD](r[u], [r[u], "0x1" if len(vin) < 3 else to_reg(vin[2])], dtype, u)
+        branch = render_iter(label, ssa(None, byte_size=4, prefix="P"), to_reg(u), to_reg(vin[1]), dtype)
+        iter_stack.append([update, *branch])
+      elif op is UOps.ASSIGN:
+        r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
+      elif op is UOps.LOAD:
+        if vin[0].op is UOps.DEFINE_LOCAL:
+          kk(Instruction("LDS", ssa(u), [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}")]))
+        elif vin[0].op is UOps.DEFINE_GLOBAL:
+          pred = to_reg(vin[3]) if len(vin) > 3 else None
+          kk(Instruction("LDG", ssa(u), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"] + mem_mods(dtype), pred=pred))
+          if pred: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=pred.negate()))
+      elif op is UOps.CAST:
+        for dti,dto,func in inst_for_cast:
+          if vin[0].dtype in dti and dtype in dto:
+            kk(func(ssa(u), to_reg(vin[0]), vin[0].dtype, dtype))
+            break
+        else: r[u] = r[vin[0]]
+      elif op is UOps.BITCAST:
+        r[u] = f"0f{vr[2:]}" if isinstance(vr := r[vin[0]], str) and vr.startswith("0x") and dtypes.is_float(dtype) else vr
+      elif op is UOps.VECTORIZE:
+        if vin[0].dtype is dtypes.half:
+          dest, srcs = ssa(u), [to_reg(v) for v in vin]
+          kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
+        elif not all(isinstance(r[v],Register) for v in vin) or not is_contiguous([to_reg(v) for v in vin]) or not is_aligned(to_reg(vin[0]),dtype):
+          dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
+          kk([inst for i,s in enumerate([r[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
+        else:
+          r[u] = r[vin[0]]
+          for v in vin: to_reg(v).size = nregs(dtype.itemsize)
+      elif op is UOps.GEP:
+        assert len(arg) == 1, f"unexpected gep arg: {arg}"
+        r[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg[0])//4), mod='_'.join([f"H{int(b%4 != 0)}"]*2) if dtype.itemsize < 4 else "")
+      elif op is UOps.ALU:
+        if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), [to_reg(v) for v in vin], dtype, u))
+        elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE] and vin[0].dtype: kk(render_cmp(arg, ssa(u), [to_reg(v) for v in vin], vin[0].dtype))
         else: raise NotImplementedError
+      else: raise NotImplementedError
 
     kk(Instruction("EXIT", None, []))
     kk(Instruction(buf_lab := ".L_BUF", None, [], label=True))

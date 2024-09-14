@@ -1,9 +1,9 @@
 import unittest, itertools
-from test.helpers import TestUOps
 from tinygrad.dtype import dtypes
-from tinygrad.ops import UOps, UOp, PatternMatcher, UPat, BinaryOps, TernaryOps, ReduceOps, UnaryOps # noqa: F401
+from tinygrad.ops import UOps, UOp, BinaryOps, TernaryOps, ReduceOps, UnaryOps # noqa: F401
+from tinygrad.ops import PatternMatcher, UPat
 
-class TestPatternMatcher(TestUOps):
+class TestPatternMatcher(unittest.TestCase):
   def test_simple_match(self):
     matcher = PatternMatcher([(UPat(UOps.CONST, name="x", dtype=dtypes.float), lambda x: x)])
     c1 = UOp(UOps.CONST, dtypes.float, arg=1.0)
@@ -30,9 +30,9 @@ class TestPatternMatcher(TestUOps):
 
   def test_arg(self):
     matcher = PatternMatcher([
-      (UPat(UOps.CONST, 0, name="x"), lambda x: x),
-      (UPat(UOps.CONST, False, name="x"), lambda x: x),
-      (UPat(UOps.ALU, BinaryOps.MAX, name="x"), lambda x: x),
+      (UPat(UOps.CONST, arg=0, name="x"), lambda x: x),
+      (UPat(UOps.CONST, arg=False, name="x"), lambda x: x),
+      (UPat(UOps.ALU, arg=BinaryOps.MAX, name="x"), lambda x: x),
     ])
     c1 = UOp(UOps.CONST, dtypes.float, arg=0.0)
     c2 = UOp(UOps.CONST, dtypes.bool, arg=False)
@@ -47,7 +47,7 @@ class TestPatternMatcher(TestUOps):
 
   def test_filter_arg(self):
     matcher = PatternMatcher([
-      (UPat(UOps.ALU, BinaryOps.MUL, [UPat(UOps.CONST, name="c"), UPat(UOps.CONST, 2)], name="x"),
+      (UPat(UOps.ALU, arg=BinaryOps.MUL, src=[UPat(UOps.CONST, name="c"), UPat(UOps.CONST, arg=2)], name="x"),
        lambda x,c: x if c.arg in {1, -1} else None)
     ])
     y1 = UOp(UOps.CONST, dtypes.int, arg=1)
