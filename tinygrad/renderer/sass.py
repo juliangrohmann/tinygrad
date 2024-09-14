@@ -1,14 +1,20 @@
-import struct, re, math
+import struct, re, math, subprocess, tempfile
+from pathlib import Path
 from enum import Enum, auto
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple, Sequence, Union, Optional, Callable, cast
-from tinygrad.helpers import data64_le
+from tinygrad.helpers import data64_le, getenv, to_function_name
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
+from tinygrad.renderer.cstyle import CUDARenderer
+from tinygrad.engine.graph import graph_uops
 from tinygrad.codegen.transcendental import xlog2
+from tinygrad.runtime.support.compiler_cuda import SASSCompiler
+from tinygrad.runtime.support.elf import elf_loader
+from CuAsm import CubinFile
 
 class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
@@ -297,6 +303,12 @@ class SASSRenderer(Renderer):
   def __init__(self, arch:str, device="CUDA"): self.device, self.tensor_cores = device, SASSRenderer.tensor_cores if int(arch[3:]) >= 80 else []
 
   def render(self, name:str, uops:List[UOp]) -> str:
+    # NOTE: debug
+    if getenv("GRAPHUOPS"): # TODO: remove
+      graph_uops(uops)
+    if debug_sass := getenv("DEBUG_SASS", ""):
+      with open(debug_sass) as f: return f.read()
+
     attr: Dict[str, int] = {"PARAM_COUNT": 0}
     kernel: List[Instruction] = []
     iter_stack: List[List[Instruction]] = []
@@ -341,6 +353,13 @@ class SASSRenderer(Renderer):
 
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
+
+      # NOTE: debug
+      if getenv("PRINT_UOPS", 0): # TODO: remove
+        print(f"{op=}, {arg=}, {dtype=}")
+        for v in vin:
+          print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
+
       if op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_LOCAL:
           kk(Instruction("STS", None, [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}"), to_reg(vin[2])]))
@@ -410,12 +429,41 @@ class SASSRenderer(Renderer):
     for _ in range(10): kk(Instruction("NOP", None, []))
     kk(Instruction(".L_END", None, [], label=True))
 
+    # NOTE: debug
+    for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
+    attr["SHI_REGISTERS"] = c["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
     rewrite_registers(kernel, "P")
     spill_to_flags(kernel)
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     set_ctrl(kernel)
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
-    return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+    sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+    # NOTE: debug
+    if out_dir := getenv("WRITE_SRC", ""):
+      try:
+        cuda_src = CUDARenderer("sm_89").render(to_function_name(name), uops)
+        with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
+        subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(),
+                        (Path(out_dir) / "nvcc.cu").as_posix()], check=False)
+        with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
+          subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f, check=False)
+        with open(Path(out_dir) / "nvcc.cubin", "rb") as frb: cuda_blob = frb.read()
+        cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
+        with open(Path(out_dir) / "nvcc.bin", "wb") as fwb: fwb.write(cuda_kernel)
+        with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
+          tmp.close()
+          subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+          CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+      except Exception:
+        pass
+      with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
+      with open(Path(out_dir) / "rendered_ssa.sass", "w") as f: f.write(ssa_src)
+      elf = SASSCompiler("sm_89").compile(sass_src)
+      with open(Path(out_dir) / "rendered.cubin", "wb") as fwb: fwb.write(elf)
+    return ssa_src if getenv("SSA") else sass_src
 
 def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
   def alloc(size): return next((i for i in range(reg_type == "P", 256) if i % size == 0 and all(i+j not in allocated for j in range(size))), None)
