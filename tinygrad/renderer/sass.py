@@ -236,8 +236,7 @@ def render_lop(d, s, dt, code) -> List[Instruction]:
   srcs = fill(s, 3, dt, val=True if dt is dtypes.bool else 0)
   return [Instruction("PLOP3", d, ["PT", *srcs, code, "0x0"]) if dt is dtypes.bool else Instruction("LOP3", d, [*srcs, code, "!PT"])]
 
-def render_iter(label:str, pred:Register, counter:Register, end:Register, dtype:DType) -> List[Instruction]:
-  return [*render_cmp(BinaryOps.CMPNE, pred, [counter, end], dtype), Instruction("BRA", None, [f"`({label})"], pred=pred)]
+def render_bra(label:str, pred:Optional[Register]=None): return Instruction("BRA", None, [f"`({label})"], pred=pred)
 
 def nregs(byte_size) -> int: return (byte_size + 3) // 4
 def const_addr(uop:UOp, offset=0) -> str: return f"c[0x0][{hex(int("160", 16) + 8*uop.arg + offset)}]"
@@ -316,7 +315,7 @@ class SASSRenderer(Renderer):
     c:Dict[str, int] = defaultdict(int)
     r:Dict[Any, Union[Register,str]] = {}
     def ssa(uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None) -> Register: # TODO: bad interface
-      n = nregs(byte_size or (uop and uop.dtype and (8 if isinstance(uop.dtype, PtrDType) else uop.dtype.itemsize)))
+      n = nregs(byte_size or (uop and (8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4))))
       idx = n * ((c[p := prefix or ("P" if uop and uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
       c[p] = idx + n
       ret = Register(idx, size=n, type=p)
@@ -360,7 +359,11 @@ class SASSRenderer(Renderer):
         for v in vin:
           print(f"\t{v.op=}, {v.arg=}, {v.dtype=}")
 
-      if op is UOps.STORE:
+      if op is UOps.IF:
+        kk(render_bra(ssa(u, prefix=".IF_").render(), to_reg(vin[0])))
+      elif op is UOps.ENDIF:
+        kk(Instruction(label.render() if isinstance(label := r[vin[0]], Register) else label, None, [], label=True))
+      elif op is UOps.STORE:
         if vin[0].op is UOps.DEFINE_LOCAL:
           kk(Instruction("STS", None, [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}"), to_reg(vin[2])]))
         else:
@@ -383,9 +386,10 @@ class SASSRenderer(Renderer):
       elif op is UOps.DEFINE_ACC:
         kk(render_mov(ssa(u), r[vin[0]], dtype))
       elif op is UOps.RANGE:
-        kk([*render_mov(ssa(u), r[vin[0]], dtype), Instruction(label := ssa(None, byte_size=4, prefix=".LOOP_").render(), None, [], label=True)])
+        kk([*render_mov(ssa(u), r[vin[0]], dtype), Instruction(label := ssa(None, byte_size=4, prefix=".RANGE_").render(), None, [], label=True)])
+        pred, counter, end = ssa(None, byte_size=4, prefix="P"), to_reg(u), to_reg(vin[1])
         update = inst_for_alu[BinaryOps.ADD](r[u], [r[u], "0x1" if len(vin) < 3 else to_reg(vin[2])], dtype, u)
-        branch = render_iter(label, ssa(None, byte_size=4, prefix="P"), to_reg(u), to_reg(vin[1]), dtype)
+        branch = [*render_cmp(BinaryOps.CMPNE, pred, [counter, end], dtype), render_bra(label, pred)]
         iter_stack.append([update, *branch])
       elif op is UOps.ASSIGN:
         r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
@@ -393,9 +397,9 @@ class SASSRenderer(Renderer):
         if vin[0].op is UOps.DEFINE_LOCAL:
           kk(Instruction("LDS", ssa(u), [replace(to_reg(vin[1]), mem_type="", mod=f"X{vin[0].dtype.itemsize}")]))
         elif vin[0].op is UOps.DEFINE_GLOBAL:
-          pred = to_reg(vin[3]) if len(vin) > 3 else None
-          kk(Instruction("LDG", ssa(u), [glob_addr(vin[1], vin[0], pred=pred)], mods=["E"] + mem_mods(dtype), pred=pred))
-          if pred: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=pred.negate()))
+          gate = to_reg(vin[3]) if len(vin) > 3 else None
+          kk(Instruction("LDG", ssa(u), [glob_addr(vin[1], vin[0], pred=gate)], mods=["E"] + mem_mods(dtype), pred=gate))
+          if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
       elif op is UOps.CAST:
         for dti,dto,func in inst_for_cast:
           if vin[0].dtype in dti and dtype in dto:
@@ -421,7 +425,7 @@ class SASSRenderer(Renderer):
         if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), [to_reg(v) for v in vin], dtype, u))
         elif arg in [BinaryOps.CMPLT, BinaryOps.CMPNE] and vin[0].dtype: kk(render_cmp(arg, ssa(u), [to_reg(v) for v in vin], vin[0].dtype))
         else: raise NotImplementedError
-      else: raise NotImplementedError
+      else: r[u] = "0x0"
 
     kk(Instruction("EXIT", None, []))
     kk(Instruction(buf_lab := ".L_BUF", None, [], label=True))
@@ -470,7 +474,7 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
   unrolled = []
   loops: Dict[str, List[Instruction]] = {}
   for inst in kernel:
-    if inst.label and "LOOP" in inst.op:
+    if inst.label and "RANGE" in inst.op:
       loops[inst.op] = []
     unrolled.append(inst)
     for v in loops.values(): v.append(inst)
