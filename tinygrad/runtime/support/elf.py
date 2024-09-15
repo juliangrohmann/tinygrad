@@ -44,10 +44,10 @@ def make_elf(header:libc.Elf64_Ehdr, sections:List[ElfSection], segments:Optiona
 
   blob = bytearray()
   for s in sections:
-    if s.header.sh_type == libc.SHT_NOBITS: continue
     blob += _pad(len(blob) + header.e_ehsize, s.header.sh_addralign)
     s.header.sh_offset = header.e_ehsize + len(blob) if s.header.sh_name != 0 else 0
-    blob += s.content
+    if s.header.sh_type != libc.SHT_NOBITS:
+      blob += s.content
 
   blob += _pad(len(blob) + header.e_ehsize, 8)
   header.e_shoff = header.e_ehsize + len(blob)

@@ -1,15 +1,15 @@
 from typing import Sequence, List, Dict, Any
 import tinygrad.runtime.autogen.libc as libc
-from tinygrad.helpers import partition
+from tinygrad.helpers import partition, getenv
 from tinygrad.runtime.support.assembler_sass import SASSParser
 from tinygrad.runtime.support.elf import ElfSection, ElfSegment, make_elf
 
 strtab_common_pre = (".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.FUNC", ".nv.info.FUNC", ".nv.shared.FUNC")
-strtab_common_post = (".nv.prototype", ".nv.rel.action")
+strtab_common_post = (".debug_frame", ".rel.debug_frame", ".rela.debug_frame", ".nv.callgraph", ".nv.prototype", ".nv.rel.action")
 strtab_names = strtab_common_pre + (".rel.nv.constant0.FUNC", ".nv.constant0.FUNC") + strtab_common_post + ("FUNC",)
 shstrtab_names = strtab_common_pre + (".nv.constant0.FUNC", ".rel.nv.constant0.FUNC") + strtab_common_post
-sym_names = (".text.FUNC", ".nv.constant0.FUNC", ".nv.rel.action", "FUNC") # TODO: is .nv.info needed?
-sec_names = (".shstrtab", ".strtab", ".symtab", ".nv.info", ".nv.info.FUNC", ".nv.rel.action", ".nv.constant0.FUNC", ".text.FUNC", ".nv.shared.FUNC")
+sym_names = (".text.FUNC", ".nv.shared.FUNC", ".nv.constant0.FUNC", ".debug_frame", ".nv.callgraph", ".nv.rel.action", "FUNC") # TODO: is .nv.info needed?
+sec_names = (".shstrtab", ".strtab", ".symtab", ".debug_frame", ".nv.info", ".nv.info.FUNC", ".nv.callgraph", ".nv.rel.action", ".rel.debug_frame", ".nv.constant0.FUNC", ".text.FUNC", ".nv.shared.FUNC")
 eiattr = {'EIATTR_MAX_THREADS': 0x0504, 'EIATTR_PARAM_CBANK': 0x0a04, 'EIATTR_FRAME_SIZE': 0x1104, 'EIATTR_MIN_STACK_SIZE': 0x1204,
           'EIATTR_KPARAM_INFO': 0x1704, 'EIATTR_CBANK_PARAM_SIZE': 0x1903, 'EIATTR_MAXREG_COUNT': 0x1b03, 'EIATTR_EXIT_INSTR_OFFSETS': 0x1c04,
           'EIATTR_REGCOUNT': 0x2f04, 'EIATTR_CUDA_API_VERSION': 0x3704}
@@ -19,17 +19,31 @@ nv_info_func_attr = ("EIATTR_CUDA_API_VERSION", "EIATTR_PARAM_CBANK", "EIATTR_CB
                       "EIATTR_MAXREG_COUNT", "EIATTR_EXIT_INSTR_OFFSETS", "EIATTR_MAX_THREADS")
 nv_rel_action = b'\x73\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x11\x25\x00\x05\x36' # TODO: figure out dynsym d_un type
 
+debug_frame = b'\xff\xff\xff\xff$\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x03\x00\x04|\xff\xff\xff\xff\x0f\x0c\x81\x80\x80(\x00\x08\xff\x81\x80(\x08\x81\x80\x80(\x00\x00\x00\xff\xff\xff\xff4\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x03\x00\x00\x00\x00\x00\x00\x04\x04\x00\x00\x00\x04<\x00\x00\x00\x0c\x81\x80\x80(\x00\x04t\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+nv_callgraph = b'\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\xfe\xff\xff\xff\x00\x00\x00\x00\xfd\xff\xff\xff\x00\x00\x00\x00\xfc\xff\xff\xff'
+rel_debug_frame = b'D\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x07\x00\x00\x00'
+symtab = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x002\x00\x00\x00\x03\x00\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00[\x00\x00\x00\x03\x00\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x92\x00\x00\x00\x03\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xad\x00\x00\x00\x03\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xdd\x00\x00\x00\x03\x00\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf9\x00\x00\x00\x03\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x01\x00\x00\x12\x10\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x03\x00\x00\x00\x00\x00\x00'
+
 def make_cubin(kernel:bytes, eiattr:Dict[str,List], parser:SASSParser, arch:str) -> memoryview:
   assert arch == "sm_89", f"cubin generation not supported for {arch}"
   (attr := dict(eiattr)).update({"EIATTR_MIN_STACK_SIZE": [[sym_names.index("FUNC") + 1, 0]], "EIATTR_FRAME_SIZE":[[sym_names.index("FUNC") + 1, 0]]})
   attr.update({k: [[sym_names.index(v[0]) + 1, v[1]] for v in attr[k]] for k in indexed_attr}) # map sym names to indices
+  attr.update({"EIATTR_REGCOUNT": [[7, 30]]})
+  attr.update({"EIATTR_MAXREG_COUNT": [128]})
+  attr.update({"EIATTR_EXIT_INSTR_OFFSETS": [[240, 720]]})
+  attr.update({"EIATTR_MAX_THREADS": [[512, 1, 1]]})
+  print(f"{attr=}")
   sec_tab = {".shstrtab": build_shstrtab(parser.function_name),
              ".strtab": build_strtab(parser.function_name),
              ".text.FUNC": build_kernel(kernel, parser.function_name, attr),
              ".nv.info": build_nv_info(attr),
              ".nv.info.FUNC": build_nv_info_func(parser.function_name, attr),
              ".nv.rel.action": build_nv_rel_action(),
-             ".nv.constant0.FUNC": build_constant_memory(parser.function_name, attr)}
+             ".nv.constant0.FUNC": build_constant_memory(parser.function_name, attr),
+             ".debug_frame": build_debug_frame(),
+             ".nv.callgraph": build_nv_callgraph(),
+             ".rel.debug_frame": build_rel_debug_frame()
+             }
   sec_tab[".symtab"] = build_symtab(parser.function_name, sec_tab[".strtab"], sec_tab[".text.FUNC"])
   if "SHM_SIZE" in attr: sec_tab[".nv.shared.FUNC"] = build_shared_memory(parser.function_name, attr)
   for s in sec_tab.values(): s.header.sh_name, s.header.sh_size = sh_name(s.name, sec_tab[".shstrtab"].content), len(s.content)
@@ -37,6 +51,15 @@ def make_cubin(kernel:bytes, eiattr:Dict[str,List], parser:SASSParser, arch:str)
   segments = build_segments(sections)
   header = build_file_header(attr, len(sections), len(segments))
   return make_elf(header, sections, segments)
+
+def build_rel_debug_frame() -> ElfSection: # TODO: remove
+  return ElfSection(".rel.debug_frame", libc.Elf64_Shdr(sh_type=libc.SHT_REL, sh_addralign=8, sh_info=4, sh_link=3, sh_flags=64, sh_entsize=16), rel_debug_frame)
+
+def build_debug_frame() -> ElfSection: # TODO: remove
+  return ElfSection(".debug_frame", libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_addralign=1), debug_frame)
+
+def build_nv_callgraph() -> ElfSection: # TODO: remove
+  return ElfSection(".nv.callgraph", libc.Elf64_Shdr(sh_type=libc.SHT_LOPROC + libc.SHT_PROGBITS, sh_addralign=4, sh_entsize=8, sh_link=3), nv_callgraph)
 
 def build_file_header(attr:Dict[str,List], shnum:int, phnum:int) -> libc.Elf64_Ehdr:
   header = libc.Elf64_Ehdr()
@@ -73,8 +96,11 @@ def build_strtab(function_name:str) -> ElfSection:
   return ElfSection(".strtab", sh, b'\0' + b'\0'.join(s.encode() for s in strtab) + b'\0')
 
 def build_kernel(kernel:bytes, function_name:str, attr:Dict[str,List]) -> ElfSection:
-  sh = libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_flags=libc.SHF_EXECINSTR + libc.SHF_ALLOC, sh_link=sec_names.index(".symtab") + 1,
-                       sh_info=(attr["EIATTR_REGCOUNT"][0][1] << 24) + 6, sh_addralign=128)
+  if ko := getenv("KERNEL_OVERRIDE", ""):
+    print("OVERRIDE")
+    with open(ko, "rb") as f: kernel = f.read()
+  sh = libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_flags=libc.SHF_EXECINSTR + libc.SHF_ALLOC + 1048576, sh_link=sec_names.index(".symtab") + 1,
+                       sh_info=(attr["EIATTR_REGCOUNT"][0][1] << 24) + 7, sh_addralign=128)
   return ElfSection(f".text.{function_name}", sh, kernel)
 
 def build_symtab(function_name:str, strtab:ElfSection, kernel:ElfSection) -> ElfSection:
@@ -107,8 +133,8 @@ def build_constant_memory(function_name:str, attr:Dict[str,List]) -> ElfSection:
   return ElfSection(f".nv.constant0.{function_name}", sh, b'\0'*(((v := attr["EIATTR_PARAM_CBANK"][0][-1]) >> 16) + (v & ((1 << 16) - 1))))
 
 def build_shared_memory(function_name:str, attr:Dict[str,List]) -> ElfSection:
-  sh = libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_flags=0x40+libc.SHF_ALLOC+libc.SHF_WRITE,
-                       sh_info=sec_names.index(".nv.shared.FUNC") + 1, sh_addralign=4)
+  sh = libc.Elf64_Shdr(sh_type=libc.SHT_NOBITS, sh_flags=0x40+libc.SHF_ALLOC+libc.SHF_WRITE,
+                       sh_info=sec_names.index(".text.FUNC") + 1, sh_addralign=4)
   return ElfSection(f".nv.shared.{function_name}", sh, b'\0'*attr["SHM_SIZE"][0][0])
 
 def pack_eiattr_tab(attr_names:Sequence[str], kernel_eiattr:Dict[str, List]) -> bytes:

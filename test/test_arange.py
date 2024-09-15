@@ -1,4 +1,4 @@
-import unittest, contextlib
+import unittest, contextlib, sys
 import numpy as np
 from tinygrad import Tensor, GlobalCounters, dtypes, nn
 from tinygrad.helpers import CI, Context, getenv
@@ -20,6 +20,11 @@ class TestArange(unittest.TestCase):
     print(p.name)
     #print(p.src)
     ExecItem(CompiledRunner(p), [tt.lazydata.buffer]).run()
+    ret = tt.numpy()
+    print(f"max={ret.max()*4}")
+    np.set_printoptions(threshold=sys.maxsize)
+    print(f"wrong:\n{ret[mask := (ret != np.arange(N))]}\n")
+    print(f"right:\n{np.arange(N)[mask]}\n")
     np.testing.assert_equal(tt.numpy(), np.arange(N))
     return p.op_estimate
 
