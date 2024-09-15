@@ -8,7 +8,7 @@ strtab_common_pre = (".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.in
 strtab_common_post = (".nv.prototype", ".nv.rel.action")
 strtab_names = strtab_common_pre + (".rel.nv.constant0.FUNC", ".nv.constant0.FUNC") + strtab_common_post + ("FUNC",)
 shstrtab_names = strtab_common_pre + (".nv.constant0.FUNC", ".rel.nv.constant0.FUNC") + strtab_common_post
-sym_names = (".text.FUNC", ".nv.constant0.FUNC", ".nv.rel.action", "FUNC") # TODO: is .nv.info needed?
+sym_names = (".text.FUNC", ".nv.shared.FUNC", ".nv.constant0.FUNC", ".nv.rel.action", "FUNC") # TODO: is .nv.info needed?
 sec_names = (".shstrtab", ".strtab", ".symtab", ".nv.info", ".nv.info.FUNC", ".nv.rel.action", ".nv.constant0.FUNC", ".text.FUNC", ".nv.shared.FUNC")
 eiattr = {'EIATTR_MAX_THREADS': 0x0504, 'EIATTR_PARAM_CBANK': 0x0a04, 'EIATTR_FRAME_SIZE': 0x1104, 'EIATTR_MIN_STACK_SIZE': 0x1204,
           'EIATTR_KPARAM_INFO': 0x1704, 'EIATTR_CBANK_PARAM_SIZE': 0x1903, 'EIATTR_MAXREG_COUNT': 0x1b03, 'EIATTR_EXIT_INSTR_OFFSETS': 0x1c04,
@@ -108,7 +108,7 @@ def build_constant_memory(function_name:str, attr:Dict[str,List]) -> ElfSection:
 
 def build_shared_memory(function_name:str, attr:Dict[str,List]) -> ElfSection:
   sh = libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_flags=0x40+libc.SHF_ALLOC+libc.SHF_WRITE,
-                       sh_info=sec_names.index(".nv.shared.FUNC") + 1, sh_addralign=4)
+                       sh_info=sec_names.index(".text.FUNC") + 1, sh_addralign=4)
   return ElfSection(f".nv.shared.{function_name}", sh, b'\0'*attr["SHM_SIZE"][0][0])
 
 def pack_eiattr_tab(attr_names:Sequence[str], kernel_eiattr:Dict[str, List]) -> bytes:
