@@ -529,7 +529,7 @@ def spill_to_flags(kernel:List[Instruction]):
       cast(Register, sp).idx = cap + j + 1
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS"} # TODO: casts are only variable lat for double width
-read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F"}
+read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", }
 
 def set_ctrl(kernel:List[Instruction]):
   def new_bar(): return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
