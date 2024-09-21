@@ -1,4 +1,4 @@
-import struct, re
+import struct, re, itertools
 from functools import partial
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
@@ -139,6 +139,7 @@ sass_matcher = PatternMatcher([
 @dataclass
 class Register:
   idx:int; size:int=1; type:str="R"; negated:bool=False; mem_type:Optional[str]=None; postfix:str=""; mod:Optional[str]=None # noqa: E702
+  phys:Optional[int]=None; spill:Optional[bool]=None # noqa: E702
   def render(self) -> str:
     infix = f"{self.identity()}{f'.{self.mod}' if self.mod else ''}{self.postfix}"
     return f"{'-!'[self.type == "P"] if self.negated else ''}{f'{self.mem_type}[{infix}]' if self.mem_type is not None else infix}"
@@ -363,10 +364,46 @@ class SASSRenderer(Renderer):
     for _ in range(10): kk(Instruction("NOP", None, []))
     kk(Instruction(".L_END", None, [], label=True))
 
+    attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
+      if x.phys: x.idx = x.phys
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
-    attr["SHI_REGISTERS"] = c["R"] + 3 # two internal registers on sm >= 8x, and RZ
     set_ctrl(kernel)
     return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+reg_cap, buf_size = 240, 6
+
+def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
+  def alloc(size): return next(i for i in itertools.count(reg_type == "P") if i % size == 0 and all(i + j not in allocated for j in range(size)))
+  unrolled = []
+  loops: Dict[str, List[Instruction]] = {}
+  for inst in kernel:
+    if inst.label and "RANGE" in inst.op:
+      loops[inst.op] = []
+    unrolled.append(inst)
+    for v in loops.values(): v.append(inst)
+    if inst.srcs and isinstance(inst.srcs[0], str) and (label := next((k for k in loops.keys() if k in inst.srcs[0]), None)):
+      loop_inst = loops.pop(label)
+      unrolled.extend(loop_inst)
+      for v in loops.values(): v.extend(loop_inst)
+  locs, all_reg = defaultdict(list), set()
+  for i,r in enumerate([src for inst in unrolled for src in [inst.pred, *inst.srcs, inst.dest]]):
+    if isinstance(r, Register) and r.idx != -1 and r.type == reg_type:
+      locs[r.base().idx, r.size].append(i)
+      all_reg.add(r)
+  events = sorted([(k, max(v), False) for k,v in locs.items()] + [(k, min(v), True) for k,v in locs.items()], key=lambda x: x[1])
+  allocated, repl = [], {}
+  for (idx, size), _, is_alloc in events:
+    if is_alloc:
+      repl[idx] = base_idx = alloc(size)
+      allocated.extend([base_idx + i for i in range(size)])
+    elif idx in repl:
+      for i in range(size): allocated.remove(repl[idx] + i)
+  for reg in all_reg:
+    bidx = reg.base().idx
+    reg.phys = repl[bidx] + reg.idx - bidx
+    if reg_type == "R" and reg.phys: reg.spill = reg.phys + reg.size - 1 > reg_cap
+  return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys] + [0])
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA"} # TODO: casts only var lat for double width
 read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
