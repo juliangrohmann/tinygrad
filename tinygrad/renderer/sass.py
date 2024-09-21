@@ -330,6 +330,14 @@ class SASSRenderer(Renderer):
           kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
         else: raise NotImplementedError
         if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
+      elif op is UOps.CAST:
+        for dti,dto,func in inst_for_cast:
+          if vin[0].dtype in dti and dtype in dto:
+            kk(func(ssa(u), to_reg(vin[0]), vin[0].dtype, dtype))
+            break
+        else: r[u] = r[vin[0]]
+      elif op is UOps.BITCAST:
+        r[u] = vr.replace("0x", "0f") if isinstance(vr := r[vin[0]], str) and dtypes.is_float(dtype) and re.match(r"-?0x", vr) else vr
       elif op is UOps.VECTORIZE:
         if vin[0].dtype is dtypes.float16:
           dest, srcs = ssa(u), [to_reg(v) for v in vin]
