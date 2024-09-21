@@ -191,6 +191,7 @@ class Instruction:
 
 def nregs(byte_size:int) -> int: return (byte_size + 3) // 4
 def const_addr(uop:UOp, offset:int=0) -> str: return f"c[0x0][{hex(int("160", 16) + 8*uop.arg + offset)}]"
+def shm_addr(idx:Register, offset:str, dtype:DType): return replace(idx, mem_type="", mod=f"X{dtype.itemsize}", postfix="+"+offset)
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 def is_aligned(src:Register, dtype:DType) -> bool: return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
@@ -228,6 +229,9 @@ def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
 
 def render_bra(label:str, pred:Optional[Register]=None):
   return Instruction("BRA", None, [f"`({label})"], pred=pred)
+
+def render_shm(idx:Register, offset:str, src:Register, dt:DType, load:bool, pred:Optional[Register]=None):
+  return [Instruction(*("LDS",src) if load else ("STS",None), [shm_addr(idx,offset,dt)] + ([src] if not load else []), mods=mem_mods(dt), pred=pred)]
 
 inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
   (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
@@ -272,6 +276,9 @@ inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
+commutative = {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR, BinaryOps.CMPNE, SASSOps.FMA, SASSOps.WIDE,
+               SASSOps.DMAX}
+
 class Allocator:
   def __init__(self, vals:Dict[Any, Union[Register,str]]):
     self.vals = vals
@@ -306,11 +313,22 @@ class SASSRenderer(Renderer):
       kernel.extend(instrs := [instrs] if not isinstance(instrs, list) else instrs)
       return next((inst.dest for inst in instrs[::-1] if inst.dest and inst.dest.idx % inst.dest.size == 0), instrs[-1].dest)
 
-    def to_reg(uop:UOp) -> Register:
+    def to_reg(uop:UOp):
       if isinstance(var := r[uop], Register): return var
       if "PT" in var or "RZ" in var: return Register(-1, type="P" if "PT" in var else "R")
       if var.startswith("c["): return kk(inst_for_alu[SASSOps.WIDE](ssa(uop), ["RZ", "RZ", var], uop.dtype, None))
       return kk(render_mov(ssa(uop), var, uop.dtype))
+
+    def fit_consts(op:Any, srcs:Tuple[UOp,...]):
+      allowed = {SASSOps.FMA: (1,2), TernaryOps.WHERE: (2,)}.get(op, (1,) if len(srcs) > 1 else (0,))
+      consts = [i for i,s in enumerate(srcs) if isinstance(v:=r[s], str) and "RZ" not in v and "PT" not in v]
+      cidx, swap = next(((i, i) for i in consts if i in allowed), (consts[0], allowed[0]) if consts and op in commutative else (-1, -1))
+      regs = [to_reg(s) for i,s in enumerate(srcs) if i != cidx]
+      ret = regs if cidx != -1 else [*regs[:swap], r[srcs[cidx]], *regs[swap:]]
+      if op is TernaryOps.WHERE and cidx != swap: ret[0] = ret[0].negate()
+      if srcs[-1].dtype is dtypes.float16 and op in [BinaryOps.ADD, BinaryOps.MUL, BinaryOps.CMPLT, BinaryOps.CMPNE, SASSOps.FMA] and swap != -1:
+        ret[swap:swap] = ["0.0"]
+      return ret
 
     def glob_addr(idx:UOp, offset:Optional[UOp]=None) -> Register:
       return replace(to_reg(idx), mem_type="", mod="64", postfix=f"+{hex(offset.arg)}" if offset else "")
@@ -324,7 +342,10 @@ class SASSRenderer(Renderer):
       elif op is UOps.ENDIF:
         kk(Instruction(label.render() if isinstance(label := r[vin[0]], Register) else label, None, [], label=True))
       elif op is UOps.STORE:
-        if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
+        if arg:
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), to_reg(vin[2]), vin[2].dtype, False))
+          attr["SHM_SIZE"] = arg[1]*vin[0].dtype.itemsize
+        elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
           assert len(vin) == 3, f"unexpected STORE src count: {u}"
           kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
         else: raise NotImplementedError
@@ -353,7 +374,10 @@ class SASSRenderer(Renderer):
         r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
       elif op is UOps.LOAD:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
-        if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
+        if arg:
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), ssa(u), dtype, True))
+          attr["SHM_SIZE"] = arg[1]*dtype.itemsize
+        elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
           kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
         else: raise NotImplementedError
         if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
@@ -379,7 +403,7 @@ class SASSRenderer(Renderer):
         assert len(arg) == 1, f"unexpected gep arg: {arg}"
         r[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg[0])//4), mod='_'.join([f"H{int(b%4 != 0)}"]*2) if dtype.itemsize < 4 else "")
       elif op is UOps.ALU:
-        if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), [to_reg(v) for v in vin], dtype, u))
+        if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), fit_consts(arg, vin), dtype, u))
         elif arg is SASSOps.NOT: r[u] = to_reg(vin[0]).negate()
         else: raise NotImplementedError(f"ALU op not implemented: {arg}")
       else: r[u] = "0x0"
@@ -395,7 +419,7 @@ class SASSRenderer(Renderer):
     rewrite_registers(kernel, "R")
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
-      if x.phys: x.idx = x.phys
+      if x.phys is not None: x.idx = x.phys
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
     set_ctrl(kernel)
     return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
@@ -431,13 +455,13 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
   for reg in all_reg:
     bidx = reg.base().idx
     reg.phys = repl[bidx] + reg.idx - bidx
-    if reg_type == "R" and reg.phys: reg.spill = reg.phys + reg.size - 1 > reg_cap
-  return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys] + [0])
+    if reg_type == "R" and reg.phys is not None: reg.spill = reg.phys + reg.size - 1 > reg_cap
+  return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys is not None] + [0])
 
 def pred_cap(kernel:List[Instruction]) -> int:
   cap = 6
   while True: # TODO: refactor
-    cnt = max(len([r for r in [*inst.srcs,inst.pred] if isinstance(r,Register) and r.type=="P" and r.idx != -1 and r.phys and r.phys > cap])
+    cnt = max(len([r for r in [*inst.srcs,inst.pred] if isinstance(r,Register) and r.type=="P" and r.idx!=-1 and r.phys is not None and r.phys > cap])
               for inst in kernel)
     if cnt + cap <= 6: return cap
     cap = 6 - cnt
