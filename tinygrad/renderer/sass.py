@@ -1,6 +1,7 @@
 import struct, re
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
+from enum import Enum, auto
 from typing import Any, Dict, List, Union, Optional, Callable
 from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
@@ -8,9 +9,13 @@ from tinygrad.dtype import dtypes, DType, PtrDType
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 
+class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
+  IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
+  SET_BITS = auto(); NOT = auto() # noqa: E702
+
 def mem_offset(root:UOp, idx:UOp, off:UOp):
   sz, glob = UOp.const(dtypes.uint32, root.src[0].dtype.itemsize), root.src[0].op is UOps.DEFINE_GLOBAL
-  base = idx.cast(dtypes.uint32).alu(BinaryOps.MUL, sz, root.src[0].bitcast(dtypes.uint64)) if glob else idx # HACK: render as FMA instead
+  base = idx.cast(dtypes.uint32).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.uint64)) if glob else idx
   return UOp(root.op, root.dtype, (base,off*sz)+root.src[2:], None if glob else root.src[0].arg)
 
 ints, floats = tuple(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), tuple(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
@@ -30,6 +35,10 @@ sass_matcher = PatternMatcher([
       src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("x"),UPat.cvar("c")]))), mem_offset),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True, src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)),UPat.var("x"))),
     lambda root,x: mem_offset(root,*[UOp.const(dtypes.uint32, 0), x][::1 if x.op is UOps.CONST else -1])),
+  (UPat(UOps.ALU, arg=BinaryOps.MAX, dtype=dtypes.float64, src=(UPat.var("x"),UPat.var("y"))),
+   lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
+  (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
+   lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
 ])
 
 @dataclass
@@ -96,7 +105,7 @@ def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
   return ([Instruction(op := dtype_op("SETP", dt), d, ["PT",*s,"PT"], mods=(m := ["AND", op_mod]) + (["U32"] if dt in usig or dt in longs else []))] +
          ([Instruction(op, d, ["PT",*[v.offset(1) for v in s],"PT",d], mods=m+["EX"]+(["U32"] if dt in usig else []))] if dt in longs else []))
 
-inst_for_alu: Dict[Op, Callable] = {
+inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   BinaryOps.ADD: lambda d,s,dt,u: Instruction(dtype_op("ADD", dt) + ['', '3'][dt in ints], d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MUL: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("MUL", dt), d, fill(s, 3, dt) if dt in ints else s),
   BinaryOps.MAX: lambda d,s,dt,u: Instruction(dtype_op("MNMX", dt), d, [*s, "!PT"]),
@@ -108,6 +117,15 @@ inst_for_alu: Dict[Op, Callable] = {
   BinaryOps.CMPLT: lambda d,s,dt,u: render_cmp(d, s, u.src[0].dtype, "LT"),
   BinaryOps.CMPNE: lambda d,s,dt,u: render_cmp(d, s, sdt := u.src[0].dtype, "NEU" if sdt in floats else "NE"),
   TernaryOps.WHERE: lambda d,s,dt,u: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
+  SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
+  SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("FMA", dt), d, s),
+  SASSOps.IMAD_HI: lambda d, s, dt, u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
+  SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u and u.src[0].dtype in usig else [])),
+  SASSOps.DMAX: lambda d,s,dt,u: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
+  SASSOps.SHR_LO: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64"]),
+  SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
+  SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
+  SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
 class SASSRenderer(Renderer):
@@ -142,7 +160,7 @@ class SASSRenderer(Renderer):
     def to_reg(uop:UOp) -> Register:
       if isinstance(var := r[uop], Register): return var
       if "PT" in var or "RZ" in var: return Register(-1, type="P" if "PT" in var else "R")
-      if var.startswith("c["): return kk(inst_for_alu[BinaryOps.MUL](ssa(uop), ["RZ", "RZ", var], uop.dtype, None)) # HACK: render as FMA instead
+      if var.startswith("c["): return kk(inst_for_alu[SASSOps.WIDE](ssa(uop), ["RZ", "RZ", var], uop.dtype, None))
       return kk(render_mov(ssa(uop), var, uop.dtype))
 
     def glob_addr(idx:UOp, offset:Optional[UOp]=None) -> Register:
@@ -176,6 +194,7 @@ class SASSRenderer(Renderer):
         if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
       elif op is UOps.ALU:
         if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), [to_reg(v) for v in vin], dtype, u))
+        elif arg is SASSOps.NOT: r[u] = to_reg(vin[0]).negate()
         else: raise NotImplementedError(f"ALU op not implemented: {arg}")
       else: r[u] = "0x0"
 
