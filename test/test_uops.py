@@ -376,6 +376,7 @@ class TestUOpMethod(unittest.TestCase):
 
 class TestUOpStr(unittest.TestCase):
   def test_uop_str(self):
+    if getenv("SASS"): from tinygrad.renderer.sass import SASSOps # noqa F401
     a = UOp(UOps.CONST, dtypes.float, (), 2.0) + UOp(UOps.CONST, dtypes.float, (), 3.0)
     for _ in range(20): a = a + a
     assert len(str(a)) < 10_000, "exponential string growth"

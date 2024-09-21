@@ -116,7 +116,7 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat.var("z",dtypes.bool))),
     lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True,
-    src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("x"),UPat.cvar("c")]))), mem_offset),
+    src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("idx"),UPat.cvar("off")]))), mem_offset),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True, src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)),UPat.var("x"))),
     lambda root,x: mem_offset(root,*[UOp.const(dtypes.uint32, 0), x][::1 if x.op is UOps.CONST else -1])),
   (UPat(UOps.CAST, name="root", dtype=tuple(dt for dt in dtypes.fields().values() if dt.itemsize != 4), src=(UPat.var("x", dtypes.bool))),
@@ -324,7 +324,7 @@ class SASSRenderer(Renderer):
       consts = [i for i,s in enumerate(srcs) if isinstance(v:=r[s], str) and "RZ" not in v and "PT" not in v]
       cidx, swap = next(((i, i) for i in consts if i in allowed), (consts[0], allowed[0]) if consts and op in commutative else (-1, -1))
       regs = [to_reg(s) for i,s in enumerate(srcs) if i != cidx]
-      ret = regs if cidx != -1 else [*regs[:swap], r[srcs[cidx]], *regs[swap:]]
+      ret = regs if cidx == -1 else [*regs[:swap], r[srcs[cidx]], *regs[swap:]]
       if op is TernaryOps.WHERE and cidx != swap: ret[0] = ret[0].negate()
       if srcs[-1].dtype is dtypes.float16 and op in [BinaryOps.ADD, BinaryOps.MUL, BinaryOps.CMPLT, BinaryOps.CMPNE, SASSOps.FMA] and swap != -1:
         ret[swap:swap] = ["0.0"]
