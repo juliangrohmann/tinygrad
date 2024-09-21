@@ -1,5 +1,7 @@
-import re
-from typing import List, Sequence, Tuple, Callable, Pattern, Optional
+import json, re
+from enum import StrEnum, auto
+from typing import List, Dict, Sequence, Tuple, FrozenSet, Callable, Pattern, Any, Optional
+from dataclasses import dataclass, asdict
 from collections import defaultdict
 from tinygrad.helpers import flatten
 
@@ -22,6 +24,28 @@ cpp_comment = re.compile(r'//.*$') # cpp style line comments TODO: needed?
 cc_comment = re.compile(r'\/\*.*?\*\/') # c style line comments TODO: needed?
 ins_label = re.compile(r'`\(([^\)]+)\)')
 def_label = re.compile(r'([a-zA-Z0-9._$@#]+?)\s*:\s*(.*)')
+
+class EncodingType(StrEnum): CONSTANT = auto(); OPERAND = auto(); MODIFIER = auto(); OPERAND_MODIFIER = auto() # noqa: E702
+@dataclass(frozen=True)
+class Encoding: type:str; key:str; start:int; length:int; value:int; idx:int; shift:int; inverse:bool # noqa: E702
+@dataclass(frozen=True)
+class OpCodeSpec:
+  enc:List[Encoding]; cmods:List[str]; all_mods:FrozenSet[str]; op_mods:List[Dict[str,int]]; vmods:Dict[int,List[Dict[str,int]]] # noqa: E702
+  @classmethod
+  def from_json(cls, code, enc:List[Dict], cmods:List[str], op_mods:List[Dict[str,int]], vmods:Dict[int,List[Dict[str,int]]]):
+    return cls([Encoding(**p) for p in enc],cmods,frozenset([m for g in op_mods for m in g.keys()]+cmods),op_mods,{int(k):v for k,v in vmods.items()})
+
+class InstructionSpec:
+  def __init__(self, specs:Sequence[OpCodeSpec]):
+    self.specs = {key: [s for s in specs if frozenset(s.cmods) == key] for key in {frozenset(k.cmods) for k in specs}}
+    self.code_mods = frozenset({mod for s in specs for mod in s.cmods}) # if mod and not "INVALID" in mod and not "??" in mod})
+
+class SASSAssembler:
+  def __init__(self, json_obj:Dict[str,Any]):
+    self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
+
+  def to_json(self) -> str:
+    return json.dumps({key: [asdict(spec) for spec_group in inst.specs.values() for spec in spec_group] for key,inst in self.isa.items()})
 
 def parse(line:str):
   r = text_pat.match(strip_comments(line).strip())
