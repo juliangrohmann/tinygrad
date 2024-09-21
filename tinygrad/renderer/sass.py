@@ -108,6 +108,9 @@ def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
   return ([Instruction(op := dtype_op("SETP", dt), d, ["PT",*s,"PT"], mods=(m := ["AND", op_mod]) + (["U32"] if dt in usig or dt in longs else []))] +
          ([Instruction(op, d, ["PT",*[v.offset(1) for v in s],"PT",d], mods=m+["EX"]+(["U32"] if dt in usig else []))] if dt in longs else []))
 
+def render_bra(label:str, pred:Optional[Register]=None):
+  return Instruction("BRA", None, [f"`({label})"], pred=pred)
+
 inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
   (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
   (ints, longs, lambda d,s,di,do: render_mov(d,s,do) + ([Instruction("SHF", d.offset(1), ["RZ","0x1f",d], mods=["R","HI","S32"])], [])[di in usig]),
@@ -237,4 +240,30 @@ class SASSRenderer(Renderer):
     kk(Instruction(".L_END", None, [], label=True))
 
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
+    set_ctrl(kernel)
     return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
+
+write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA"} # TODO: casts only var lat for double width
+read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
+
+def set_ctrl(kernel:List[Instruction]):
+  def new_bar(): return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
+  def all_ids(dep): return [dep.base().offset(i).identity() for i in range(dep.size if isinstance(dep, Register) else 0)]
+  def set_bar(deps, bar_tab):
+    active_bar.append(bar := new_bar())
+    bar_tab.update({rid: bar for d in deps for rid in all_ids(d)})
+    return bar
+  def wait_bar(deps, bar_tab):
+    bars = {bar_tab[rid] for d in deps for rid in all_ids(d) if rid in bar_tab}
+    inst.ctrl.wait.extend(list(bars))
+    for k,v in list(bar_tab.items()):
+      if v in bars: bar_tab.pop(k, None)
+    for b in bars: active_bar.remove(b)
+  active_bar: List[int] = []
+  write_bar: Dict[str,int] = {}
+  read_bar: Dict[str,int] = {}
+  for inst in kernel:
+    wait_bar(inst.srcs, write_bar), wait_bar([inst.dest], read_bar)
+    inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_latency_ops else None
+    inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_latency_ops else None
+    inst.ctrl.yield_ |= inst.ctrl.stall >= 12
