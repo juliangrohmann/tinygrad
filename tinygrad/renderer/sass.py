@@ -2,7 +2,7 @@ import struct, re
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from enum import Enum, auto
-from typing import Any, Dict, List, Union, Optional, Callable
+from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, PtrDType
@@ -107,6 +107,22 @@ def render_lop(d, s, dt, code) -> List[Instruction]:
 def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
   return ([Instruction(op := dtype_op("SETP", dt), d, ["PT",*s,"PT"], mods=(m := ["AND", op_mod]) + (["U32"] if dt in usig or dt in longs else []))] +
          ([Instruction(op, d, ["PT",*[v.offset(1) for v in s],"PT",d], mods=m+["EX"]+(["U32"] if dt in usig else []))] if dt in longs else []))
+
+inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
+  (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
+  (ints, longs, lambda d,s,di,do: render_mov(d,s,do) + ([Instruction("SHF", d.offset(1), ["RZ","0x1f",d], mods=["R","HI","S32"])], [])[di in usig]),
+  (floats, ints, lambda d,s,di,do: Instruction("F2I", d, [s], mods=["TRUNC"] + dtype_mods(di) + dtype_mods(do) +
+                                                                   (["NTZ"] if do not in longs and di is not dtypes.float64 else []))),
+  ((dtypes.float32,), (dtypes.float16,), lambda d,s,di,do: Instruction("F2FP", d, ["RZ", s], mods=["F16","F32","PACK_AB"])),
+  ((dtypes.float16,), (dtypes.float32,), lambda d,s,di,do: Instruction("HADD2", d, ["-RZ", s], mods=["F32"])),
+  ((dtypes.float64, dtypes.float32), (dtypes.float64, dtypes.float32), lambda d,s,di,do: Instruction("F2F", d, [s], mods=[f"F{do.itemsize * 8}"])),
+  ((dtypes.float16,), (dtypes.bool,), lambda d,s,di,do: Instruction("LOP3",d,["RZ",s,"0x7fff","RZ",lop_code(lambda a,b,c: a&b),"!PT"], mods=["LUT"])),
+  (floats, (dtypes.bool,), lambda d,s,di,do: Instruction(dtype_op("SETP",di), d, ["PT",s,"RZ","PT"], mods=["NEU","AND"])),
+  ((dtypes.bool,), ints+floats, lambda d,s,di,do: inst_for_alu[TernaryOps.WHERE](d, [s.negate(),"RZ",render_value(1, do)], do, None)),
+  (ints, (dtypes.bool,), lambda d,s,di,do:
+  [Instruction("ISETP", d, ["PT",s,"RZ","PT"], mods=["NE","AND"] + (["U32"] if di in usig or di in longs else []))] +
+  ([Instruction("ISETP", d, ["PT",s.offset(1),"RZ","PT",d], mods=["NE","AND","EX"] + (["U32"] if di in usig else []))] if di in longs else [])),
+)
 
 inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   BinaryOps.ADD: lambda d,s,dt,u: Instruction(dtype_op("ADD", dt) + ['', '3'][dt in ints], d, fill(s, 3, dt) if dt in ints else s),
