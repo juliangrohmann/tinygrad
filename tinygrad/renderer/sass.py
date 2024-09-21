@@ -192,7 +192,11 @@ class SASSRenderer(Renderer):
     r[0] = Register(-1)
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
-      if op is UOps.STORE:
+      if op is UOps.IF:
+        kk(render_bra(ssa(u, prefix=".IF_").render(), to_reg(vin[0])))
+      elif op is UOps.ENDIF:
+        kk(Instruction(label.render() if isinstance(label := r[vin[0]], Register) else label, None, [], label=True))
+      elif op is UOps.STORE:
         if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
           assert len(vin) == 3, f"unexpected STORE src count: {u}"
           kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
