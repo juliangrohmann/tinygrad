@@ -250,6 +250,18 @@ inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
+class Allocator:
+  def __init__(self, vals:Dict[Any, Union[Register,str]]):
+    self.vals = vals
+    self.counts: Dict[str, int] = defaultdict(int)
+  def __call__(self, uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None): # TODO: bad interface
+    n = nregs(byte_size or (8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)) if uop else 1)
+    idx = n * ((self.counts[p := prefix or ("P" if uop and uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
+    self.counts[p] = idx + n
+    ret = Register(idx, size=n, type=p)
+    if uop: self.vals[uop] = ret
+    return ret
+
 class SASSRenderer(Renderer):
   device = "CUDA"
   suffix = "SASS"
@@ -266,15 +278,7 @@ class SASSRenderer(Renderer):
     iter_stack: List[List[Instruction]] = []
     kernel: List[Instruction] = []
     r:Dict[Any, Union[Register,str]] = {}
-    c:Dict[str, int] = defaultdict(int)
-
-    def ssa(uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None): # TODO: bad interface
-      n = nregs(byte_size or (8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)) if uop else 1)
-      idx = n * ((c[p := prefix or ("P" if uop and uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
-      c[p] = idx + n
-      ret = Register(idx, size=n, type=p)
-      if uop: r[uop] = ret
-      return ret
+    ssa = Allocator(r)
 
     def kk(instrs:Union[List[Instruction],Instruction]):
       kernel.extend(instrs := [instrs] if not isinstance(instrs, list) else instrs)
@@ -364,6 +368,9 @@ class SASSRenderer(Renderer):
     for _ in range(10): kk(Instruction("NOP", None, []))
     kk(Instruction(".L_END", None, [], label=True))
 
+    rewrite_registers(kernel, "P")
+    spill_to_flags(kernel, ssa)
+    rewrite_registers(kernel, "R")
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys: x.idx = x.phys
@@ -404,6 +411,39 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
     reg.phys = repl[bidx] + reg.idx - bidx
     if reg_type == "R" and reg.phys: reg.spill = reg.phys + reg.size - 1 > reg_cap
   return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys] + [0])
+
+def pred_cap(kernel:List[Instruction]) -> int:
+  cap = 6
+  while True: # TODO: refactor
+    cnt = max(len([r for r in [*inst.srcs,inst.pred] if isinstance(r,Register) and r.type=="P" and r.idx != -1 and r.phys and r.phys > cap])
+              for inst in kernel)
+    if cnt + cap <= 6: return cap
+    cap = 6 - cnt
+
+def decouple(inst:Instruction):
+  if isinstance(inst.dest, Register): inst.dest = replace(inst.dest)
+  if isinstance(inst.pred, Register): inst.pred = replace(inst.pred)
+  inst.srcs = [replace(s) if isinstance(s, Register) else s for s in inst.srcs]
+
+def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
+  def is_spill(r):
+    assert r.idx == -1 or not r.type == "P" or r.phys, f"missing phys: {r}"
+    return r.type == "P" and r.idx != -1 and r.phys and r.phys > cap
+  def spill_idx(p): return p.phys - cap - 1
+  cap, flags, buf, bit_src = pred_cap(kernel), ssa(None, 4), ssa(None, 4), ssa(None, 4)
+  if cap >= 6: return
+  for inst in kernel: decouple(inst) # TODO: clean up
+  kernel[1:1] = [Instruction("MOV", bit_src, [render_value(2**32 - 1, dtypes.uint32)]), Instruction("MOV", flags, ["RZ"])]
+  for i in range(len(kernel) - 1, -1, -1):
+    if (dp := kernel[i].dest) and isinstance(dp, Register) and is_spill(dp):
+      kernel[i+1:i+1] = [Instruction("SEL", buf, [bit_src, "RZ", dp]),
+        Instruction("LOP3", flags, [flags, render_value(1 << (spill_idx(dp)), dtypes.uint32), buf, lop_code(lambda a,b,c: (b&c)|(~b&a)), "!PT"])]
+      dp.idx = ssa(None, 4, "P").idx
+    reads = [r for r in [*kernel[i].srcs, kernel[i].pred] if isinstance(r, Register) and is_spill(r)]
+    for sp in reads:
+      kernel[i:i] = [*inst_for_alu[BinaryOps.AND](buf, [flags, render_value(1 << (spill_idx(sp)), dtypes.uint32)], dtypes.uint32, None),
+                     Instruction("ISETP", sp, ["PT", buf, "RZ", "PT"], mods=["NE", "AND", "U32"])]
+      sp.idx = ssa(None, 4, "P").idx
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA"} # TODO: casts only var lat for double width
 read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
