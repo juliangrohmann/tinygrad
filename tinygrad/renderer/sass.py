@@ -12,14 +12,34 @@ from tinygrad.renderer import Renderer, TensorCore
 
 class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
-  SET_BITS = auto(); NOT = auto() # noqa: E702
+  SET_BITS = auto(); NOT = auto(); RECIP_APPROX = auto(); RECIP_HI = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.int64:dtypes.int32, dtypes.uint64:dtypes.uint32, dtypes.float64:dtypes.float32}
+inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
 
 def raw(x:UOp) -> UOp: return x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}"))
+def is_nan(x:UOp) -> UOp: return -raw(x).lt(inf[x.dtype.itemsize] + 1)
+def is_inf(x:UOp) -> UOp: return (raw(x) & 2**(x.dtype.itemsize*8 - 1) - 1).eq(inf[x.dtype.itemsize])
 def ext_to_vec(x:UOp) -> UOp:
   assert x.dtype in ext_to_word_dt, f"cannot bitcast {x.dtype} to vector: expected double width dtype"
   return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
+
+def recip_single(x:UOp) -> UOp:
+  assert x.dtype is dtypes.float32, f"unsupported dtype for single width RECIP: {x.dtype}"
+  approx = x.alu(SASSOps.RECIP_APPROX)
+  dest = -approx*(approx*x - 1) + approx
+  sinf, zero = [(r:=raw(x)).alu(SASSOps.SET_BITS, r.const_like(v), r.const_like(2**31 - 1)).bitcast(x.dtype) for v in [inf[x.dtype.itemsize], 0]]
+  return is_inf(x).where(zero, x.ne(0).where(dest, sinf))
+
+def recip_double(x:UOp) -> UOp:
+  xv = ext_to_vec(x)
+  assert x.dtype is dtypes.float64 and xv.dtype, f"unsupported dtype for double width RECIP: {x.dtype}"
+  rcp_base = (xv.gep(1).bitcast(dtypes.int32) + UOp.const(dtypes.int32, 0x300402)).bitcast(xv.dtype.scalar())
+  rcp_ext = xv.gep(1).alu(SASSOps.RECIP_HI)
+  approx = UOp(UOps.VECTORIZE, xv.dtype, (rcp_base, rcp_ext)).bitcast(x.dtype)
+  buf = -x*approx + 1
+  it = approx*(buf*buf + buf) + approx
+  return it*(-x*it + 1) + it
 
 def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
@@ -82,6 +102,8 @@ sass_matcher = PatternMatcher([
   *[(UPat(UOps.ALU, name="root", arg=iop, dtype=dtypes.bool, src=UPat(dtype=dtypes.bool)),
     partial(lambda root, oop: UOp(root.op, root.dtype, root.src, oop), oop=oop))
     for (iop,oop) in [(BinaryOps.ADD,BinaryOps.OR), (BinaryOps.MAX,BinaryOps.OR), (BinaryOps.MUL,BinaryOps.AND), (BinaryOps.CMPNE,BinaryOps.XOR)]],
+  *[(UPat(UOps.ALU, arg=UnaryOps.RECIP, dtype=dt, src=(UPat.var("x"))), func)
+    for dt,func in [(dtypes.float32,recip_single), (dtypes.float64,recip_double)]],
   *[(UPat(UOps.ALU, arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), func)
     for op,func in [(BinaryOps.MUL,mul_long), (BinaryOps.ADD,add_long)]],
   *[(UPat(UOps.ALU, name="root", arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), shf_long)
@@ -197,6 +219,8 @@ inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
   SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
   SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
+  SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
+  SASSOps.RECIP_HI: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP64H"]),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
 class SASSRenderer(Renderer):
