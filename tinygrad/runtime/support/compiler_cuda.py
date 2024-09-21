@@ -1,7 +1,9 @@
-import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib
+import subprocess, hashlib, tempfile, ctypes, ctypes.util, re, pathlib, json
 from typing import Callable
 from tinygrad.helpers import to_char_p_p, colored, init_c_var, getenv
 import tinygrad.runtime.autogen.nvrtc as nvrtc
+from tinygrad.runtime.support.assembler_sass import SASSParser, SASSAssembler
+from tinygrad.runtime.support.cubin import make_cubin
 from tinygrad.device import Compiler, CompileError
 
 PTX = getenv("PTX")  # this shouldn't be here, in fact, it shouldn't exist
@@ -49,7 +51,8 @@ class CUDACompiler(Compiler):
   def __init__(self, arch:str, cache_key:str="cuda"):
     self.arch, self.compile_options = arch, [f'--gpu-architecture={arch}', "-I/usr/local/cuda/include", "-I/usr/include", "-I/opt/cuda/include/"]
     nvrtc_check(nvrtc.nvrtcVersion((nvrtcMajor := ctypes.c_int()), (nvrtcMinor := ctypes.c_int())))
-    if (nvrtcMajor.value, nvrtcMinor.value) >= (12, 4): self.compile_options.append("--minimal")
+    self.version = (nvrtcMajor.value, nvrtcMinor.value)
+    if self.version >= (12, 4): self.compile_options.append("--minimal")
     super().__init__(f"compile_{cache_key}_{self.arch}")
   def _compile_program(self, src:str, nvrtc_get_content:Callable, nvrtc_get_size:Callable) -> bytes:
     nvrtc_check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog := nvrtc.nvrtcProgram()), src.encode(), "<null>".encode(), 0, None, None))
@@ -76,3 +79,15 @@ class NVPTXCompiler(PTXCompiler):
     data = _get_bytes(handle, nvrtc.nvJitLinkGetLinkedCubin, nvrtc.nvJitLinkGetLinkedCubinSize, jitlink_check)
     jitlink_check(nvrtc.nvJitLinkDestroy(handle))
     return data
+
+class SASSCompiler(CUDACompiler):
+  def __init__(self, arch:str):
+    with open(pathlib.Path(__file__).parent / f"isa.{arch}.json") as f: self.assembler = SASSAssembler(json.load(f))
+    super().__init__(arch, cache_key="sass")
+  def compile(self, src:str) -> bytes:
+    parser, kernel = SASSParser(src), bytearray()
+    for line in src.split('\n'):
+      if line.strip().startswith('['):
+        kernel += self.assembler.assemble(*parser.parse(line))
+    (attr := dict(parser.eiattr)).update({"EIATTR_CUDA_API_VERSION": [[int(''.join(str(v) for v in self.version))]]})
+    return bytes(make_cubin(kernel, attr, parser, self.arch))
