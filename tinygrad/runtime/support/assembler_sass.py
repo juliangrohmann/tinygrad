@@ -1,6 +1,6 @@
 import json, struct, re
 from enum import StrEnum, auto
-from typing import List, Dict, DefaultDict, Sequence, Tuple, FrozenSet, Callable, Pattern, Any, Optional
+from typing import List, Dict, DefaultDict, Sequence, Tuple, FrozenSet, Callable, Pattern, Union, Any, Optional
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 from tinygrad.dtype import ConstType
@@ -45,7 +45,11 @@ class SASSAssembler:
   def __init__(self, json_obj:Dict[str,Any]):
     self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
 
-  def assemble(self, key:str, values:List[ConstType], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int,Sequence[str]]]=None) -> int:
+  def assemble(self, ctrl:str, key:str, values:List[Union[int,float]], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int,Sequence[str]]]=None):
+    ctrl_code, inst_code = self.encode_control_code(*parse_ctrl(ctrl)), self.encode_instruction(key, values, op_mods, operand_mods)
+    return ((ctrl_code << 105) | inst_code).to_bytes(16, "little")
+
+  def encode_instruction(self, key:str, values:List[ConstType], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int,Sequence[str]]]=None) -> int:
     def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
     def choose_mod(explicit_mods, spec_mods):
       valid_mods = [m for m in explicit_mods if m in spec_mods]
@@ -78,7 +82,10 @@ class SASSAssembler:
         code += set_bits(spec.vmods[enc.idx][enc.value][choose_mod(explicit_mods, list(mod_tab.keys()))], enc.start, enc.length)
       else:
         raise ValueError(f"Unknown encoding type: {enc.type}")
-    return code.to_bytes(16, "little")
+    return code
+
+  def encode_control_code(self, wait:int, read:int, write:int, yield_:int, stall:int) -> int:
+    return sum(c << i for c,i in zip([wait, read, write, yield_, stall], [11, 8, 5, 4, 0]))
 
   def to_json(self) -> str:
     return json.dumps({key: [asdict(spec) for spec_group in inst.specs.values() for spec in spec_group] for key,inst in self.isa.items()})
