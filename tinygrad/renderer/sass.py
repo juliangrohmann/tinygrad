@@ -1,4 +1,4 @@
-import struct, re, itertools
+import struct, re, itertools, math
 from functools import partial
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
@@ -95,12 +95,18 @@ def mem_offset(root:UOp, idx:UOp, off:UOp):
   base = idx.cast(dtypes.uint32).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.uint64)) if glob else idx
   return UOp(root.op, root.dtype, (base,off*sz)+root.src[2:], None if glob else root.src[0].arg)
 
+shift_consts = set(2 ** i for i in range(64))
+half_not_supported = (UnaryOps.RECIP, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN, UnaryOps.SQRT)
 not_half = tuple(dt for dt in dtypes.fields().values() if dt is not dtypes.half)
 ints, floats = tuple(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), tuple(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
 usig, longs = tuple(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt)), (dtypes.int64, dtypes.uint64)
 numeric = ints + floats
 
 sass_matcher = PatternMatcher([
+  (UPat(UOps.ALU, arg=BinaryOps.MUL, name="root", dtype=ints, src=[UPat.var("x"),UPat.cvar(name="c")]),
+   lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHL) if c.arg in shift_consts else None),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, name="root", dtype=ints, src=(UPat.var("x"),UPat.cvar(name="c"))),
+   lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHR) if c.arg in shift_consts else None),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"),UPat.var("k"))),
     lambda root,x,y,z,k: UOp(root.op, dtypes.uint8, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())),
@@ -113,14 +119,26 @@ sass_matcher = PatternMatcher([
     src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("x"),UPat.cvar("c")]))), mem_offset),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True, src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)),UPat.var("x"))),
     lambda root,x: mem_offset(root,*[UOp.const(dtypes.uint32, 0), x][::1 if x.op is UOps.CONST else -1])),
+  (UPat(UOps.CAST, name="root", dtype=tuple(dt for dt in dtypes.fields().values() if dt.itemsize != 4), src=(UPat.var("x", dtypes.bool))),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int32),))),
+  (UPat(UOps.CAST, name="root", dtype=(dtypes.float64,dtypes.float16), src=(UPat(name="x", dtype=(dtypes.float64, dtypes.float16)))),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.float32),))),
+  (UPat(UOps.CAST, name="root", dtype=floats, src=(UPat(name="x", dtype=(dtypes.int8,dtypes.uint8)))),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int16),))),
+  (UPat(UOps.CAST, name="root", dtype=tuple(dt for dt in ints if dt.itemsize < 4), src=(UPat(name="x", dtype=(dtypes.float64,dtypes.float32)))),
+   lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.uint32 if dtypes.is_unsigned(root.dtype) else dtypes.int32),))),
   (UPat(UOps.ALU, arg=BinaryOps.MAX, dtype=dtypes.float64, src=(UPat.var("x"),UPat.var("y"))),
-    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
+   lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
+  (UPat(UOps.ALU, name="root", arg=UnaryOps.RECIP, dtype=tuple(dt for dt in ints if dt.itemsize <= 4), src=(UPat.var("x"))),
+   lambda root,x: UOp(x.op, dtypes.float32, tuple(vv.cast(dtypes.float32) for vv in x.src), x.arg).cast(root.dtype)),
+  (UPat(UOps.ALU, arg=SASSOps.SET_BITS, dtype=longs, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), set_bits_long),
+  (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=tuple(ext_to_word_dt.keys()), src=(UPat.var("p"),UPat.var("x"),UPat.var("y"))), where_ext),
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), lambda x,y,z: (x&y)|(-x&z)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPLT, dtype=dtypes.bool, src=(UPat.var("x",dtypes.bool),UPat.var("y",dtypes.bool))), lambda x,y: -x&y),
   (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.var("y"))), idiv),
   (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - idiv(x,y)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
-    lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
+   lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
   *[(UPat(UOps.ALU, name="root", arg=iop, dtype=dtypes.bool, src=UPat(dtype=dtypes.bool)),
     partial(lambda root, oop: UOp(root.op, root.dtype, root.src, oop), oop=oop))
     for (iop,oop) in [(BinaryOps.ADD,BinaryOps.OR), (BinaryOps.MAX,BinaryOps.OR), (BinaryOps.MUL,BinaryOps.AND), (BinaryOps.CMPNE,BinaryOps.XOR)]],
@@ -134,6 +152,10 @@ sass_matcher = PatternMatcher([
     for op in [BinaryOps.SHL, BinaryOps.SHR]],
   *[(UPat(UOps.ALU, name="root", arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), bitwise_long)
     for op in [BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR]],
+  *[(UPat(UOps.ALU, arg=op, dtype=dtypes.float16, name="x"),
+     lambda x: (UOp(x.op, dtypes.float32, tuple(vv.cast(dtypes.float32) for vv in x.src), x.arg).cast(dtypes.float16))) for op in half_not_supported],
+  (UPat(UOps.ALU, name="root", arg=BinaryOps.ADD, src=[UPat(UOps.ALU, arg=BinaryOps.MUL, src=(UPat.var("x"),UPat.var("y"))), UPat.var("z")]),
+   lambda root,x,y,z: UOp(root.op, root.dtype, src=(x,y,z), arg=SASSOps.FMA))
 ])
 
 @dataclass
