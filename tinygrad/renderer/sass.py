@@ -471,24 +471,29 @@ def decouple(inst:Instruction):
   inst.srcs = [replace(s) if isinstance(s, Register) else s for s in inst.srcs]
 
 def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
-  def is_spill(r):
-    assert r.idx == -1 or not r.type == "P" or r.phys, f"missing phys: {r}"
-    return r.type == "P" and r.idx != -1 and r.phys and r.phys > cap
-  def spill_idx(p): return p.phys - cap - 1
-  cap, flags, buf, bit_src = pred_cap(kernel), ssa(None, 4), ssa(None, 4), ssa(None, 4)
+  def to_pos(p):
+    reg_idx, flag_idx = (idx := p.phys - cap - 1) // 32, idx % 32
+    while len(flag_regs) <= reg_idx: flag_regs.append(ssa(None, 4))
+    return flag_regs[reg_idx], render_value(1 << flag_idx, dtypes.uint32)
+  def read_flag(p):
+    return [*inst_for_alu[BinaryOps.AND](buf,[*to_pos(p)],dtypes.uint32,None), Instruction("ISETP", p, ["PT",buf,"RZ","PT"], mods=["NE","AND","U32"])]
+  def write_flag(p):
+    dest, mask = to_pos(p)
+    return [Instruction("SEL", buf, [bit_src, "RZ", p]), Instruction("LOP3", dest, [dest, mask, buf, lop_code(lambda a,b,c: (b&c)|(~b&a)), "!PT"])]
+  def spill(p, write):
+    if isinstance(p, Register) and p.type == "P" and p.idx != -1 and p.phys and p.phys > cap:
+      kernel[i+write:i+write] = write_flag(p) if write else read_flag(p)
+      p.idx = ssa(None, 4, "P").idx
+
+  cap = pred_cap(kernel)
   if cap >= 6: return
-  for inst in kernel: decouple(inst) # TODO: clean up
-  kernel[1:1] = [Instruction("MOV", bit_src, [render_value(2**32 - 1, dtypes.uint32)]), Instruction("MOV", flags, ["RZ"])]
-  for i in range(len(kernel) - 1, -1, -1):
-    if (dp := kernel[i].dest) and isinstance(dp, Register) and is_spill(dp):
-      kernel[i+1:i+1] = [Instruction("SEL", buf, [bit_src, "RZ", dp]),
-        Instruction("LOP3", flags, [flags, render_value(1 << (spill_idx(dp)), dtypes.uint32), buf, lop_code(lambda a,b,c: (b&c)|(~b&a)), "!PT"])]
-      dp.idx = ssa(None, 4, "P").idx
-    reads = [r for r in [*kernel[i].srcs, kernel[i].pred] if isinstance(r, Register) and is_spill(r)]
-    for sp in reads:
-      kernel[i:i] = [*inst_for_alu[BinaryOps.AND](buf, [flags, render_value(1 << (spill_idx(sp)), dtypes.uint32)], dtypes.uint32, None),
-                     Instruction("ISETP", sp, ["PT", buf, "RZ", "PT"], mods=["NE", "AND", "U32"])]
-      sp.idx = ssa(None, 4, "P").idx
+  flag_regs: List[Register] = []
+  buf, bit_src = ssa(None, 4), ssa(None, 4)
+  for i,inst in list(enumerate(kernel))[::-1]:
+    decouple(inst)
+    for j,r in enumerate([inst.dest, *inst.srcs, inst.pred]): spill(r, j == 0)
+  kernel[1:1] = [Instruction("MOV", bit_src, [render_value(2**32 - 1, dtypes.uint32)])]
+  for reg in flag_regs: kernel[1:1] = [Instruction("MOV", reg, ["RZ"])]
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA"} # TODO: casts only var lat for double width
 read_latency_ops = {"MUFU", "LDG", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
@@ -500,6 +505,7 @@ def set_ctrl(kernel:List[Instruction]):
     active_bar.append(bar := new_bar())
     bar_tab.update({rid: bar for d in deps for rid in all_ids(d)})
     return bar
+
   def wait_bar(deps, bar_tab):
     bars = {bar_tab[rid] for d in deps for rid in all_ids(d) if rid in bar_tab}
     inst.ctrl.wait.extend(list(bars))
