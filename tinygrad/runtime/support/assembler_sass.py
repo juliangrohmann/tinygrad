@@ -1,8 +1,9 @@
-import json, re
+import json, struct, re
 from enum import StrEnum, auto
-from typing import List, Dict, Sequence, Tuple, FrozenSet, Callable, Pattern, Any, Optional
+from typing import List, Dict, DefaultDict, Sequence, Tuple, FrozenSet, Callable, Pattern, Any, Optional
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from tinygrad.dtype import ConstType
 from tinygrad.helpers import flatten
 
 addr_ops = {'BRA', 'BRX', 'BRXU', 'CALL', 'JMP', 'JMX', 'JMXU', 'RET', 'BSSY', 'SSY', 'CAL', 'PRET', 'PBK'}
@@ -44,16 +45,43 @@ class SASSAssembler:
   def __init__(self, json_obj:Dict[str,Any]):
     self.isa = {k: InstructionSpec([OpCodeSpec.from_json(**spec) for spec in v]) for k,v in json_obj.items()}
 
+  def assemble(self, key:str, values:List[ConstType], op_mods:Sequence[str]=(), operand_mods:Optional[Dict[int,Sequence[str]]]=None) -> int:
+    def set_bits(value, start, length): return (value & (2 ** length - 1)) << start
+    def choose_mod(explicit_mods, spec_mods):
+      valid_mods = [m for m in explicit_mods if m in spec_mods]
+      return valid_mods[0] if len(valid_mods) else ''
+
+    inst, predicate, values = self.isa[key], values[0], values[1:]
+    seen:DefaultDict[int,int] = defaultdict(int)
+    spec_group = list(inst.specs.values())[0] if len(inst.specs) == 1 else inst.specs[frozenset(mod for mod in op_mods if mod in inst.code_mods)]
+    valid_specs = [s for s in spec_group if all(m in s.all_mods for m in op_mods)]
+    assert len(valid_specs), (f"invalid SASS instruction spec:\n{key=}, {values=}, {op_mods=}\n"
+                              f"spec group:\n{'\n'.join([f"{i}: {spec.all_mods}" for i,spec in enumerate(spec_group)])}")
+    spec, code = valid_specs[0], set_bits(predicate, 12, 4)
+    for enc in spec.enc:
+      if enc.type == EncodingType.CONSTANT:
+        code += set_bits(enc.value, enc.start, enc.length)
+      elif enc.type == EncodingType.OPERAND:
+        value = encode_float(v, key, op_mods) if isinstance(v := values[enc.idx], float) else v
+        if value < 0: value += 2 ** sum(e.length for e in spec.enc if e.type == EncodingType.OPERAND and e.idx == enc.idx)
+        if enc.inverse: value ^= 2 ** enc.length - 1
+        value = value >> (seen[enc.idx] + enc.shift)
+        code += set_bits(value, enc.start, enc.length)
+        seen[enc.idx] += enc.length
+      elif enc.type == EncodingType.MODIFIER:
+        if not len(spec.op_mods[enc.value]): continue # TODO: remove empty mod entries from isa
+        chosen_mod = choose_mod(op_mods, list(spec.op_mods[enc.value].keys()))
+        code += set_bits(spec.op_mods[enc.value][chosen_mod], enc.start, enc.length)
+      elif enc.type == EncodingType.OPERAND_MODIFIER:
+        mod_tab = spec.vmods[enc.idx][enc.value]
+        explicit_mods = operand_mods[enc.idx] if operand_mods and enc.idx in operand_mods else []
+        code += set_bits(spec.vmods[enc.idx][enc.value][choose_mod(explicit_mods, list(mod_tab.keys()))], enc.start, enc.length)
+      else:
+        raise ValueError(f"Unknown encoding type: {enc.type}")
+    return code.to_bytes(16, "little")
+
   def to_json(self) -> str:
     return json.dumps({key: [asdict(spec) for spec_group in inst.specs.values() for spec in spec_group] for key,inst in self.isa.items()})
-
-def parse(line:str):
-  r = text_pat.match(strip_comments(line).strip())
-  assert r, f"invalid SASS line: {line}"
-  ctrl, ins = r.groups()
-  addr = parse_inst_addr(line)
-  key, vals, op_mods, vmods = parse_inst(ins, addr=addr)
-  return ctrl, key, vals, op_mods, vmods
 
 def parse_inst(ins:str, addr:Optional[int]=None):
   for k,v in const_tr.items():
@@ -130,6 +158,16 @@ def split_operands(s:str, op:str) -> List[str]:
   if op in addr_ops and (res := reg_imme_addr.search(s)):
     s = s.replace(res.group(), res.group('R')+','+res.group('II'))
   return s.split(',') if s else []
+
+def encode_float(val:float, op:str, mods:Sequence[str]):
+  if op[0] in {'H', 'F', 'D'}: prec = op[0]
+  else: prec = 'D' if '64' in mods else 'H' if '16' in mods else 'F'
+  nbits = 32 if '32I' in mods else -1
+  ifmt, ofmt, fullbits, keepbits = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)}[prec]
+  fb = struct.pack(ifmt, val)
+  ival = struct.unpack(ofmt, fb)[0]
+  trunc_bits = fullbits - max(nbits, keepbits)
+  return ival >> trunc_bits if trunc_bits > 0 else ival
 
 token_formats: Tuple[Tuple[Callable,Pattern],...] = (
   (parse_special_reg, re.compile(r'(?P<Label>SR_[\w\.]+)')),
