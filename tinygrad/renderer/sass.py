@@ -100,8 +100,8 @@ def bitwise_long(root:UOp, x:UOp, y:UOp) -> UOp:
   return UOp(UOps.VECTORIZE, xv.dtype, (base, ext)).bitcast(x.dtype)
 
 def mem_offset(root:UOp, idx:UOp, off:UOp):
-  sz, glob = UOp.const(dtypes.uint32, root.src[0].dtype.itemsize), root.src[0].op is UOps.DEFINE_GLOBAL
-  base = idx.cast(dtypes.uint32).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.uint64)) if glob else idx
+  sz, glob = UOp.const(dtypes.int32, root.src[0].dtype.itemsize), root.src[0].op is UOps.DEFINE_GLOBAL
+  base = idx.cast(dtypes.int32).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.int64)) if glob else idx
   return UOp(root.op, root.dtype, (base,off*sz)+root.src[2:], None if glob else root.src[0].arg)
 
 shift_consts = set(2 ** i for i in range(64))
@@ -352,7 +352,8 @@ class SASSRenderer(Renderer):
       return kk(render_mov(ssa(uop), var, uop.dtype))
 
     def fit_consts(op:Any, srcs:Tuple[UOp,...]):
-      allowed = {SASSOps.FMA: (1,2), TernaryOps.WHERE: (2,)}.get(op, (1,) if len(srcs) > 1 else (0,))
+      if op in [SASSOps.WIDE]: return [to_reg(s) for s in srcs]
+      allowed = {SASSOps.FMA: (1,2), SASSOps.WIDE: (1,2), TernaryOps.WHERE: (2,)}.get(op, (1,) if len(srcs) > 1 else (0,))
       consts = [i for i,s in enumerate(srcs) if isinstance(v:=r[s], str) and "RZ" not in v and "PT" not in v]
       cidx, swap = next(((i, i) for i in consts if i in allowed), (consts[0], allowed[0]) if consts and op in commutative else (-1, -1))
       regs = [to_reg(s) for i,s in enumerate(srcs) if i != cidx]
@@ -363,7 +364,7 @@ class SASSRenderer(Renderer):
       return ret
 
     def glob_addr(idx:UOp, offset:Optional[UOp]=None) -> Register:
-      return replace(to_reg(idx), mem_type="", mod="64", postfix=f"+{hex(offset.arg)}" if offset else "")
+      return replace(to_reg(idx), mem_type="", mod="64", postfix=f"{'+-'[offset.arg < 0]}{hex(abs(offset.arg))}" if offset and offset.arg else "")
 
     def print_uop(u, depth=0): # NOTE: debug TODO: remove
       if depth >= getenv("PRINT_DEPTH", 1): return
@@ -555,7 +556,7 @@ def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
       sp.idx = ssa(None, 4, "P").idx
 
 write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA"} # TODO: casts only var lat for double width
-read_latency_ops = {"MUFU", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
+read_latency_ops = {"MUFU", "LDG", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
 
 def set_ctrl(kernel:List[Instruction]):
   def new_bar(): return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
