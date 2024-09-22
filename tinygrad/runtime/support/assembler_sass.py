@@ -16,7 +16,7 @@ float_fmt = {'H':('e','H', 16, 16), 'F':('f','I', 32, 32), 'D':('d','Q', 64, 32)
 sr_vals = {"SR_TID": 32, "SR_TID.X": 33, "SR_TID.Y": 34, "SR_TID.Z": 35, "SR_CTAID.X": 37, "SR_CTAID.Y": 38, "SR_CTAID.Z": 39, "SR_NTID": 40}
 ins_pat = re.compile(r'(?P<Pred>@!?U?P\w\s+)?\s*(?P<Op>[\w\.\?]+)(?P<Operands>.*)')
 text_pat = re.compile(r'\[([\w:-]+)\](.*)')
-ins_addr = re.compile(r'/\*([\da-fA-F]{4})\*/')
+ins_addr = re.compile(r'/\*([\da-fA-F]*)\*/')
 reg_imme_addr = re.compile(r'(?P<R>R\d+)\s*(?P<II>-?0x[0-9a-fA-F]+)')
 const_mem = re.compile(r'c\[(?P<Bank>0x\w+)\]\[(?P<Addr>[+-?\w\.]+)\]')
 insig_whitespace = re.compile(r'((?<=[\w\?]) (?![\w\?]))|((?<![\w\?]) (?=[\w\?]))|((?<![\w\?]) (?![\w\?]))')
