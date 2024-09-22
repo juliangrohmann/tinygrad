@@ -3,7 +3,7 @@ from functools import partial
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from enum import Enum, auto
-from typing import Any, Dict, List, Tuple, Union, Optional, Callable
+from typing import Any, Dict, DefaultDict, List, Tuple, Set, Union, Optional, Callable
 from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
@@ -428,23 +428,20 @@ reg_cap, buf_size = 240, 6
 
 def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
   def alloc(size): return next(i for i in itertools.count(reg_type == "P") if i % size == 0 and all(i + j not in allocated for j in range(size)))
-  unrolled = []
-  loops: Dict[str, List[Instruction]] = {}
-  for inst in kernel:
+  locs: DefaultDict[Tuple[int,int], List[int]] = defaultdict(list)
+  loop_deps: Dict[str, Set[Tuple[int,int]]] = {}
+  ext_deps, all_reg = {}, set()
+  for i,inst in enumerate(kernel):
     if inst.label and "RANGE" in inst.op:
-      loops[inst.op] = []
-    unrolled.append(inst)
-    for v in loops.values(): v.append(inst)
-    if inst.srcs and isinstance(inst.srcs[0], str) and (label := next((k for k in loops.keys() if k in inst.srcs[0]), None)):
-      loop_inst = loops.pop(label)
-      unrolled.extend(loop_inst)
-      for v in loops.values(): v.extend(loop_inst)
-  locs, all_reg = defaultdict(list), set()
-  for i,r in enumerate([src for inst in unrolled for src in [inst.pred, *inst.srcs, inst.dest]]):
-    if isinstance(r, Register) and r.idx != -1 and r.type == reg_type:
-      locs[r.base().idx, r.size].append(i)
+      ext_deps[inst.op], loop_deps[inst.op] = set(locs.keys()), set()
+    for r in [src for src in [inst.pred, *inst.srcs, inst.dest] if isinstance(src, Register) and src.idx != -1 and src.type == reg_type]:
+      locs[lk := (r.base().idx, r.size)].append(i)
       all_reg.add(r)
-  events = sorted([(k, max(v), False) for k,v in locs.items()] + [(k, min(v), True) for k,v in locs.items()], key=lambda x: x[1])
+      for k,v in loop_deps.items(): v.add(lk)
+    if inst.srcs and isinstance(inst.srcs[0], str) and (label := next((k for k in loop_deps.keys() if k in inst.srcs[0]), None)):
+      for d in loop_deps.pop(label) & ext_deps.pop(label):
+        locs[d].append(i + 1) # keep external loop dependencies live until end of loop
+  events = sorted([(k, max(v), False) for k,v in locs.items()] + [(k, min(v) + 0.5, True) for k,v in locs.items()], key=lambda x: x[1])
   allocated, repl = [], {}
   for (idx, size), _, is_alloc in events:
     if is_alloc:
@@ -455,7 +452,8 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
   for reg in all_reg:
     bidx = reg.base().idx
     reg.phys = repl[bidx] + reg.idx - bidx
-    if reg_type == "R" and reg.phys is not None: reg.spill = reg.phys + reg.size - 1 > reg_cap
+    if reg_type == "R" and reg.phys is not None:
+      reg.spill = reg.phys + reg.size - 1 > reg_cap
   return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys is not None] + [0])
 
 def pred_cap(kernel:List[Instruction]) -> int:
