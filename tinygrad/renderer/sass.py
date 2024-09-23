@@ -392,12 +392,13 @@ class SASSRenderer(Renderer):
       elif op is UOps.ENDIF:
         kk(Instruction(label.render() if isinstance(label := r[vin[0]], Register) else label, None, [], label=True))
       elif op is UOps.STORE:
+        gate = to_reg(vin[3]) if len(vin) > 3 else None
         if arg:
-          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), to_reg(vin[2]), vin[2].dtype, False))
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), to_reg(vin[2]), vin[2].dtype, False, pred=gate))
           attr["SHM_SIZE"] = arg[1]*vin[0].dtype.itemsize
         elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
-          assert len(vin) == 3, f"unexpected STORE src count: {u}"
-          kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
+          assert len(vin) <= 4, f"unexpected STORE src count: {u}"
+          kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype), pred=gate))
         else: raise NotImplementedError
       elif op is UOps.ENDRANGE:
         kk(iter_stack.pop(-1))
@@ -425,7 +426,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.LOAD:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
         if arg:
-          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), ssa(u), dtype, True))
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), ssa(u), dtype, True, pred=gate))
           attr["SHM_SIZE"] = arg[1]*dtype.itemsize
         elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
           kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
