@@ -459,12 +459,9 @@ class SASSRenderer(Renderer):
         if vin[0].dtype is dtypes.float16:
           dest, srcs = ssa(u), [to_reg(v) for v in vin]
           kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
-        elif not all(isinstance(r[v],Register) for v in vin) or not is_contiguous([to_reg(v) for v in vin]) or not is_aligned(to_reg(vin[0]),dtype):
+        else:
           dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
           kk([inst for i,s in enumerate([r[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
-        else:
-          r[u] = r[vin[0]]
-          for v in vin: to_reg(v).size = nregs(dtype.itemsize)
       elif op is UOps.GEP:
         assert len(arg) == 1, f"unexpected gep arg: {arg}"
         r[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg[0])//4), mod='_'.join([f"H{int(b%4 != 0)}"]*2) if dtype.itemsize < 4 else "")
