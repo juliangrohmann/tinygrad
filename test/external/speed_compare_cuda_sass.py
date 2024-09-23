@@ -12,11 +12,14 @@ if __name__ == "__main__":
   dev = Device["CUDA"]
   sass = SASSRenderer(dev.arch)
 
+  start, end = getenv("START", -1), getenv("END", len(ast_strs)) # NOTE: debug
   single = getenv("NUM", -1)
   if single != -1: ast_strs = ast_strs[single:single+1]
 
   average_tm_cuda, average_tm_sass = 0, 0
   for num,ast in enumerate(ast_strs):
+    if not start <= num < end: continue # NOTE: debug
+
     # cuda compile
     dev.compiler = CUDACompiler(dev.arch)
     lin = ast_str_to_lin(ast, opts=dev.renderer)
