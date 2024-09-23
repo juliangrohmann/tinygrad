@@ -101,8 +101,14 @@ def bitwise_long(root:UOp, x:UOp, y:UOp) -> UOp:
 
 def mem_offset(root:UOp, idx:UOp, off:UOp):
   sz, glob = UOp.const(dtypes.int32, root.src[0].dtype.itemsize), root.src[0].op is UOps.DEFINE_GLOBAL
-  base = idx.cast(dtypes.int32).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.int64)) if glob else idx
+  base = idx.cast(sz.dtype).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.int64)) if glob else idx
   return UOp(root.op, root.dtype, (base,off*sz)+root.src[2:], None if glob else root.src[0].arg)
+
+def offset_overflow(root:UOp, idx:UOp, off:UOp):
+  sz = (root.dtype if root.op is not UOps.STORE else root.src[2].dtype).itemsize
+  assert off.dtype.itemsize <= 4
+  base = off.alu(SASSOps.WIDE, off.const_like(1), idx)
+  return UOp(root.op, root.dtype, (base, UOp.const(dtypes.int32, 0))+root.src[2:], root.arg) if not (-2**23 <= off.arg*sz < 2**23) else None
 
 shift_consts = set(2 ** i for i in range(64))
 half_not_supported = (UnaryOps.RECIP, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN, UnaryOps.SQRT)
@@ -128,6 +134,7 @@ sass_matcher = PatternMatcher([
     src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("idx"),UPat.cvar("off")]))), mem_offset),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True, src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)),UPat.var("x"))),
     lambda root,x: mem_offset(root,*[UOp.const(dtypes.uint32, 0), x][::1 if x.op is UOps.CONST else -1])),
+  (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True, src=(UPat.var("idx"),UPat.cvar("off"))), offset_overflow),
   (UPat(UOps.CAST, name="root", dtype=tuple(dt for dt in dtypes.fields().values() if dt.itemsize != 4), src=(UPat.var("x", dtypes.bool))),
    lambda root,x: UOp(root.op, root.dtype, src=(x.cast(dtypes.int32),))),
   (UPat(UOps.CAST, name="root", dtype=(dtypes.float64,dtypes.float16), src=(UPat(name="x", dtype=(dtypes.float64, dtypes.float16)))),
@@ -207,10 +214,9 @@ def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else rende
 def dtype_op(op:str, dt:DType) -> str: return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.float16 else '')
 def dtype_mods(dt:DType): return [sig] if (sig:=f"{'F' if dt in floats else 'U' if dt in usig else 'S'}{dt.itemsize*8}") not in ["S32","F32"] else []
 def mem_mods(dtype:DType) -> List[str]: return [f"{'' if sz > 4 else 'SU'[dtypes.is_unsigned(dtype)]}{8*sz}"] if (sz := dtype.itemsize) != 4 else []
+def mem_addr(idx:Register, offset:int=0, mod=""): return replace(idx, mem_type="", mod=mod, postfix=f"+{hex(offset)}" if offset else "")
 def prmt_code(a:Register, b:Register) -> str: return "0x"+"".join(str(i+j+2*(r.mod == "H1_H1")) for i in [0,4] for j,r in enumerate([a,b]))[::-1]
 def lop_code(func:Callable[[int, int, int], int]) -> str: return hex(func(0xF0, 0xCC, 0xAA))
-def mem_addr(idx:Register, offset:int=0, mod=""):
-  return replace(idx, mem_type="", mod=mod, postfix=f"{'+-'[offset < 0]}{hex(abs(offset))}" if offset else "")
 
 def render_binary(x, dtype) -> str:
   x = dtypes.as_const(x, dtype) * (-1 if (neg := dtype in ints and x < 0) else 1)

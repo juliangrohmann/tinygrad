@@ -189,7 +189,7 @@ def parse_const_memory(prefix, bank, addr):
   return [''.join(bk + ak)], bv + av, mods
 
 def parse_addr(prefix:str, addr:str):
-  operands = re.split(r'[-+]', addr.strip('[]'))
+  operands = addr.strip("[]").split('+')
   keys, vals, mods = parse_operands(operands)
   return [f"{prefix}[{''.join(keys)}]"], vals, mods
 
