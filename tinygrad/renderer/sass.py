@@ -73,10 +73,13 @@ class Instruction:
 
 def nregs(byte_size:int) -> int: return (byte_size + 3) // 4
 def const_addr(uop:UOp, offset:int=0) -> str: return f"c[0x0][{hex(int("160", 16) + 8*uop.arg + offset)}]"
+def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
+def is_aligned(src:Register, dtype:DType) -> bool: return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
 def dtype_op(op:str, dt:DType) -> str: return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.float16 else '')
 def dtype_mods(dt:DType): return [sig] if (sig:=f"{'F' if dt in floats else 'U' if dt in usig else 'S'}{dt.itemsize*8}") not in ["S32","F32"] else []
 def mem_mods(dtype:DType) -> List[str]: return [f"{'' if sz > 4 else 'SU'[dtypes.is_unsigned(dtype)]}{8*sz}"] if (sz := dtype.itemsize) != 4 else []
+def prmt_code(a:Register, b:Register) -> str: return "0x"+"".join(str(i+j+2*(r.mod == "H1_H1")) for i in [0,4] for j,r in enumerate([a,b]))[::-1]
 def lop_code(func:Callable[[int, int, int], int]) -> str: return hex(func(0xF0, 0xCC, 0xAA))
 
 def render_binary(x, dtype) -> str:
@@ -192,6 +195,19 @@ class SASSRenderer(Renderer):
           kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
         else: raise NotImplementedError
         if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
+      elif op is UOps.VECTORIZE:
+        if vin[0].dtype is dtypes.float16:
+          dest, srcs = ssa(u), [to_reg(v) for v in vin]
+          kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
+        elif not all(isinstance(r[v],Register) for v in vin) or not is_contiguous([to_reg(v) for v in vin]) or not is_aligned(to_reg(vin[0]),dtype):
+          dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
+          kk([inst for i,s in enumerate([r[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
+        else:
+          r[u] = r[vin[0]]
+          for v in vin: to_reg(v).size = nregs(dtype.itemsize)
+      elif op is UOps.GEP:
+        assert len(arg) == 1, f"unexpected gep arg: {arg}"
+        r[u] = replace(to_reg(vin[0]).offset((b := dtype.itemsize*arg[0])//4), mod='_'.join([f"H{int(b%4 != 0)}"]*2) if dtype.itemsize < 4 else "")
       elif op is UOps.ALU:
         if arg in inst_for_alu: kk(inst_for_alu[arg](ssa(u), [to_reg(v) for v in vin], dtype, u))
         elif arg is SASSOps.NOT: r[u] = to_reg(vin[0]).negate()
