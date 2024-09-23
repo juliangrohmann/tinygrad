@@ -167,6 +167,8 @@ sass_matcher = PatternMatcher([
    lambda root,x,y,z: UOp(root.op, root.dtype, src=(x,y,z), arg=SASSOps.FMA))
 ])
 
+if getenv("NO_REWRITE"): sass_matcher = PatternMatcher([]) # NOTE: debug
+
 @dataclass
 class Register:
   idx:int; size:int=1; type:str="R"; negated:bool=False; mem_type:Optional[str]=None; postfix:str=""; mod:Optional[str]=None # noqa: E702
