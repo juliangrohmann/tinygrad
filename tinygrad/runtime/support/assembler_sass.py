@@ -90,6 +90,61 @@ class SASSAssembler:
   def to_json(self) -> str:
     return json.dumps({key: [asdict(spec) for spec_group in inst.specs.values() for spec in spec_group] for key,inst in self.isa.items()})
 
+class SASSParser:
+  def __init__(self, src:str):
+    self.eiattr: DefaultDict[str,List] = defaultdict(list)
+    self.labels: Dict[str,str] = dict()
+    self.parse_labels(src)
+    self.parse_attributes(src)
+
+  def parse(self, line:str):
+    r = text_pat.match(strip_comments(line).strip())
+    assert r, f"invalid SASS line: {line}"
+    ctrl, ins = r.groups()
+    ins = self.labels_to_addr(ins.strip())
+    addr = parse_inst_addr(line)
+    key, vals, op_mods, vmods = parse_inst(ins, addr=addr)
+    return ctrl, key, vals, op_mods, vmods
+
+  def labels_to_addr(self, s:str):
+    r = ins_label.search(s)
+    return ins_label.sub(self.labels[r.groups()[0]], s) if r else s
+
+  def parse_labels(self, src:str):
+    addr = None
+    for line in src.split('\n'):
+      if a := parse_inst_addr(line):
+        addr = a
+      if r := def_label.match(line.strip()):
+        if addr: self.labels[r.groups()[0]] = hex(addr + 16)
+        elif r.groups()[0].startswith(".text."): self.function_name = r.groups()[0].replace(".text.", "", 1)
+        else: raise ValueError
+
+  def parse_attributes(self, src:str):
+    block_dims = [1, 1, 1]
+    for line in src.split('\n'):
+      if dim_match := re.match(r"BLOCK_DIM_(\d)=(\d+)", line):
+        block_dims[int(dim_match.groups()[0])] = int(dim_match.groups()[1])
+      if reg_match := re.match(r"SHI_REGISTERS=(\d+)", line):
+        self.eiattr["EIATTR_REGCOUNT"].append(["FUNC", int(reg_match.groups()[0])])
+      if reg_match := re.match(r"SHM_SIZE=(\d+)", line):
+        self.eiattr["SHM_SIZE"].append([int(reg_match.groups()[0])])
+      if param_match := re.match(r"PARAM_COUNT=(\d+)", line):
+        n = int(param_match.groups()[0])
+        for i in range(n-1, -1, -1):
+          self.eiattr["EIATTR_KPARAM_INFO"].append([0, (8*i << 16) + i, 0x21f000])
+        self.eiattr["EIATTR_PARAM_CBANK"].append([".nv.constant0.FUNC", (8*n << 16) + 0x160])
+        self.eiattr["EIATTR_CBANK_PARAM_SIZE"].append(8*n)
+      if not (text_match := text_pat.match(strip_comments(line).strip())):
+        continue
+      ins = text_match.groups()[1].strip()
+      if ins.startswith("EXIT"):
+        self.eiattr["EIATTR_EXIT_INSTR_OFFSETS"].append([parse_inst_addr(line)])
+      elif ins.startswith("BAR"):
+        self.eiattr["SHF_BARRIERS"].append([parse_inst_addr(line)])
+    self.eiattr["EIATTR_MAX_THREADS"].append(block_dims)
+    self.eiattr["EIATTR_MAXREG_COUNT"].append(255)
+
 def parse_inst(ins:str, addr:Optional[int]=None):
   for k,v in const_tr.items():
     ins = re.sub(k, v, ins)
