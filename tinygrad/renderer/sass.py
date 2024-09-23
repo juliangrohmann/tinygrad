@@ -175,7 +175,7 @@ class Register:
     infix = f"{self.identity()}{f'.{self.mod}' if self.mod else ''}{self.postfix}"
     return f"{'-!'[self.type == "P"] if self.negated else ''}{f'{self.mem_type}[{infix}]' if self.mem_type is not None else infix}"
   def identity(self) -> str: return f"{self.type}{self.idx if self.idx != -1 else 'ZT'[self.type == 'P']}"
-  def offset(self, n): return replace(self, idx=self.idx + n)
+  def offset(self, n): return replace(self, idx=self.idx + n, phys=self.phys + n if self.phys is not None else None)
   def base(self): return self.offset(-(self.idx % self.size))
   def negate(self): return replace(self, negated=not self.negated)
   def __hash__(self): return id(self)
@@ -199,8 +199,6 @@ class Instruction:
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
 def nregs(byte_size:int) -> int: return (byte_size + 3) // 4
-def const_addr(uop:UOp, offset:int=0) -> str: return f"c[0x0][{hex(int("160", 16) + 8*uop.arg + offset)}]"
-def shm_addr(idx:Register, offset:str, dtype:DType): return replace(idx, mem_type="", mod=f"X{dtype.itemsize}", postfix="+"+offset)
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 def is_aligned(src:Register, dtype:DType) -> bool: return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
@@ -209,6 +207,8 @@ def dtype_mods(dt:DType): return [sig] if (sig:=f"{'F' if dt in floats else 'U' 
 def mem_mods(dtype:DType) -> List[str]: return [f"{'' if sz > 4 else 'SU'[dtypes.is_unsigned(dtype)]}{8*sz}"] if (sz := dtype.itemsize) != 4 else []
 def prmt_code(a:Register, b:Register) -> str: return "0x"+"".join(str(i+j+2*(r.mod == "H1_H1")) for i in [0,4] for j,r in enumerate([a,b]))[::-1]
 def lop_code(func:Callable[[int, int, int], int]) -> str: return hex(func(0xF0, 0xCC, 0xAA))
+def mem_addr(idx:Register, offset:int=0, mod=""):
+  return replace(idx, mem_type="", mod=mod, postfix=f"{'+-'[offset < 0]}{hex(abs(offset))}" if offset else "")
 
 def render_binary(x, dtype) -> str:
   x = dtypes.as_const(x, dtype) * (-1 if (neg := dtype in ints and x < 0) else 1)
@@ -241,8 +241,17 @@ def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
 def render_bra(label:str, pred:Optional[Register]=None):
   return Instruction("BRA", None, [f"`({label})"], pred=pred)
 
-def render_shm(idx:Register, offset:str, src:Register, dt:DType, load:bool, pred:Optional[Register]=None):
-  return [Instruction(*("LDS",src) if load else ("STS",None), [shm_addr(idx,offset,dt)] + ([src] if not load else []), mods=mem_mods(dt), pred=pred)]
+def render_shm(idx:Register, offset:int, src:Register, dt:DType, load:bool, pred:Optional[Register]=None):
+  addr = mem_addr(idx, offset, mod=f"X{dt.itemsize}")
+  return [Instruction(*("LDS",src) if load else ("STS",None), [addr] + ([src] if not load else []), mods=mem_mods(dt), pred=pred)]
+
+def render_stl(idx:Union[Register,str], src:Register, dtype:DType, pred:Optional[Register]=None):
+  dest: Union[Register, str] = replace(idx, mem_type="", mod=f"X{dtype.itemsize}") if isinstance(idx, Register) else f"[{hex(int(idx, 16)*4)}]"
+  return [Instruction("STL", None, [dest, src], mods=mem_mods(dtype), pred=pred)]
+
+def render_ldl(dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[Register]=None):
+  src = replace(src, mem_type="", mod=f"X{dtype.itemsize}") if isinstance(src, Register) else f"[{hex(int(src, 16)*4)}]"
+  return [Instruction("LDL", dest, [src], mods=mem_mods(dtype), pred=pred)]
 
 inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
   (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
@@ -295,7 +304,7 @@ class Allocator:
     self.vals = vals
     self.counts: Dict[str, int] = defaultdict(int)
   def __call__(self, uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None): # TODO: bad interface
-    n = nregs(byte_size or (8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)) if uop else 1)
+    n = nregs(byte_size or (4 if not uop else 8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)))
     idx = n * ((self.counts[p := prefix or ("P" if uop and uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
     self.counts[p] = idx + n
     ret = Register(idx, size=n, type=p)
@@ -365,9 +374,6 @@ class SASSRenderer(Renderer):
         ret[swap:swap] = ["0.0"]
       return ret
 
-    def glob_addr(idx:UOp, offset:Optional[UOp]=None) -> Register:
-      return replace(to_reg(idx), mem_type="", mod="64", postfix=f"{'+-'[offset.arg < 0]}{hex(abs(offset.arg))}" if offset and offset.arg else "")
-
     def print_uop(u, depth=0): # NOTE: debug TODO: remove
       if depth >= getenv("PRINT_DEPTH", 1): return
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
@@ -395,11 +401,11 @@ class SASSRenderer(Renderer):
       elif op is UOps.STORE:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
         if arg:
-          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, allow_reg=False), to_reg(vin[2]), vin[2].dtype, False, pred=gate))
+          kk(render_shm(to_reg(vin[0]), vin[1].arg, to_reg(vin[2]), vin[2].dtype, False, pred=gate))
           attr["SHM_SIZE"] = arg[1]*vin[0].dtype.itemsize
         elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
           assert len(vin) <= 4, f"unexpected STORE src count: {u}"
-          kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype), pred=gate))
+          kk(Instruction("STG", None, [mem_addr(to_reg(vin[0]),vin[1].arg,mod="64"), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype), pred=gate))
         else: raise NotImplementedError
       elif op is UOps.ENDRANGE:
         kk(iter_stack.pop(-1))
@@ -412,7 +418,7 @@ class SASSRenderer(Renderer):
         if dtype.itemsize <= 4: r[u] = render_value(arg, dtype)
         else: kk(render_mov(ssa(u), render_value(arg, dtype), dtype))
       elif op is UOps.DEFINE_GLOBAL:
-        r[u] = const_addr(u)
+        r[u] = f"c[0x0][{hex(int("160", 16) + 8*u.arg)}]"
         attr["PARAM_COUNT"] += 1
       elif op is UOps.DEFINE_ACC:
         kk(render_mov(ssa(u), r[vin[0]], dtype))
@@ -427,10 +433,10 @@ class SASSRenderer(Renderer):
       elif op is UOps.LOAD:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
         if arg:
-          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, allow_reg=False), ssa(u), dtype, True, pred=gate))
+          kk(render_shm(to_reg(vin[0]), vin[1].arg, ssa(u), dtype, True, pred=gate))
           attr["SHM_SIZE"] = arg[1]*dtype.itemsize
         elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
-          kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
+          kk(Instruction("LDG", ssa(u), [mem_addr(to_reg(vin[0]), vin[1].arg, mod="64")], mods=["E"] + mem_mods(dtype), pred=gate))
         else: raise NotImplementedError
         if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
       elif op is UOps.CAST:
@@ -474,7 +480,8 @@ class SASSRenderer(Renderer):
     rewrite_registers(kernel, "P")
     spill_to_flags(kernel, ssa)
     rewrite_registers(kernel, "R")
-    attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in ["R", "P", "B"]}["R"] + 3 # two internal registers on sm >= 8x, and RZ
+    spill_to_local(kernel, schedule_spills(kernel), ssa)
+    attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in "RPB"}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys is not None: x.idx = x.phys
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
@@ -524,6 +531,37 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
       reg.spill = reg.phys + reg.size - 1 > reg_cap
   return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys is not None] + [0])
 
+def spill_to_local(kernel:List[Instruction], sched:List[Tuple[int,bool,List[Register]]], ssa:Allocator):
+  local = ssa(None, 4)
+  for idx,store,regs in sched[::-1]:
+    # print(f"{idx}: {store}, [{', '.join([f"{r.identity()} ({r.size}) [{r.phys}]" for r in regs])}]")
+    sz = max(r.size for r in regs)
+    buf, addr, mods = ssa(None, 4*sz), mem_addr(local, 4*(regs[0].base().phys - reg_cap)), mem_mods(dtypes.uint32.vec(sz))
+    for r in regs: r.idx = buf.idx + r.idx % r.size
+    kernel[idx+store:idx+store] = [Instruction("STL", None, [addr, buf], mods=mods)] if store else [Instruction("LDL", buf, [addr], mods=mods)]
+  kernel[1:1] = [Instruction("MOV", local, ["c[0x0][0x28]"])]
+
+def schedule_spills(kernel:List[Instruction]):
+  def is_spill(r:Register): return r.type == "R" and r.idx != -1 and r.spill
+  sched = []
+  prev = {}
+  for i,inst in enumerate(kernel):
+    decouple(inst)
+    loads = [s for s in [inst.pred, *inst.srcs] if isinstance(s, Register) and is_spill(s)]
+    for bid in {s.base().identity() for s in loads}:
+      sched.append(entry := (i, False, [s for s in loads if s.base().identity() == bid]))
+      prev[bid] = entry
+    if isinstance(inst.dest, Register) and is_spill(inst.dest):
+      stores = [inst.dest]
+      if (bid := inst.dest.base().identity()) in prev and prev[bid][1]: # merge consecutive stores of the same spill
+        stores.extend(prev[bid][2])
+        sched.remove(prev[bid])
+      sched.append(entry := (i, True, stores))
+      prev[inst.dest.base().identity()] = entry
+  # print("spill sched:")
+  # for s in sched: print(f"{s[0]}: {s[1]}, [{', '.join([f"{r.identity()} ({r.size})" for r in s[2]])}]")
+  return sched
+
 def pred_cap(kernel:List[Instruction]) -> int:
   cap = 6
   while True: # TODO: refactor
@@ -562,8 +600,9 @@ def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
   kernel[1:1] = [Instruction("MOV", bit_src, [render_value(2**32 - 1, dtypes.uint32)])]
   for reg in flag_regs: kernel[1:1] = [Instruction("MOV", reg, ["RZ"])]
 
-write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA"} # TODO: casts only var lat for double width
-read_latency_ops = {"MUFU", "LDG", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA"}
+# TODO: casts only var lat for double width
+write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA", "STL", "LDL"}
+read_latency_ops = {"MUFU", "LDG", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA", "STL", "LDL"}
 
 def set_ctrl(kernel:List[Instruction]):
   def new_bar(): return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
