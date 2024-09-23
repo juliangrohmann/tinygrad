@@ -220,7 +220,9 @@ def render_value(x, dtype, allow_reg=True) -> str:
   return str(x).upper() if dtype in [dtypes.float32, dtypes.float64] else render_binary(x, dtype)
 
 def render_mov(dest:Register, src:Union[Register,str], dtype:DType, pred:Optional[Register]=None) -> List[Instruction]:
-  def enc_to_hex(s:str): return ''.join(m.groups()) if (m := re.match(r"(-?)0[xf](.*)", s)) else None
+  def enc_to_hex(s:str): return ''.join(m.groups()) if (m := re.match(r"(-?)0[xf](.*)", s)) else "0x0" if re.match(r"-?RZ", s) else None
+  if dtype is dtypes.bool:
+    return render_lop(dest, [src], dtype, lop_code(lambda a,b,c: a))
   if isinstance(src, Register):
     srcs = [src.offset(i) if i < src.size - src.idx % src.size else "RZ" for i in range(nregs(dtype.itemsize))]
   else:
@@ -338,7 +340,7 @@ class SASSRenderer(Renderer):
     attr: Dict[str, int] = defaultdict(int)
     iter_stack: List[List[Instruction]] = []
     kernel: List[Instruction] = []
-    r:Dict[Any, Union[Register,str]] = {}
+    r:Dict[UOp, Union[Register,str]] = {}
     ssa = Allocator(r)
 
     def kk(instrs:Union[List[Instruction],Instruction]):
@@ -379,7 +381,6 @@ class SASSRenderer(Renderer):
         print()
 
     kk(Instruction(f".text.{name}", None, [], label=True))
-    r[0] = Register(-1)
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
       if getenv("PRINT_UOPS", 0): # NOTE: debug TODO: remove
@@ -394,7 +395,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.STORE:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
         if arg:
-          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), to_reg(vin[2]), vin[2].dtype, False, pred=gate))
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, allow_reg=False), to_reg(vin[2]), vin[2].dtype, False, pred=gate))
           attr["SHM_SIZE"] = arg[1]*vin[0].dtype.itemsize
         elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
           assert len(vin) <= 4, f"unexpected STORE src count: {u}"
@@ -408,8 +409,8 @@ class SASSRenderer(Renderer):
         kk(Instruction("S2R", ssa(u), [('SR_TID.' if (tid := arg[0][:3] == "lid") else 'SR_CTAID.') + "XYZ"[dim := int(arg[0][-1])]]))
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
       elif op is UOps.CONST:
-        if dtype.itemsize <= 4: r[u] = r[arg] if arg in r else render_value(arg, dtype)
-        else: kk(render_mov(ssa(u), render_value(arg, dtype, allow_reg=False), dtype))
+        if dtype.itemsize <= 4: r[u] = render_value(arg, dtype)
+        else: kk(render_mov(ssa(u), render_value(arg, dtype), dtype))
       elif op is UOps.DEFINE_GLOBAL:
         r[u] = const_addr(u)
         attr["PARAM_COUNT"] += 1
@@ -426,7 +427,7 @@ class SASSRenderer(Renderer):
       elif op is UOps.LOAD:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
         if arg:
-          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), ssa(u), dtype, True, pred=gate))
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, allow_reg=False), ssa(u), dtype, True, pred=gate))
           attr["SHM_SIZE"] = arg[1]*dtype.itemsize
         elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
           kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
