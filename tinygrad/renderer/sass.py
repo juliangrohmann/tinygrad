@@ -219,8 +219,9 @@ def prmt_code(a:Register, b:Register) -> str: return "0x"+"".join(str(i+j+2*(r.m
 def lop_code(func:Callable[[int, int, int], int]) -> str: return hex(func(0xF0, 0xCC, 0xAA))
 
 def render_binary(x, dtype) -> str:
-  x = dtypes.as_const(x, dtype) * (-1 if (neg := dtype in ints and x < 0) else 1)
-  return f"{'-' if neg else ''}0{'xf'[dtypes.is_float(dtype)]}{struct.pack('>'+{dtypes.int64:'q', dtypes.uint64:'Q'}.get(dtype, dtype.fmt), x).hex()}"
+  x = dtypes.as_const(abs(x) if (neg := dtype in ints and x < 0) else x, dtype)
+  s = hex(x)[2:] if dtype in ints else struct.pack('>'+{dtypes.int64:'q', dtypes.uint64:'Q'}.get(dtype, dtype.fmt), x).hex()
+  return f"{'-' if dtype in ints and neg else ''}0{'xf'[dtypes.is_float(dtype)]}{s}"
 
 def render_value(x, dtype, allow_reg=True) -> str:
   if dtype is dtypes.bool: return "PT" if x else "!PT"
