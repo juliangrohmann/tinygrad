@@ -108,6 +108,9 @@ def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
   return ([Instruction(op := dtype_op("SETP", dt), d, ["PT",*s,"PT"], mods=(m := ["AND", op_mod]) + (["U32"] if dt in usig or dt in longs else []))] +
          ([Instruction(op, d, ["PT",*[v.offset(1) for v in s],"PT",d], mods=m+["EX"]+(["U32"] if dt in usig else []))] if dt in longs else []))
 
+def render_bra(label:str, pred:Optional[Register]=None):
+  return Instruction("BRA", None, [f"`({label})"], pred=pred)
+
 inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
   (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
   (ints, longs, lambda d,s,di,do: render_mov(d,s,do) + ([Instruction("SHF", d.offset(1), ["RZ","0x1f",d], mods=["R","HI","S32"])], [])[di in usig]),
@@ -189,7 +192,11 @@ class SASSRenderer(Renderer):
     r[0] = Register(-1)
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
-      if op is UOps.STORE:
+      if op is UOps.IF:
+        kk(render_bra(ssa(u, prefix=".IF_").render(), to_reg(vin[0])))
+      elif op is UOps.ENDIF:
+        kk(Instruction(label.render() if isinstance(label := r[vin[0]], Register) else label, None, [], label=True))
+      elif op is UOps.STORE:
         if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
           assert len(vin) == 3, f"unexpected STORE src count: {u}"
           kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
