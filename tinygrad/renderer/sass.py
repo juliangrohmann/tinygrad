@@ -1,17 +1,55 @@
 import struct, re
+from functools import partial
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from enum import Enum, auto
 from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
-from tinygrad.dtype import dtypes, DType, PtrDType
+from tinygrad.dtype import dtypes, DType, PtrDType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
 
 class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
   SET_BITS = auto(); NOT = auto() # noqa: E702
+
+ext_to_word_dt = {dtypes.int64:dtypes.int32, dtypes.uint64:dtypes.uint32, dtypes.float64:dtypes.float32}
+
+def raw(x:UOp) -> UOp: return x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}"))
+def ext_to_vec(x:UOp) -> UOp:
+  assert x.dtype in ext_to_word_dt, f"cannot bitcast {x.dtype} to vector: expected double width dtype"
+  return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
+
+def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
+  xv, yv = ext_to_vec(x), ext_to_vec(y)
+  return UOp(UOps.VECTORIZE, xv.dtype, (p.where(xv.gep(0), yv.gep(0)), p.where(xv.gep(1), yv.gep(1)))).bitcast(x.dtype)
+
+def mul_long(x:UOp, y:UOp) -> UOp:
+  xv, yv = ext_to_vec(x), ext_to_vec(y)
+  base = UOp(UOps.ALU, x.dtype, (raw(xv.gep(0)), raw(yv.gep(0))), SASSOps.WIDE).bitcast(xv.dtype)
+  return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(0) * yv.gep(1) + xv.gep(1) * yv.gep(0) + base.gep(1))).bitcast(x.dtype)
+
+def add_long(x:UOp, y:UOp) -> UOp:
+  xv = ext_to_vec(x)
+  base = (fac := raw(xv.gep(0))).alu(SASSOps.WIDE, fac.const_like(1), y).bitcast(xv.dtype)
+  return UOp(UOps.VECTORIZE, xv.dtype, (base.gep(0), xv.gep(1) + base.gep(1))).bitcast(x.dtype)
+
+def shf_long(root:UOp, x:UOp, y:UOp) -> UOp:
+  xv = ext_to_vec(x)
+  assert x.dtype in longs and y.dtype in ints, f"unsupported dtypes for double width shift funnel: root={root.dtype}, x={x.dtype}, y={y.dtype}"
+  ext = UOp(UOps.ALU, wdt := ext_to_word_dt[x.dtype], (x, y), SASSOps.SHR_HI if (shr := root.arg == BinaryOps.SHR) else SASSOps.SHL_HI)
+  base = UOp(UOps.ALU, wdt, (xv.gep(0), ext_to_vec(y).gep(0) if y.dtype.itemsize > 4 else y), SASSOps.SHR_LO if shr else root.arg)
+  return UOp(UOps.VECTORIZE, base.dtype.vec(2), (base, ext)).bitcast(x.dtype)
+
+def set_bits_long(x:UOp, y:UOp, z:UOp) -> UOp:
+  xv, yv, zv = ext_to_vec(x), ext_to_vec(y), ext_to_vec(z)
+  return UOp(UOps.VECTORIZE, xv.dtype, tuple(xv.gep(i).alu(SASSOps.SET_BITS, yv.gep(i), zv.gep(i)) for i in range(2))).bitcast(x.dtype)
+
+def bitwise_long(root:UOp, x:UOp, y:UOp) -> UOp:
+  xv, yv = ext_to_vec(x), ext_to_vec(y)
+  base, ext = raw(b := xv.gep(0)).alu(root.arg, raw(yv.gep(0))).bitcast(b.dtype), xv.gep(1).alu(root.arg, yv.gep(1))
+  return UOp(UOps.VECTORIZE, xv.dtype, (base, ext)).bitcast(x.dtype)
 
 def mem_offset(root:UOp, idx:UOp, off:UOp):
   sz, glob = UOp.const(dtypes.uint32, root.src[0].dtype.itemsize), root.src[0].op is UOps.DEFINE_GLOBAL
@@ -32,13 +70,24 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.STORE, name="root", src=(UPat(),UPat(),UPat.var("z",dtypes.bool))),
     lambda root,z: UOp(root.op, root.dtype, root.src[:2] + (z.cast(dtypes.uint8),), root.arg)),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True,
-      src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("x"),UPat.cvar("c")]))), mem_offset),
+    src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)), UPat(UOps.ALU, arg=BinaryOps.ADD, src=[UPat.var("x"),UPat.cvar("c")]))), mem_offset),
   (UPat((UOps.LOAD, UOps.STORE), name="root", allow_any_len=True, src=(UPat((UOps.DEFINE_GLOBAL,UOps.DEFINE_LOCAL)),UPat.var("x"))),
     lambda root,x: mem_offset(root,*[UOp.const(dtypes.uint32, 0), x][::1 if x.op is UOps.CONST else -1])),
   (UPat(UOps.ALU, arg=BinaryOps.MAX, dtype=dtypes.float64, src=(UPat.var("x"),UPat.var("y"))),
-   lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
+    lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
+  (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), lambda x,y,z: (x&y)|(-x&z)),
+  (UPat(UOps.ALU, arg=BinaryOps.CMPLT, dtype=dtypes.bool, src=(UPat.var("x",dtypes.bool),UPat.var("y",dtypes.bool))), lambda x,y: -x&y),
   (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
-   lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
+    lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
+  *[(UPat(UOps.ALU, name="root", arg=iop, dtype=dtypes.bool, src=UPat(dtype=dtypes.bool)),
+    partial(lambda root, oop: UOp(root.op, root.dtype, root.src, oop), oop=oop))
+    for (iop,oop) in [(BinaryOps.ADD,BinaryOps.OR), (BinaryOps.MAX,BinaryOps.OR), (BinaryOps.MUL,BinaryOps.AND), (BinaryOps.CMPNE,BinaryOps.XOR)]],
+  *[(UPat(UOps.ALU, arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), func)
+    for op,func in [(BinaryOps.MUL,mul_long), (BinaryOps.ADD,add_long)]],
+  *[(UPat(UOps.ALU, name="root", arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), shf_long)
+    for op in [BinaryOps.SHL, BinaryOps.SHR]],
+  *[(UPat(UOps.ALU, name="root", arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), bitwise_long)
+    for op in [BinaryOps.AND, BinaryOps.OR, BinaryOps.XOR]],
 ])
 
 @dataclass
@@ -165,7 +214,7 @@ class SASSRenderer(Renderer):
     attr: Dict[str, int] = defaultdict(int)
     kernel: List[Instruction] = []
     r:Dict[Any, Union[Register,str]] = {}
-    c:Dict[str, int] = {}
+    c:Dict[str, int] = defaultdict(int)
 
     def ssa(uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None): # TODO: bad interface
       n = nregs(byte_size or (8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)) if uop else 1)
@@ -250,6 +299,7 @@ class SASSRenderer(Renderer):
     kk(Instruction(".L_END", None, [], label=True))
 
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
+    attr["SHI_REGISTERS"] = c["R"] + 3 # two internal registers on sm >= 8x, and RZ
     set_ctrl(kernel)
     return ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
