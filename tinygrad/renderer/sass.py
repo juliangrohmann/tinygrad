@@ -336,24 +336,32 @@ class SASSRenderer(Renderer):
     if getenv("GRAPHUOPS"): # TODO: remove
       graph_uops(uops)
     if debug_sass := getenv("DEBUG_SASS", ""):
-      with open(debug_sass) as f: return f.read()
+      with open(debug_sass) as f: debug_src = f.read()
+      debug_name = next(m.groups()[0] for line in debug_src.split('\n') if (m := re.match(r"\.text\.([^:]*)", line.strip())))
+      if debug_name == name:
+        print(colored(f"using debug sass: {name}", "green"))
+        return debug_src
+      print(colored(f"skipping debug sass: {name}", "yellow"))
     if out_dir := getenv("WRITE_SRC", ""):
-      try:
-        cuda_src = CUDARenderer("sm_89").render(to_function_name(name), uops)
-        with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
-        subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(),
-                        (Path(out_dir) / "nvcc.cu").as_posix()], check=False)
-        with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
-          subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f, check=False)
-        with open(Path(out_dir) / "nvcc.cubin", "rb") as frb: cuda_blob = frb.read()
-        cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
-        with open(Path(out_dir) / "nvcc.bin", "wb") as fwb: fwb.write(cuda_kernel)
-        with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
-          tmp.close()
-          subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-          CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
-      except Exception:
-        print(colored("failed to render nvcc", "red"))
+      if write_src := not (name_filter := getenv("FILTER_NAME", "")) or name == name_filter:
+        try:
+          cuda_src = CUDARenderer("sm_89").render(to_function_name(name), uops)
+          with open(fn_cu := Path(out_dir) / "nvcc.cu", "w") as f: f.write(cuda_src)
+          subprocess.run(["nvcc", "--cubin", "-arch", "sm_89", "-o", (Path(out_dir) / "nvcc.cubin").as_posix(),
+                          (Path(out_dir) / "nvcc.cu").as_posix()], check=False)
+          with open(Path(out_dir) / "nvcc_cuobjdump.sass", "w") as f:
+            subprocess.run(["cuobjdump", "-sass", "-arch", "sm_89", (Path(out_dir) / "nvcc.cubin").as_posix()], stdout=f, check=False)
+          with open(Path(out_dir) / "nvcc.cubin", "rb") as frb: cuda_blob = frb.read()
+          cuda_kernel = [section for section in elf_loader(cuda_blob)[1] if section.name.startswith(".text")][0].content
+          with open(Path(out_dir) / "nvcc.bin", "wb") as fwb: fwb.write(cuda_kernel)
+          with tempfile.NamedTemporaryFile(suffix=".cubin", delete_on_close=False) as tmp:
+            tmp.close()
+            subprocess.run(["nvcc", "--cubin", "-arch=sm_89", "-o", tmp.name, fn_cu], stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+            CubinFile(tmp.name).saveAsCuAsm(Path(out_dir) / "nvcc.cuasm")
+        except Exception:
+          print(colored("failed to render nvcc", "red"))
+      else:
+        print(colored(f"skipping write src: {name}", "yellow"))
 
     attr: Dict[str, int] = defaultdict(int)
     iter_stack: List[List[Instruction]] = []
@@ -495,7 +503,7 @@ class SASSRenderer(Renderer):
     sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
     # NOTE: debug
-    if out_dir := getenv("WRITE_SRC", ""):
+    if getenv("WRITE_SRC", "") and write_src:
       with open(Path(out_dir) / "rendered.sass", "w") as f: f.write(sass_src)
       with open(Path(out_dir) / "rendered_ssa.sass", "w") as f: f.write(ssa_src)
       elf = SASSCompiler("sm_89").compile(sass_src)
