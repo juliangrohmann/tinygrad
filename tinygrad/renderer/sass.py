@@ -262,6 +262,7 @@ class SASSRenderer(Renderer):
 
   def render(self, name:str, uops:List[UOp]) -> str:
     attr: Dict[str, int] = defaultdict(int)
+    iter_stack: List[List[Instruction]] = []
     kernel: List[Instruction] = []
     r:Dict[Any, Union[Register,str]] = {}
     c:Dict[str, int] = defaultdict(int)
@@ -300,6 +301,10 @@ class SASSRenderer(Renderer):
           assert len(vin) == 3, f"unexpected STORE src count: {u}"
           kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
         else: raise NotImplementedError
+      elif op is UOps.ENDRANGE:
+        kk(iter_stack.pop(-1))
+      elif op is UOps.BARRIER:
+        kk(Instruction("BAR", None, ["0x0"], mods=["SYNC", "DEFER_BLOCKING"]))
       elif op is UOps.SPECIAL:
         kk(Instruction("S2R", ssa(u), [('SR_TID.' if (tid := arg[0][:3] == "lid") else 'SR_CTAID.') + "XYZ"[dim := int(arg[0][-1])]]))
         if tid: attr[f"BLOCK_DIM_{dim}"] = arg[1]
@@ -311,6 +316,14 @@ class SASSRenderer(Renderer):
         attr["PARAM_COUNT"] += 1
       elif op is UOps.DEFINE_ACC:
         kk(render_mov(ssa(u), r[vin[0]], dtype))
+      elif op is UOps.RANGE:
+        kk([*render_mov(ssa(u), r[vin[0]], dtype), Instruction(rng_label := ssa(None, byte_size=4, prefix=".RANGE_").render(), None, [], label=True)])
+        pred, counter, end = ssa(None, byte_size=4, prefix="P"), to_reg(u), to_reg(vin[1])
+        update = inst_for_alu[BinaryOps.ADD](r[u], [r[u], "0x1" if len(vin) < 3 else to_reg(vin[2])], dtype, u)
+        branch = [*inst_for_alu[BinaryOps.CMPNE](pred, [counter, end], dtype, u), render_bra(rng_label, pred)]
+        iter_stack.append([update, *branch])
+      elif op is UOps.ASSIGN:
+        r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
       elif op is UOps.LOAD:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
         if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
