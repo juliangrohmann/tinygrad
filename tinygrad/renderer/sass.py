@@ -41,6 +41,13 @@ def recip_double(x:UOp) -> UOp:
   it = approx*(buf*buf + buf) + approx
   return it*(-x*it + 1) + it
 
+def idiv(x:UOp, y:UOp) -> UOp:
+  bits = raw(x.cast(fdt := dtypes.float64) / y.cast(fdt))
+  assert x.dtype in ints and y.dtype in ints and bits.dtype, f"unsupported dtypes for IDIV: x={x.dtype}, y={y.dtype}"
+  exp = (bits & inf[bits.dtype.itemsize]).alu(BinaryOps.SHR, bits.const_like(52)) - (2**10 - 1)
+  mask = bits.const_like(1).alu(BinaryOps.SHL, -exp + 52) - 1
+  return exp.lt(0).where(x.const_like(0), bits.alu(SASSOps.SET_BITS, bits.const_like(0), mask).bitcast(fdt).cast(x.dtype))
+
 def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
   return UOp(UOps.VECTORIZE, xv.dtype, (p.where(xv.gep(0), yv.gep(0)), p.where(xv.gep(1), yv.gep(1)))).bitcast(x.dtype)
@@ -97,6 +104,8 @@ sass_matcher = PatternMatcher([
     lambda x,y: UOp(UOps.ALU, dtypes.bool.vec(2), (x, y), SASSOps.DMAX).gep(0).where(x, y)),
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), lambda x,y,z: (x&y)|(-x&z)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPLT, dtype=dtypes.bool, src=(UPat.var("x",dtypes.bool),UPat.var("y",dtypes.bool))), lambda x,y: -x&y),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.var("y"))), idiv),
+  (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - idiv(x,y)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
     lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
   *[(UPat(UOps.ALU, name="root", arg=iop, dtype=dtypes.bool, src=UPat(dtype=dtypes.bool)),
