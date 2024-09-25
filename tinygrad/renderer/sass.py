@@ -195,7 +195,7 @@ class ControlCode:
   def render(self) -> str:
     bs = ''.join(['-' if b not in self.wait else str(b) for b in range(6)])
     rs, ws = [v if v is not None else '-' for v in [self.read, self.write]]
-    return f"[B{bs}:R{rs}:W{ws}:{'-Y'[self.yield_]}:S{self.stall}]"
+    return f"[B{bs}:R{rs}:W{ws}:{'-Y'[self.yield_]}:S{self.stall:02}]"
 
 @dataclass
 class Instruction:
@@ -380,10 +380,9 @@ class SASSRenderer(Renderer):
       return kk(render_mov(ssa(uop), var, uop.dtype))
 
     def fit_consts(op:Any, srcs:Tuple[UOp,...]):
-      if op in [SASSOps.WIDE]: return [to_reg(s) for s in srcs]
       allowed = {SASSOps.FMA: (1,2), SASSOps.WIDE: (1,2), TernaryOps.WHERE: (2,)}.get(op, (1,) if len(srcs) > 1 else (0,))
       consts = [i for i,s in enumerate(srcs) if isinstance(v:=r[s], str) and "RZ" not in v and "PT" not in v]
-      cidx, swap = next(((i, i) for i in consts if i in allowed), (consts[0], allowed[0]) if consts and op in commutative else (-1, -1))
+      cidx, swap = next(((i, i) for i in consts[::-1] if i in allowed), (consts[0], allowed[0]) if consts and op in commutative else (-1, -1))
       regs = [to_reg(s) for i,s in enumerate(srcs) if i != cidx]
       ret = regs if cidx == -1 else [*regs[:swap], r[srcs[cidx]], *regs[swap:]]
       if op is TernaryOps.WHERE and cidx != swap: ret[0] = ret[0].negate()
@@ -499,7 +498,8 @@ class SASSRenderer(Renderer):
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys is not None: x.idx = x.phys
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
-    set_ctrl(kernel)
+    set_bars(kernel)
+    set_stalls(kernel)
     sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
     # NOTE: debug
@@ -615,28 +615,66 @@ def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
   for reg in flag_regs: kernel[1:1] = [Instruction("MOV", reg, ["RZ"])]
 
 # TODO: casts only var lat for double width
-write_latency_ops = {"MUFU", "LDG", "S2R", "I2F", "F2I", "F2F", "DSETP", "DADD", "DMUL", "LDS", "DFMA", "STL", "LDL"}
-read_latency_ops = {"MUFU", "LDG", "DSETP", "STS", "STG", "F2I", "F2F", "I2F", "DMUL", "DADD", "DFMA", "STL", "LDL"}
+common_var_lat = {"MUFU", "LDG", "DSETP", "I2F", "F2I", "F2F", "DADD", "DMUL", "DFMA", "LDL"}
+write_var_lat = common_var_lat | {"LDS", "S2R"}
+read_var_lat = common_var_lat | {"STG", "STL", "STS"}
+smem_ops = {"LDS", "STS"}
+gmem_ops = {"LDG", "STG", "LDL", "STL",  "LDC", "ULDC", "BAR", "DEPBAR"}
+word_ops = {"FADD", "FMUL", "FFMA", "HADD2", "HMUL2", "HFMA2", "IADD3", "IMAD", "LOP3", "MOV", "PRMT", "SEL", "FSEL", "BRA", "EXIT", "NOP"}
+ext_ops = {"DADD", "DMUL", "DFMA"}
+shift_ops = {"HMNMX2", "FMNMX", "IMNMX", "SHF"}
+cmp_ops = {"HSETP2", "FSETP", "DSETP", "ISETP", "PLOP3", "DMNMX"}
+qtr_ops = {"MUFU", "F2F", "F2I", "I2F", "I2I"}
 
-def set_ctrl(kernel:List[Instruction]):
-  def new_bar(): return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
-  def all_ids(dep): return [dep.base().offset(i).identity() for i in range(dep.size if isinstance(dep, Register) else 0)]
+@dataclass(frozen=True)
+class LatSpec: res:str; lat:int; rlat:int; tput:int; dual:bool; reuse:bool # noqa: E702
+
+lat_groups = (({"S2R"},  LatSpec("s2r", 2, 0, 1, False, False)), (shift_ops, LatSpec("shift", 6, 0, 2, False, True)),
+              ({"F2FP"}, LatSpec("qtr", 8, 1, 1, True, False)),  (qtr_ops,   LatSpec("qtr", 8, 2, 1, True, False)),
+              (gmem_ops, LatSpec("mem", 2, 2, 1, True, False)),  (smem_ops,  LatSpec("mem", 2, 1, 1, True, False)),
+              (word_ops, LatSpec("word", 6, 0, 1, False, True)), (ext_ops,   LatSpec("ext", 2, 0, 128, False, True)),
+              (cmp_ops,  LatSpec("cmp", 13, 0, 2, False, True)))
+op_lats = {op: spec for ops, spec in lat_groups for op in ops}
+
+def set_stalls(kernel:List[Instruction]):
+  def deps(vals): return [v.base().identity() for v in vals if isinstance(v, Register) and v.idx != -1]
+  valid = [k for k in kernel if not k.label]
+  clock = 1
+  eta: Dict[str, int] = {}
+  for i, inst in enumerate(valid):
+    reads, writes, spec = deps([inst.pred, *inst.srcs]), deps([inst.dest]), op_lats[inst.op]
+    if i > 0:
+      prev = valid[i - 1]
+      min_stall = max(1 if spec != op_lats[prev.op] else spec.tput, 2*(prev.ctrl.write in inst.ctrl.wait or prev.ctrl.read in inst.ctrl.wait))
+      prev.ctrl.stall = stall = min(max([eta[r] - clock - spec.rlat*(r[0] != "P") for r in reads] + [min_stall]), 15)
+      prev.ctrl.yield_ |= stall >= 4
+    else:
+      stall = 1
+    clock += stall
+    op_lat = max(spec.lat, 7*("WIDE" in inst.mods))
+    eta.update({w: clock + op_lat for w in writes})
+  prev.ctrl.stall = 1
+
+def set_bars(kernel:List[Instruction]):
+  def new_bar():
+    return open_bar[0] if (open_bar := [i for i in range(6) if i not in active_bar]) else active_bar[0]
+  def all_ids(dep):
+    return [dep.base().offset(i).identity() for i in range(dep.size if isinstance(dep, Register) else 0)]
   def set_bar(deps, bar_tab):
     active_bar.append(bar := new_bar())
     bar_tab.update({rid: bar for d in deps for rid in all_ids(d)})
     return bar
-
   def wait_bar(deps, bar_tab):
     bars = {bar_tab[rid] for d in deps for rid in all_ids(d) if rid in bar_tab}
     inst.ctrl.wait.extend(list(bars))
     for k,v in list(bar_tab.items()):
       if v in bars: bar_tab.pop(k, None)
     for b in bars: active_bar.remove(b)
+
   active_bar: List[int] = []
   write_bar: Dict[str,int] = {}
   read_bar: Dict[str,int] = {}
   for inst in kernel:
     wait_bar(inst.srcs, write_bar), wait_bar([inst.dest], read_bar)
-    inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_latency_ops else None
-    inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_latency_ops else None
-    inst.ctrl.yield_ |= inst.ctrl.stall >= 12
+    inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_var_lat else None
+    inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_var_lat else None
