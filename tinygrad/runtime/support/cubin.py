@@ -4,12 +4,12 @@ from tinygrad.helpers import partition
 from tinygrad.runtime.support.assembler_sass import SASSParser
 from tinygrad.runtime.support.elf import ElfSection, ElfSegment, make_elf
 
-strtab_common_pre = (".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.FUNC", ".nv.info.FUNC")
+strtab_common_pre = (".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.FUNC", ".nv.info.FUNC", ".nv.shared.FUNC")
 strtab_common_post = (".nv.prototype", ".nv.rel.action")
 strtab_names = strtab_common_pre + (".rel.nv.constant0.FUNC", ".nv.constant0.FUNC") + strtab_common_post + ("FUNC",)
 shstrtab_names = strtab_common_pre + (".nv.constant0.FUNC", ".rel.nv.constant0.FUNC") + strtab_common_post
-sym_names = (".text.FUNC", ".nv.constant0.FUNC", ".nv.rel.action", "FUNC") # TODO: is .nv.info needed?
-sec_names = (".shstrtab", ".strtab", ".symtab", ".nv.info", ".nv.info.FUNC", ".nv.rel.action", ".nv.constant0.FUNC", ".text.FUNC")
+sym_names = (".text.FUNC", ".nv.shared.FUNC", ".nv.constant0.FUNC", ".nv.rel.action", "FUNC") # TODO: is .nv.info needed?
+sec_names = (".shstrtab", ".strtab", ".symtab", ".nv.info", ".nv.info.FUNC", ".nv.rel.action", ".nv.constant0.FUNC", ".text.FUNC", ".nv.shared.FUNC")
 eiattr = {'EIATTR_MAX_THREADS': 0x0504, 'EIATTR_PARAM_CBANK': 0x0a04, 'EIATTR_FRAME_SIZE': 0x1104, 'EIATTR_MIN_STACK_SIZE': 0x1204,
           'EIATTR_KPARAM_INFO': 0x1704, 'EIATTR_CBANK_PARAM_SIZE': 0x1903, 'EIATTR_MAXREG_COUNT': 0x1b03, 'EIATTR_EXIT_INSTR_OFFSETS': 0x1c04,
           'EIATTR_REGCOUNT': 0x2f04, 'EIATTR_CUDA_API_VERSION': 0x3704}
@@ -19,7 +19,7 @@ nv_info_func_attr = ("EIATTR_CUDA_API_VERSION", "EIATTR_PARAM_CBANK", "EIATTR_CB
                       "EIATTR_MAXREG_COUNT", "EIATTR_EXIT_INSTR_OFFSETS", "EIATTR_MAX_THREADS")
 nv_rel_action = b'\x73\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x11\x25\x00\x05\x36' # TODO: figure out dynsym d_un type
 
-def make_cubin(kernel:bytes, eiattr:Dict[str,List], parser:SASSParser, arch:str) -> memoryview: # TODO: refactor, bad interface!
+def make_cubin(kernel:bytes, eiattr:Dict[str,List], parser:SASSParser, arch:str) -> memoryview:
   assert arch == "sm_89", f"cubin generation not supported for {arch}"
   (attr := dict(eiattr)).update({"EIATTR_MIN_STACK_SIZE": [[sym_names.index("FUNC") + 1, 0]], "EIATTR_FRAME_SIZE":[[sym_names.index("FUNC") + 1, 0]]})
   attr.update({k: [[sym_names.index(v[0]) + 1, v[1]] for v in attr[k]] for k in indexed_attr}) # map sym names to indices
@@ -31,6 +31,7 @@ def make_cubin(kernel:bytes, eiattr:Dict[str,List], parser:SASSParser, arch:str)
              ".nv.rel.action": build_nv_rel_action(),
              ".nv.constant0.FUNC": build_constant_memory(parser.function_name, attr)}
   sec_tab[".symtab"] = build_symtab(parser.function_name, sec_tab[".strtab"], sec_tab[".text.FUNC"])
+  if "SHM_SIZE" in attr: sec_tab[".nv.shared.FUNC"] = build_shared_memory(parser.function_name, attr)
   for s in sec_tab.values(): s.header.sh_name, s.header.sh_size = sh_name(s.name, sec_tab[".shstrtab"].content), len(s.content)
   sections = [ElfSection("", libc.Elf64_Shdr(sh_type=libc.SHT_NULL), content=b'')] + [sec_tab[name] for name in sec_names if name in sec_tab]
   segments = build_segments(sections)
@@ -104,6 +105,11 @@ def build_nv_rel_action() -> ElfSection:
 def build_constant_memory(function_name:str, attr:Dict[str,List]) -> ElfSection:
   sh = libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_flags=0x40 + libc.SHF_ALLOC, sh_info=sec_names.index(".text.FUNC") + 1, sh_addralign=4)
   return ElfSection(f".nv.constant0.{function_name}", sh, b'\0'*(((v := attr["EIATTR_PARAM_CBANK"][0][-1]) >> 16) + (v & ((1 << 16) - 1))))
+
+def build_shared_memory(function_name:str, attr:Dict[str,List]) -> ElfSection:
+  sh = libc.Elf64_Shdr(sh_type=libc.SHT_PROGBITS, sh_flags=0x40+libc.SHF_ALLOC+libc.SHF_WRITE,
+                       sh_info=sec_names.index(".text.FUNC") + 1, sh_addralign=4)
+  return ElfSection(f".nv.shared.{function_name}", sh, b'\0'*attr["SHM_SIZE"][0][0])
 
 def pack_eiattr_tab(attr_names:Sequence[str], kernel_eiattr:Dict[str, List]) -> bytes:
   content = bytearray()

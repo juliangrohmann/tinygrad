@@ -168,6 +168,7 @@ class Instruction:
 
 def nregs(byte_size:int) -> int: return (byte_size + 3) // 4
 def const_addr(uop:UOp, offset:int=0) -> str: return f"c[0x0][{hex(int("160", 16) + 8*uop.arg + offset)}]"
+def shm_addr(idx:Register, offset:str, dtype:DType): return replace(idx, mem_type="", mod=f"X{dtype.itemsize}", postfix="+"+offset)
 def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
 def is_aligned(src:Register, dtype:DType) -> bool: return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
@@ -205,6 +206,9 @@ def render_cmp(d, s, dt, op_mod) -> List[Instruction]:
 
 def render_bra(label:str, pred:Optional[Register]=None):
   return Instruction("BRA", None, [f"`({label})"], pred=pred)
+
+def render_shm(idx:Register, offset:str, src:Register, dt:DType, load:bool, pred:Optional[Register]=None):
+  return [Instruction(*("LDS",src) if load else ("STS",None), [shm_addr(idx,offset,dt)] + ([src] if not load else []), mods=mem_mods(dt), pred=pred)]
 
 inst_for_cast: Tuple[Tuple[Tuple, Tuple, Callable],...] = (
   (ints, floats, lambda d,s,di,do: Instruction("I2F", d, [s], mods=[] + dtype_mods(di) + dtype_mods(do))),
@@ -297,7 +301,10 @@ class SASSRenderer(Renderer):
       elif op is UOps.ENDIF:
         kk(Instruction(label.render() if isinstance(label := r[vin[0]], Register) else label, None, [], label=True))
       elif op is UOps.STORE:
-        if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
+        if arg:
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), to_reg(vin[2]), vin[2].dtype, False))
+          attr["SHM_SIZE"] = arg[1]*vin[0].dtype.itemsize
+        elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].sparents):
           assert len(vin) == 3, f"unexpected STORE src count: {u}"
           kk(Instruction("STG", None, [glob_addr(*vin[:2]), to_reg(vin[2])], mods=["E"] + mem_mods(vin[2].dtype)))
         else: raise NotImplementedError
@@ -326,10 +333,12 @@ class SASSRenderer(Renderer):
         r[u] = kk(render_mov(to_reg(vin[0]), r[vin[1]], dtype))
       elif op is UOps.LOAD:
         gate = to_reg(vin[3]) if len(vin) > 3 else None
-        if any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
+        if arg:
+          kk(render_shm(to_reg(vin[0]), render_value(vin[1].arg, dtypes.uint32, False), ssa(u), dtype, True))
+          attr["SHM_SIZE"] = arg[1]*dtype.itemsize
+        elif any(p.op is UOps.DEFINE_GLOBAL for p in vin[0].parents):
           kk(Instruction("LDG", ssa(u), [glob_addr(*vin[:2])], mods=["E"] + mem_mods(dtype), pred=gate))
         else: raise NotImplementedError
-        if gate: kk(render_mov(to_reg(u), r[vin[2]], dtype, pred=gate.negate()))
       elif op is UOps.CAST:
         for dti,dto,func in inst_for_cast:
           if vin[0].dtype in dti and dtype in dto:
