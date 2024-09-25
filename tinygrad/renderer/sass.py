@@ -6,13 +6,14 @@ from enum import Enum, auto
 from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 from tinygrad.helpers import data64_le
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
-from tinygrad.dtype import dtypes, DType, PtrDType, to_dtype
+from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
 from tinygrad.renderer import Renderer, TensorCore
+from tinygrad.codegen.transcendental import xlog2
 
 class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
-  SET_BITS = auto(); NOT = auto(); RECIP_APPROX = auto(); RECIP_HI = auto() # noqa: E702
+  SET_BITS = auto(); NOT = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.int64:dtypes.int32, dtypes.uint64:dtypes.uint32, dtypes.float64:dtypes.float32}
 inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
@@ -20,9 +21,20 @@ inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
 def raw(x:UOp) -> UOp: return x.bitcast(to_dtype(f"uint{8*x.dtype.itemsize}"))
 def is_nan(x:UOp) -> UOp: return -raw(x).lt(inf[x.dtype.itemsize] + 1)
 def is_inf(x:UOp) -> UOp: return (raw(x) & 2**(x.dtype.itemsize*8 - 1) - 1).eq(inf[x.dtype.itemsize])
+def geu(x:UOp, v:ConstType) -> UOp: return (-x.lt(x.const_like(v))) | is_nan(x)
 def ext_to_vec(x:UOp) -> UOp:
   assert x.dtype in ext_to_word_dt, f"cannot bitcast {x.dtype} to vector: expected double width dtype"
   return x.bitcast(ext_to_word_dt[x.dtype].vec(2))
+
+def exp2(d:UOp) -> UOp:
+  valid = geu(d, -126.0)
+  dest = valid.where(d, d * d.const_like(0.5)).alu(SASSOps.EXP2_APPROX)
+  return valid.where(dest, dest * dest)
+
+def sqrt(d:UOp) -> UOp: # TODO: valid for double/long/int?
+  assert d.dtype in set(numeric) - {dtypes.float16}, f"unsupported dtype for SQRT: {d.dtype}"
+  buf = (root := d.alu(SASSOps.SQRT_APPROX)) * d
+  return raw(d).eq(inf[d.dtype.itemsize]).where(d.const_like(float("inf")), d.eq(0).where(d.const_like(0), 0.5 * (-buf * buf + d) * root + buf))
 
 def recip_single(x:UOp) -> UOp:
   assert x.dtype is dtypes.float32, f"unsupported dtype for single width RECIP: {x.dtype}"
@@ -83,6 +95,7 @@ def mem_offset(root:UOp, idx:UOp, off:UOp):
   base = idx.cast(dtypes.uint32).alu(SASSOps.WIDE, sz, root.src[0].bitcast(dtypes.uint64)) if glob else idx
   return UOp(root.op, root.dtype, (base,off*sz)+root.src[2:], None if glob else root.src[0].arg)
 
+not_half = tuple(dt for dt in dtypes.fields().values() if dt is not dtypes.half)
 ints, floats = tuple(dt for dt in dtypes.fields().values() if dtypes.is_int(dt)), tuple(dt for dt in dtypes.fields().values() if dtypes.is_float(dt))
 usig, longs = tuple(dt for dt in dtypes.fields().values() if dtypes.is_unsigned(dt)), (dtypes.int64, dtypes.uint64)
 numeric = ints + floats
@@ -115,6 +128,8 @@ sass_matcher = PatternMatcher([
     for dt,func in [(dtypes.float32,recip_single), (dtypes.float64,recip_double)]],
   *[(UPat(UOps.ALU, arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), func)
     for op,func in [(BinaryOps.MUL,mul_long), (BinaryOps.ADD,add_long)]],
+  *[(UPat(UOps.ALU, arg=op, dtype=not_half, src=(UPat.var("d"),)), func)
+    for op,func in [(UnaryOps.EXP2,exp2), (UnaryOps.LOG2,xlog2), (UnaryOps.SQRT,sqrt)]],
   *[(UPat(UOps.ALU, name="root", arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), shf_long)
     for op in [BinaryOps.SHL, BinaryOps.SHR]],
   *[(UPat(UOps.ALU, name="root", arg=op, dtype=longs, src=(UPat.var("x"),UPat.var("y"))), bitwise_long)
@@ -230,6 +245,8 @@ inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.RECIP_HI: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP64H"]),
+  SASSOps.EXP2_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["EX2"]),
+  SASSOps.SQRT_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RSQ"]),
 } # TODO: treat lops separately to fuse into arbitrary ternary combinations
 
 class SASSRenderer(Renderer):
