@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from enum import Enum, auto
 from typing import Any, Dict, DefaultDict, List, Tuple, Set, Union, Optional, Callable
-from tinygrad.helpers import data64_le
+from tinygrad.helpers import data64_le, all_same
 from tinygrad.ops import BinaryOps, UnaryOps, TernaryOps, Op
 from tinygrad.dtype import dtypes, DType, PtrDType, ConstType, to_dtype
 from tinygrad.ops import PatternMatcher, UPat, UOps, UOp
@@ -176,7 +176,7 @@ sass_matcher = PatternMatcher([
 
 if getenv("NO_REWRITE"): sass_matcher = PatternMatcher([]) # NOTE: debug
 
-@dataclass
+@dataclass(eq=False)
 class Register:
   idx:int; size:int=1; type:str="R"; negated:bool=False; mem_type:Optional[str]=None; postfix:str=""; mod:Optional[str]=None # noqa: E702
   phys:Optional[int]=None; spill:Optional[bool]=None # noqa: E702
@@ -187,17 +187,16 @@ class Register:
   def offset(self, n): return replace(self, idx=self.idx + n, phys=self.phys + n if self.phys is not None else None)
   def base(self): return self.offset(-(self.idx % self.size))
   def negate(self): return replace(self, negated=not self.negated)
-  def __hash__(self): return id(self)
 
 @dataclass
 class ControlCode:
-  wait:List[int]=field(default_factory=list); read:Optional[int]=None; write:Optional[int]=None; yield_:bool=False; stall:int=15 # noqa: E702
+  wait:List[int]=field(default_factory=list); read:Optional[int]=None; write:Optional[int]=None; yield_:bool=False; stall:int=-1 # noqa: E702
   def render(self) -> str:
     bs = ''.join(['-' if b not in self.wait else str(b) for b in range(6)])
     rs, ws = [v if v is not None else '-' for v in [self.read, self.write]]
     return f"[B{bs}:R{rs}:W{ws}:{'-Y'[self.yield_]}:S{self.stall:02}]"
 
-@dataclass
+@dataclass(eq=False)
 class Instruction:
   op:str; dest:Optional[Register]; srcs:List[Union[Register, str]]; ctrl:ControlCode=field(default_factory=ControlCode) # noqa: E702
   mods:List[str]=field(default_factory=list); pred:Optional[Register]=None; label:bool=False; addr:int=-1 # noqa: E702
@@ -208,7 +207,7 @@ class Instruction:
     return f"{' '*6}{self.ctrl.render()}{' '*9}/*{hex(self.addr)[2:]:>04}*/{' '*19}{ins} ;"
 
 def nregs(byte_size:int) -> int: return (byte_size + 3) // 4
-def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size for i,s in enumerate(srcs))
+def is_contiguous(srcs:List[Register]): return all(s.size == srcs[0].size and s.idx - srcs[0].idx == i * srcs[0].size // len(srcs) for i,s in enumerate(srcs))
 def is_aligned(src:Register, dtype:DType) -> bool: return src.idx % nregs(dtype.itemsize) == 0
 def fill(srcs, count, dtype, val=0): return [srcs[i] if len(srcs) > i else render_value(val, dtype) for i in range(count)]
 def dtype_op(op:str, dt:DType) -> str: return (dt.name[0].upper() if dtypes.is_float(dt) else 'I') + op + ('2' if dt is dtypes.float16 else '')
@@ -312,11 +311,15 @@ class Allocator:
   def __init__(self, vals:Dict[Any, Union[Register,str]]):
     self.vals = vals
     self.counts: Dict[str, int] = defaultdict(int)
+    self.prealloc: Dict[UOp, Register] = {}
   def __call__(self, uop:Optional[UOp], byte_size:Optional[int]=None, prefix:Optional[str]=None): # TODO: bad interface
-    n = nregs(byte_size or (4 if not uop else 8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)))
-    idx = n * ((self.counts[p := prefix or ("P" if uop and uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
-    self.counts[p] = idx + n
-    ret = Register(idx, size=n, type=p)
+    if uop in self.prealloc:
+      ret = self.prealloc[uop]
+    else:
+      n = nregs(byte_size or (4 if not uop else 8 if isinstance(uop.dtype, PtrDType) else max(uop.dtype.itemsize, 4)))
+      idx = n * ((self.counts[p := prefix or ("P" if uop and uop.dtype is dtypes.bool else "R")] + n - 1) // n) # ceil
+      self.counts[p] = idx + n
+      ret = Register(idx, size=n, type=p)
     if uop: self.vals[uop] = ret
     return ret
 
@@ -402,6 +405,11 @@ class SASSRenderer(Renderer):
         print_uop(u)
         print()
 
+    for u in uops:
+      if u.op is UOps.VECTORIZE and all(s.dtype.itemsize >=4 for s in u.src):
+        dest, n = ssa(u), nregs(u.dtype.scalar().itemsize)
+        ssa.prealloc.update({s:dest.offset(i*n) for i,s in enumerate(u.src)})
+
     kk(Instruction(f".text.{name}", None, [], label=True))
     for u in uops:
       op,dtype,vin,arg = u.op,u.dtype,u.src,u.arg
@@ -467,6 +475,9 @@ class SASSRenderer(Renderer):
         if vin[0].dtype is dtypes.float16:
           dest, srcs = ssa(u), [to_reg(v) for v in vin]
           kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
+        elif all(isinstance(r[v], Register) for v in vin) and is_contiguous([r[v] for v in vin]) and is_aligned(r[vin[0]], dtype):
+          print("vector preallocated")
+          r[u] = r[vin[0]]
         else:
           dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
           kk([inst for i,s in enumerate([r[v] for v in vin]) for inst in render_mov(dest.offset(i*n), s, vin[0].dtype)])
@@ -480,26 +491,32 @@ class SASSRenderer(Renderer):
       else: r[u] = "0x0"
 
     kk(Instruction("EXIT", None, []))
-    kk(Instruction(buf_lab := ".L_BUF", None, [], label=True))
-    kk(Instruction("BRA", None, [f"`({buf_lab})"]))
-    for _ in range(10): kk(Instruction("NOP", None, []))
-    kk(Instruction(".L_END", None, [], label=True))
 
     # NOTE: debug
     for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
     attr["SHI_REGISTERS"] = ssa.counts["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
+    kernel = schedule_kernel(kernel)
     rewrite_registers(kernel, "P")
     spill_to_flags(kernel, ssa)
-    rewrite_registers(kernel, "R")
+    spill_cnt = rewrite_registers(kernel, "R") - reg_cap
+    for x in [inst.dest for inst in kernel]:
+      assert x is None or x.phys is not None and x.spill or x.phys < 270, "WHAT"
+    if spill_cnt > 0: print(colored(f"spilled {spill_cnt}", "red"))
     spill_to_local(kernel, schedule_spills(kernel), ssa)
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in "RPB"}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys is not None: x.idx = x.phys
-    for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
+    kernel = schedule_kernel(kernel)
     set_bars(kernel)
-    set_stalls(kernel)
+
+    ctrl_buf = ControlCode(yield_=True, stall=0)
+    kk(Instruction(buf_lab := ".L_BUF", None, [], label=True, ctrl=ctrl_buf))
+    kk(Instruction("BRA", None, [f"`({buf_lab})"], ctrl=ctrl_buf))
+    for _ in range(10): kk(Instruction("NOP", None, [], ctrl=ctrl_buf))
+    kk(Instruction(".L_END", None, [], label=True))
+    for i,ins in enumerate([ins for ins in kernel if not ins.label]): ins.addr = 16*i
     sass_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
     # NOTE: debug
@@ -517,6 +534,7 @@ reg_cap, buf_size = 240, 6
 
 def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
   def alloc(size): return next(i for i in itertools.count(reg_type == "P") if i % size == 0 and all(i + j not in allocated for j in range(size)))
+
   locs: DefaultDict[Tuple[int,int], List[int]] = defaultdict(list)
   loop_deps: Dict[str, Set[Tuple[int,int]]] = {}
   ext_deps, all_reg = {}, set()
@@ -530,6 +548,7 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
     if inst.srcs and isinstance(inst.srcs[0], str) and (label := next((k for k in loop_deps.keys() if k in inst.srcs[0]), None)):
       for d in loop_deps.pop(label) & ext_deps.pop(label):
         locs[d].append(i + 1) # keep external loop dependencies live until end of loop
+
   events = sorted([(k, max(v), False) for k,v in locs.items()] + [(k, min(v) + 0.5, True) for k,v in locs.items()], key=lambda x: x[1])
   allocated, repl = [], {}
   for (idx, size), _, is_alloc in events:
@@ -538,6 +557,7 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
       allocated.extend([base_idx + i for i in range(size)])
     elif idx in repl:
       for i in range(size): allocated.remove(repl[idx] + i)
+
   for reg in all_reg:
     bidx = reg.base().idx
     reg.phys = repl[bidx] + reg.idx - bidx
@@ -572,8 +592,8 @@ def schedule_spills(kernel:List[Instruction]):
         sched.remove(prev[bid])
       sched.append(entry := (i, True, stores))
       prev[inst.dest.base().identity()] = entry
-  # print("spill sched:")
-  # for s in sched: print(f"{s[0]}: {s[1]}, [{', '.join([f"{r.identity()} ({r.size})" for r in s[2]])}]")
+  print("spill sched:")
+  for s in sched: print(f"{s[0]}: {s[1]}, [{', '.join([f"{r.identity()} ({r.size})" for r in s[2]])}]")
   return sched
 
 def pred_cap(kernel:List[Instruction]) -> int:
@@ -601,8 +621,8 @@ def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
     return [Instruction("SEL", buf, [bit_src, "RZ", p]), Instruction("LOP3", dest, [dest, mask, buf, lop_code(lambda a,b,c: (b&c)|(~b&a)), "!PT"])]
   def spill(p, write):
     if isinstance(p, Register) and p.type == "P" and p.idx != -1 and p.phys and p.phys > cap:
-      kernel[i+write:i+write] = write_flag(p) if write else read_flag(p)
       p.idx = ssa(None, 4, "P").idx
+      kernel[i+write:i+write] = (write_flag if write else read_flag)(replace(p, negated=False))
 
   cap = pred_cap(kernel)
   if cap >= 6: return
@@ -615,11 +635,11 @@ def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
   for reg in flag_regs: kernel[1:1] = [Instruction("MOV", reg, ["RZ"])]
 
 # TODO: casts only var lat for double width
-common_var_lat = {"MUFU", "LDG", "DSETP", "I2F", "F2I", "F2F", "DADD", "DMUL", "DFMA", "LDL"}
-write_var_lat = common_var_lat | {"LDS", "S2R"}
+common_var_lat = {"DADD", "DMUL", "DFMA", "DSETP", "MUFU", "I2F", "F2I", "F2F", "LDG", "LDL", "LDS"}
+write_var_lat = common_var_lat | {"S2R"}
 read_var_lat = common_var_lat | {"STG", "STL", "STS"}
 smem_ops = {"LDS", "STS"}
-gmem_ops = {"LDG", "STG", "LDL", "STL",  "LDC", "ULDC", "BAR", "DEPBAR"}
+gmem_ops = {"LDG", "STG", "LDL", "STL", "LDC", "ULDC", "BAR", "DEPBAR"}
 word_ops = {"FADD", "FMUL", "FFMA", "HADD2", "HMUL2", "HFMA2", "IADD3", "IMAD", "LOP3", "MOV", "PRMT", "SEL", "FSEL", "BRA", "EXIT", "NOP"}
 ext_ops = {"DADD", "DMUL", "DFMA"}
 shift_ops = {"HMNMX2", "FMNMX", "IMNMX", "SHF"}
@@ -636,24 +656,57 @@ lat_groups = (({"S2R"},  LatSpec("s2r", 2, 0, 1, False, False)), (shift_ops, Lat
               (cmp_ops,  LatSpec("cmp", 13, 0, 2, False, True)))
 op_lats = {op: spec for ops, spec in lat_groups for op in ops}
 
-def set_stalls(kernel:List[Instruction]):
-  def deps(vals): return [v.base().identity() for v in vals if isinstance(v, Register) and v.idx != -1]
-  valid = [k for k in kernel if not k.label]
-  clock = 1
-  eta: Dict[str, int] = {}
-  for i, inst in enumerate(valid):
-    reads, writes, spec = deps([inst.pred, *inst.srcs]), deps([inst.dest]), op_lats[inst.op]
-    if i > 0:
-      prev = valid[i - 1]
-      min_stall = max(1 if spec != op_lats[prev.op] else spec.tput, 2*(prev.ctrl.write in inst.ctrl.wait or prev.ctrl.read in inst.ctrl.wait))
-      prev.ctrl.stall = stall = min(max([eta[r] - clock - spec.rlat*(r[0] != "P") for r in reads] + [min_stall]), 15)
-      prev.ctrl.yield_ |= stall >= 4
-    else:
-      stall = 1
-    clock += stall
-    op_lat = max(spec.lat, 7*("WIDE" in inst.mods))
-    eta.update({w: clock + op_lat for w in writes})
-  prev.ctrl.stall = 1
+def schedule_kernel(kernel:List[Instruction], optim_movs=False):
+  def regs(vals): return [v.base().offset(i).identity() for v in vals if isinstance(v, Register) and v.idx != -1 for i in range(v.size)]
+  def link(parent, child, lat):
+    children[parent].append((child, lat))
+    parents[child].append(parent)
+
+  # TODO: render as instruction graph instead of list and remove this
+  children, parents, writes, reads = [defaultdict(list) for _ in range(4)]
+  ready = []
+  for i, inst in enumerate(kernel):
+    dest, srcs = regs([inst.dest]), regs([inst.pred, *inst.srcs])
+    for reg in itertools.chain(srcs, dest):
+      for parent in reversed(writes[reg]):
+        link(parent, inst, True)
+        if not parent.pred: break
+    for parent in [p for d in dest for p in reads[d]]:
+      link(parent, inst, False)
+    if inst.label or inst.op in ["BRA", "BAR", "EXIT"]:
+      for j,k in enumerate(kernel):
+        if i != j: link(*[inst, k][::1 if i < j else -1], False)
+    for d in dest: writes[d].append(inst)
+    for s in srcs: reads[s].append(inst)
+    if not parents[inst]: ready.append(inst)
+
+  eta = {}
+  idx = {v:k for k,v in enumerate(kernel)}
+  clock, sched = 0, []
+  while ready:
+    ready.sort(key=lambda x: (eta.get(x, clock + 1), -len(children[x]), idx[x]))
+    inst, prev = ready.pop(0), next((item for item in reversed(sched) if not item.label), None)
+    if prev:
+      prev.ctrl.stall = min(max(eta.get(inst, clock + 1) - clock, 1), 15)
+      prev.ctrl.yield_ = prev.ctrl.stall >= 4
+    clock += (prev.ctrl.stall if prev else 0)
+    sched.append(inst)
+
+    # print(f"children:\n{'\n'.join([e.render() for e,_ in children[inst]])}")
+    spec = op_lats.get(inst.op)
+    assert inst.label or spec, f"unknown lat spec for op: {inst.op}"
+    delay = max(spec.lat, 7*("WIDE" in inst.mods)) if spec else 0
+    # print(f"eta={eta.get(inst, -1):>2}  clock={clock:>3} + {delay:>2} | #{idx[inst]:>2} [{' '.join([f'#{idx[c]}' for c,_ in children[inst]]):<20}] {inst.render()}")
+    for c,lat in children[inst]:
+      if not inst.label and not c.label:
+        spec_c = op_lats[c.op]
+        dep_lat = delay - spec_c.rlat*(not isinstance(inst.dest, Register) or inst.dest.type != "P") if lat else 0
+        eta[c] = max(eta.get(c, 0), clock + dep_lat, clock + (spec.tput if spec_c == spec else 1))
+      parents[c].remove(inst)
+      if not parents[c]: ready.append(c)
+  sched[-1].ctrl.stall = 5
+  assert len(sched) == len(kernel), f"{len(kernel) - len(sched)} unscheduled instructions!"
+  return sched
 
 def set_bars(kernel:List[Instruction]):
   def new_bar():
@@ -662,7 +715,8 @@ def set_bars(kernel:List[Instruction]):
     return [dep.base().offset(i).identity() for i in range(dep.size if isinstance(dep, Register) else 0)]
   def set_bar(deps, bar_tab):
     active_bar.append(bar := new_bar())
-    bar_tab.update({rid: bar for d in deps for rid in all_ids(d)})
+    bar_map[bar].extend(regs := [rid for d in deps for rid in all_ids(d)])
+    bar_tab.update({rid: bar for rid in regs})
     return bar
   def wait_bar(deps, bar_tab):
     bars = {bar_tab[rid] for d in deps for rid in all_ids(d) if rid in bar_tab}
@@ -674,7 +728,12 @@ def set_bars(kernel:List[Instruction]):
   active_bar: List[int] = []
   write_bar: Dict[str,int] = {}
   read_bar: Dict[str,int] = {}
+  bar_map = defaultdict(list)
+  prev = None
   for inst in kernel:
     wait_bar(inst.srcs, write_bar), wait_bar([inst.dest], read_bar)
     inst.ctrl.read = set_bar(inst.srcs, read_bar) if inst.op in read_var_lat else None
     inst.ctrl.write = set_bar([inst.dest], write_bar) if inst.op in write_var_lat else None
+    if prev and (prev.ctrl.read in inst.ctrl.wait or prev.ctrl.write in inst.ctrl.wait):
+      prev.ctrl.stall = max(prev.ctrl.stall, 2)
+    if not inst.label: prev = inst
