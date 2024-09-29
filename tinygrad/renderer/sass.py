@@ -497,7 +497,7 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = ssa.counts["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
-    kernel = schedule_kernel(kernel, getenv("ORDERED"))
+    kernel = schedule_kernel(kernel, optim_rp=True)
     rewrite_registers(kernel, "P")
     spill_to_flags(kernel, ssa)
     spill_cnt = rewrite_registers(kernel, "R") - reg_cap
@@ -508,7 +508,7 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in "RPB"}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys is not None: x.idx = x.phys
-    kernel = schedule_kernel(kernel, getenv("ORDERED"))
+    kernel = set_stalls(kernel)
     set_bars(kernel)
 
     ctrl_buf = ControlCode(yield_=True, stall=0)
@@ -657,8 +657,10 @@ lat_groups = (({"S2R"},  LatSpec("s2r", 2, 0, 1, False, False)), (shift_ops, Lat
 op_lats = {op: spec for ops, spec in lat_groups for op in ops}
 mem_deps = {"LDL": ("STL",), "STL": ("STL", "LDL"), "LDS": ("STS",), "STS": ("STS", "LDS"), "LDG": ("STG", "LDG"), "STG": ("STG", "LDG")}
 
-def schedule_kernel(kernel:List[Instruction], ordered=False):
-  def regs(vals): return [v.base().offset(i).identity() for v in vals if isinstance(v, Register) and v.idx != -1 for i in range(v.size)]
+def regs(vals):
+  return [v.base().offset(i).identity() for v in vals if isinstance(v, Register) and v.idx != -1 for i in range(v.size)]
+
+def graph_kernel(kernel:List[Instruction]):
   def link(parent, child, lat):
     children[parent].append(child)
     parents[child].append((parent, lat))
@@ -685,18 +687,52 @@ def schedule_kernel(kernel:List[Instruction], ordered=False):
     for d in dest: writes[d].append(inst)
     for s in srcs: reads[s].append(inst)
     if (accs := mem_acc.get(inst.op)) is not None: accs[mem_src].append(inst)
+  return children, parents
 
+def schedule_kernel(kernel:List[Instruction], optim_rp=False):
+  """SU scheduling with RP-reduction and clustering heuristic. Paper: https://arxiv.org/pdf/2303.06855"""
   @lru_cache(None)
-  def max_pressure(inst): return (inst.dest.size if inst.dest else 0) + max([max_pressure(c) for c in children[inst]] + [0])
-  max_rp = {inst: max_pressure(inst) for inst in kernel[::-1]}
+  def max_pressure(inst): return (inst.dest.size if inst.dest is not None else 0) + max([max_pressure(c) for c in children[inst]] + [0])
 
-  # SU scheduling with RP-reduction and clustering heuristic: https://arxiv.org/pdf/2303.06855
   eta = {}
-  clock, sched = 0, []
+  children, parents = graph_kernel(kernel)
+  max_rp = {inst: max_pressure(inst) for inst in kernel[::-1]}
   idx = {v:k for k,v in enumerate(kernel)}
+  clock, sched = 0, []
   ready, prio = [kernel[-1]], []
+  live = set()
   while ready:
-    ready.sort(key=lambda x: (idx[x] if ordered else 0, max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), idx[x]))
+    ready.sort(key=lambda x: (optim_rp*(max_rp[x] - (x.dest.size if x.dest else 0)), eta.get(x, clock + 1), -idx[x]))
+    prio.append(ready.pop(0))
+    while prio:
+      inst = prio.pop(0)
+      if not inst.label:
+        inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)
+        inst.ctrl.yield_ = inst.ctrl.stall >= 4
+        clock += inst.ctrl.stall
+      sched.insert(0, inst)
+      live |= set(regs(inst.srcs))
+
+      for p,lat in parents[inst]:
+        if not inst.label and not p.label:
+          eta[p] = max(eta.get(p, 0), clock + lat)
+        children[p].remove(inst)
+        if not children[p]:
+          delta = inst.dest.size if isinstance(inst.dest, Register) and inst.dest.identity() in live else 0
+          unique = list({s.base().identity(): s for s in p.srcs if isinstance(s, Register) and s.idx != -1}.values())
+          delta -= sum(s.size for s in unique)
+          (prio if delta >= 0 else ready).append(p)
+  assert len(sched) == len(kernel), f"{len(kernel) - len(sched)} unscheduled instructions!"
+  return sched
+
+def set_stalls(kernel:List[Instruction]):
+  eta = {}
+  children, parents = graph_kernel(kernel)
+  idx = {v:k for k,v in enumerate(kernel)}
+  clock, sched = 0, []
+  ready = [kernel[-1]]
+  while ready:
+    ready.sort(key=lambda x: (eta.get(x, clock + 1), -idx[x]))
     inst = ready.pop(0)
     if not inst.label:
       inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)

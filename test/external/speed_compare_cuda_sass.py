@@ -17,6 +17,7 @@ if __name__ == "__main__":
   if single != -1: ast_strs = ast_strs[single:single+1]
   skip_idiv = [491, 922]
   skip_spill = [2983, 3721] # 233 spilled (ordered: 20)
+  large = [8, 171, 282, 445, 583, 591, 824, 944, 1030, 1227, 1332, 1378, 1433, 1649, 1723, 1741, 2028, 2057, 2467, 2833, 3116, 3246, 3380, 3391, 3455, 3652, 4127, 4168]
   # ordered: 1.68
   # SU: 1.63x
   # SU + RP-reduction:
@@ -24,7 +25,7 @@ if __name__ == "__main__":
 
   average_tm_cuda, average_tm_sass = 0, 0
   for num,ast in enumerate(ast_strs):
-    if num in skip_idiv or num in skip_spill or not start <= num < end: continue # NOTE: debug
+    if num in skip_idiv or num in skip_spill or (getenv("LARGE") and not num in large) or not start <= num < end: continue # NOTE: debug
 
     # cuda compile
     dev.compiler = CUDACompiler(dev.arch)
