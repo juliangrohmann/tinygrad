@@ -151,7 +151,6 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=tuple(ext_to_word_dt.keys()), src=(UPat.var("p"),UPat.var("x"),UPat.var("y"))), where_ext),
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), lambda x,y,z: (x&y)|(-x&z)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPLT, dtype=dtypes.bool, src=(UPat.var("x",dtypes.bool),UPat.var("y",dtypes.bool))), lambda x,y: -x&y),
-  (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.cvar("c"))), idiv),
   (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.var("y"))), idiv),
   (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - y*idiv(x,y)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
@@ -505,11 +504,11 @@ class SASSRenderer(Renderer):
     for x in [inst.dest for inst in kernel]:
       assert x is None or x.phys is not None and x.spill or x.phys < 270, "WHAT"
     if spill_cnt > 0: print(colored(f"spilled {spill_cnt}", "red"))
-    # spill_to_local(kernel, schedule_spills(kernel), ssa)
+    spill_to_local(kernel, schedule_spills(kernel), ssa)
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in "RPB"}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys is not None: x.idx = x.phys
-    # kernel = schedule_kernel(kernel, getenv("ORDERED"))
+    kernel = schedule_kernel(kernel, getenv("ORDERED"))
     set_bars(kernel)
 
     ctrl_buf = ControlCode(yield_=True, stall=0)
@@ -691,10 +690,11 @@ def schedule_kernel(kernel:List[Instruction], ordered=False):
   def max_pressure(inst): return (inst.dest.size if inst.dest else 0) + max([max_pressure(c) for c in children[inst]] + [0])
   max_rp = {inst: max_pressure(inst) for inst in kernel[::-1]}
 
+  # SU scheduling with RP-reduction and clustering heuristic: https://arxiv.org/pdf/2303.06855
   eta = {}
   clock, sched = 0, []
   idx = {v:k for k,v in enumerate(kernel)}
-  ready = [kernel[-1]]
+  ready, prio = [kernel[-1]], []
   while ready:
     ready.sort(key=lambda x: (idx[x] if ordered else 0, max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), idx[x]))
     inst = ready.pop(0)

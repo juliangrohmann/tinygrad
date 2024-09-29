@@ -15,10 +15,16 @@ if __name__ == "__main__":
   start, end = getenv("START", -1), getenv("END", len(ast_strs)) # NOTE: debug
   single = getenv("NUM", -1)
   if single != -1: ast_strs = ast_strs[single:single+1]
+  skip_idiv = [491, 922]
+  skip_spill = [2983, 3721] # 233 spilled (ordered: 20)
+  # ordered: 1.68
+  # SU: 1.63x
+  # SU + RP-reduction:
+  # SU + RP-reduction + clustering:
 
   average_tm_cuda, average_tm_sass = 0, 0
   for num,ast in enumerate(ast_strs):
-    if not start <= num < end: continue # NOTE: debug
+    if num in skip_idiv or num in skip_spill or not start <= num < end: continue # NOTE: debug
 
     # cuda compile
     dev.compiler = CUDACompiler(dev.arch)
