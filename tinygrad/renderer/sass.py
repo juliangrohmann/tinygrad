@@ -1,5 +1,5 @@
-import struct, re, itertools, math
-from functools import partial
+import struct, re, itertools, math, heapq
+from functools import partial, lru_cache
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from enum import Enum, auto
@@ -120,7 +120,7 @@ numeric = ints + floats
 sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, arg=BinaryOps.MUL, name="root", dtype=ints, src=[UPat.var("x"),UPat.cvar(name="c")]),
    lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHL) if c.arg in shift_consts else None),
-  (UPat(UOps.ALU, arg=BinaryOps.IDIV, name="root", dtype=ints, src=(UPat.var("x"),UPat.cvar(name="c"))),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, name="root", dtype=ints, src=[UPat.var("x"),UPat.cvar(name="c")]),
    lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHR) if c.arg in shift_consts else None),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"),UPat.var("k"))),
     lambda root,x,y,z,k: UOp(root.op, dtypes.uint8, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
@@ -151,6 +151,7 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=tuple(ext_to_word_dt.keys()), src=(UPat.var("p"),UPat.var("x"),UPat.var("y"))), where_ext),
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), lambda x,y,z: (x&y)|(-x&z)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPLT, dtype=dtypes.bool, src=(UPat.var("x",dtypes.bool),UPat.var("y",dtypes.bool))), lambda x,y: -x&y),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.cvar("c"))), idiv),
   (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.var("y"))), idiv),
   (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - y*idiv(x,y)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
@@ -405,10 +406,10 @@ class SASSRenderer(Renderer):
         print_uop(u)
         print()
 
-    for u in uops:
-      if u.op is UOps.VECTORIZE and all(s.dtype.itemsize >=4 for s in u.src):
-        dest, n = ssa(u), nregs(u.dtype.scalar().itemsize)
-        ssa.prealloc.update({s:dest.offset(i*n) for i,s in enumerate(u.src)})
+    # for u in uops:
+    #   if u.op is UOps.VECTORIZE and all(s.dtype.itemsize >=4 for s in u.src):
+    #     dest, n = ssa(u), nregs(u.dtype.scalar().itemsize)
+    #     ssa.prealloc.update({s:dest.offset(i*n) for i,s in enumerate(u.src)})
 
     kk(Instruction(f".text.{name}", None, [], label=True))
     for u in uops:
@@ -476,7 +477,7 @@ class SASSRenderer(Renderer):
           dest, srcs = ssa(u), [to_reg(v) for v in vin]
           kk([Instruction("PRMT", dest.offset(i // 2), [srcs[i], prmt_code(srcs[i], srcs[i+1]), srcs[i+1]]) for i in range(0, len(srcs), 2)])
         elif all(isinstance(r[v], Register) for v in vin) and is_contiguous([r[v] for v in vin]) and is_aligned(r[vin[0]], dtype):
-          print("vector preallocated")
+          # print("vector preallocated")
           r[u] = r[vin[0]]
         else:
           dest, n = ssa(u), nregs(vin[0].dtype.itemsize)
@@ -497,18 +498,18 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = ssa.counts["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
-    kernel = schedule_kernel(kernel)
+    kernel = schedule_kernel(kernel, getenv("ORDERED"))
     rewrite_registers(kernel, "P")
     spill_to_flags(kernel, ssa)
     spill_cnt = rewrite_registers(kernel, "R") - reg_cap
     for x in [inst.dest for inst in kernel]:
       assert x is None or x.phys is not None and x.spill or x.phys < 270, "WHAT"
     if spill_cnt > 0: print(colored(f"spilled {spill_cnt}", "red"))
-    spill_to_local(kernel, schedule_spills(kernel), ssa)
+    # spill_to_local(kernel, schedule_spills(kernel), ssa)
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in "RPB"}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
       if x.phys is not None: x.idx = x.phys
-    kernel = schedule_kernel(kernel)
+    # kernel = schedule_kernel(kernel, getenv("ORDERED"))
     set_bars(kernel)
 
     ctrl_buf = ControlCode(yield_=True, stall=0)
@@ -562,7 +563,7 @@ def rewrite_registers(kernel:List[Instruction], reg_type:str) -> int:
     bidx = reg.base().idx
     reg.phys = repl[bidx] + reg.idx - bidx
     if reg_type == "R" and reg.phys is not None:
-      reg.spill = reg.phys + reg.size - 1 > reg_cap
+      reg.spill = reg.phys - reg.phys % reg.size + reg.size - 1 > reg_cap
   return max([r.phys - (r.phys % r.size) + r.size for r in all_reg if r.phys is not None] + [0])
 
 def spill_to_local(kernel:List[Instruction], sched:List[Tuple[int,bool,List[Register]]], ssa:Allocator):
@@ -587,13 +588,13 @@ def schedule_spills(kernel:List[Instruction]):
       prev[bid] = entry
     if isinstance(inst.dest, Register) and is_spill(inst.dest):
       stores = [inst.dest]
-      if (bid := inst.dest.base().identity()) in prev and prev[bid][1]: # merge consecutive stores of the same spill
-        stores.extend(prev[bid][2])
-        sched.remove(prev[bid])
+      # if (bid := inst.dest.base().identity()) in prev and prev[bid][1]: # merge consecutive stores of the same spill
+      #   stores.extend(prev[bid][2])
+      #   sched.remove(prev[bid])
       sched.append(entry := (i, True, stores))
       prev[inst.dest.base().identity()] = entry
-  print("spill sched:")
-  for s in sched: print(f"{s[0]}: {s[1]}, [{', '.join([f"{r.identity()} ({r.size})" for r in s[2]])}]")
+  # print("spill sched:")
+  # for s in sched: print(f"{s[0]}: {s[1]}, [{', '.join([f"{r.identity()} ({r.size})" for r in s[2]])}]")
   return sched
 
 def pred_cap(kernel:List[Instruction]) -> int:
@@ -655,56 +656,59 @@ lat_groups = (({"S2R"},  LatSpec("s2r", 2, 0, 1, False, False)), (shift_ops, Lat
               (word_ops, LatSpec("word", 6, 0, 1, False, True)), (ext_ops,   LatSpec("ext", 2, 0, 128, False, True)),
               (cmp_ops,  LatSpec("cmp", 13, 0, 2, False, True)))
 op_lats = {op: spec for ops, spec in lat_groups for op in ops}
+mem_deps = {"LDL": ("STL",), "STL": ("STL", "LDL"), "LDS": ("STS",), "STS": ("STS", "LDS"), "LDG": ("STG", "LDG"), "STG": ("STG", "LDG")}
 
-def schedule_kernel(kernel:List[Instruction], optim_movs=False):
+def schedule_kernel(kernel:List[Instruction], ordered=False):
   def regs(vals): return [v.base().offset(i).identity() for v in vals if isinstance(v, Register) and v.idx != -1 for i in range(v.size)]
   def link(parent, child, lat):
-    children[parent].append((child, lat))
-    parents[child].append(parent)
+    children[parent].append(child)
+    parents[child].append((parent, lat))
 
-  # TODO: render as instruction graph instead of list and remove this
   children, parents, writes, reads = [defaultdict(list) for _ in range(4)]
-  ready = []
+  mem_acc = {op: defaultdict(list) for op in mem_deps}
   for i, inst in enumerate(kernel):
     dest, srcs = regs([inst.dest]), regs([inst.pred, *inst.srcs])
+    mem_src = next((s.render() for s in inst.srcs if isinstance(s, Register) and s.mem_type is not None), None)
     for reg in itertools.chain(srcs, dest):
       for parent in reversed(writes[reg]):
-        link(parent, inst, True)
+        spec_p, spec_c = op_lats[parent.op], op_lats[inst.op]
+        pipe = max(spec_p.lat, 7 if "WIDE" in parent.mods else 0)
+        lat = pipe - spec_c.rlat*(not isinstance(parent.dest, Register) or parent.dest.type != "P")
+        link(parent, inst, max(lat, spec_p.tput if spec_p.res == spec_c.res else 1))
         if not parent.pred: break
     for parent in [p for d in dest for p in reads[d]]:
-      link(parent, inst, False)
+      link(parent, inst, 0)
+    for parent in [p for dep in mem_deps.get(inst.op, tuple()) for p in mem_acc[dep][mem_src]]:
+      link(parent, inst, 0)
     if inst.label or inst.op in ["BRA", "BAR", "EXIT"]:
       for j,k in enumerate(kernel):
-        if i != j: link(*[inst, k][::1 if i < j else -1], False)
+        if i != j: link(*[inst, k][::1 if i < j else -1], 0)
     for d in dest: writes[d].append(inst)
     for s in srcs: reads[s].append(inst)
-    if not parents[inst]: ready.append(inst)
+    if (accs := mem_acc.get(inst.op)) is not None: accs[mem_src].append(inst)
+
+  @lru_cache(None)
+  def max_pressure(inst): return (inst.dest.size if inst.dest else 0) + max([max_pressure(c) for c in children[inst]] + [0])
+  max_rp = {inst: max_pressure(inst) for inst in kernel[::-1]}
 
   eta = {}
-  idx = {v:k for k,v in enumerate(kernel)}
   clock, sched = 0, []
+  idx = {v:k for k,v in enumerate(kernel)}
+  ready = [kernel[-1]]
   while ready:
-    ready.sort(key=lambda x: (eta.get(x, clock + 1), -len(children[x]), idx[x]))
-    inst, prev = ready.pop(0), next((item for item in reversed(sched) if not item.label), None)
-    if prev:
-      prev.ctrl.stall = min(max(eta.get(inst, clock + 1) - clock, 1), 15)
-      prev.ctrl.yield_ = prev.ctrl.stall >= 4
-    clock += (prev.ctrl.stall if prev else 0)
-    sched.append(inst)
+    ready.sort(key=lambda x: (idx[x] if ordered else 0, max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), idx[x]))
+    inst = ready.pop(0)
+    if not inst.label:
+      inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)
+      inst.ctrl.yield_ = inst.ctrl.stall >= 4
+      clock += inst.ctrl.stall
+    sched.insert(0, inst)
 
-    # print(f"children:\n{'\n'.join([e.render() for e,_ in children[inst]])}")
-    spec = op_lats.get(inst.op)
-    assert inst.label or spec, f"unknown lat spec for op: {inst.op}"
-    delay = max(spec.lat, 7*("WIDE" in inst.mods)) if spec else 0
-    # print(f"eta={eta.get(inst, -1):>2}  clock={clock:>3} + {delay:>2} | #{idx[inst]:>2} [{' '.join([f'#{idx[c]}' for c,_ in children[inst]]):<20}] {inst.render()}")
-    for c,lat in children[inst]:
-      if not inst.label and not c.label:
-        spec_c = op_lats[c.op]
-        dep_lat = delay - spec_c.rlat*(not isinstance(inst.dest, Register) or inst.dest.type != "P") if lat else 0
-        eta[c] = max(eta.get(c, 0), clock + dep_lat, clock + (spec.tput if spec_c == spec else 1))
-      parents[c].remove(inst)
-      if not parents[c]: ready.append(c)
-  sched[-1].ctrl.stall = 5
+    for p,lat in parents[inst]:
+      if not inst.label and not p.label:
+        eta[p] = max(eta.get(p, 0), clock + lat)
+      children[p].remove(inst)
+      if not children[p]: ready.append(p)
   assert len(sched) == len(kernel), f"{len(kernel) - len(sched)} unscheduled instructions!"
   return sched
 
