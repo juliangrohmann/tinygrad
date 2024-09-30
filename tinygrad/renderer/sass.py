@@ -697,11 +697,13 @@ def graph_kernel(kernel:List[Instruction]):
 def schedule_kernel(kernel:List[Instruction], ordered=False):
   """SU scheduling with RP-reduction and clustering heuristic. Paper: https://arxiv.org/pdf/2303.06855"""
   @lru_cache(None)
-  def max_pressure(inst):
-    def def_size(node): return node.dest.size if isinstance(node.dest, Register) else 0
+  def max_pressure(node):
+    def def_size(n): return n.dest.size if isinstance(n.dest, Register) else 0
     def choose(idx): return max(max_pressure(cs[idx]), def_size(cs[idx]) + choose(idx + 1)) if idx < len(cs) else 0
-    cs = sorted(children[inst], key=lambda x: -(max_pressure(x) - def_size(x)))
+    cs = sorted(children[node], key=lambda x: -(max_pressure(x) - def_size(x)))
     return choose(0)
+  def find_blocker(node):
+    return c if (c := children[node][0]) in ready else find_blocker(c)
 
   eta = {}
   children, parents = graph_kernel(kernel)
@@ -712,7 +714,18 @@ def schedule_kernel(kernel:List[Instruction], ordered=False):
   live = set()
   while ready:
     ready.sort(key=lambda x: (max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), -idx[x]))
-    prio.append(ready.pop(0))
+    cluster = {c for x,lat in parents[ready[0]] if lat > 0 for c in children[x]} | {ready[0]}
+    for x in cluster:
+      if not x in ready:
+        blocker = find_blocker(x)
+        prio.append(blocker)
+        ready.remove(blocker)
+        break
+    else:
+      for x in cluster:
+        prio.append(x)
+        ready.remove(x)
+
     while prio:
       inst = prio.pop(0)
       if not inst.label:
