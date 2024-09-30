@@ -708,24 +708,30 @@ def schedule_kernel(kernel:List[Instruction], ordered=False):
   max_rp = {inst: max_pressure(inst) for inst in kernel[::-1]}
   idx = {v:k for k,v in enumerate(kernel)}
   clock, sched = 0, []
-  ready = [kernel[-1]]
+  ready, prio = [kernel[-1]], []
+  live = set()
   while ready:
-    ready.sort(key=lambda x: (-idx[x] if ordered else 0, max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), idx[x]))
-    inst = ready.pop(0)
-    if not inst.label:
-      inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)
-      inst.ctrl.yield_ = inst.ctrl.stall >= 4
-      clock += inst.ctrl.stall
-    sched.insert(0, inst)
+    ready.sort(key=lambda x: (max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), -idx[x]))
+    prio.append(ready.pop(0))
+    while prio:
+      inst = prio.pop(0)
+      if not inst.label:
+        inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)
+        inst.ctrl.yield_ = inst.ctrl.stall >= 4
+        clock += inst.ctrl.stall
+      sched.insert(0, inst)
+      live |= set(regs(inst.srcs))
 
-    for p,lat in parents[inst]:
-      if not inst.label and not p.label:
-        eta[p] = max(eta.get(p, 0), clock + lat)
-      children[p].remove(inst)
-      if not children[p]: ready.append(p)
+      for p,lat in parents[inst]:
+        if not inst.label and not p.label:
+          eta[p] = max(eta.get(p, 0), clock + lat)
+        children[p].remove(inst)
+        if not children[p]:
+          delta = inst.dest.size if isinstance(inst.dest, Register) and inst.dest.identity() in live else 0
+          unique = list({s.base().identity(): s for s in p.srcs if isinstance(s, Register) and s.idx != -1}.values())
+          delta -= sum(s.size for s in unique)
+          (prio if delta >= 0 else ready).append(p)
   assert len(sched) == len(kernel), f"{len(kernel) - len(sched)} unscheduled instructions!"
-  # for inst in sched:
-  #   print(f"rp={max_rp[inst]} | {inst.render()}")
   return sched
 
 def set_stalls(kernel:List[Instruction]):
