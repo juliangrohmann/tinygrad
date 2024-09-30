@@ -20,6 +20,9 @@ from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.engine.graph import graph_uops
 from CuAsm import CubinFile
 
+reg_cnt = -1
+def get_reg_cnt(): return reg_cnt
+
 class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
   SET_BITS = auto(); NOT = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
@@ -497,13 +500,13 @@ class SASSRenderer(Renderer):
     attr["SHI_REGISTERS"] = ssa.counts["R"] + 3 # two internal registers on sm >= 8x, and RZ
     ssa_src = ''.join(f"{k}={v}\n" for k,v in attr.items()) + ''.join(ins.render()+"\n" for ins in kernel)
 
-    kernel = schedule_kernel(kernel, optim_rp=True)
+    kernel = schedule_kernel(kernel, getenv("ORDERED"))
     rewrite_registers(kernel, "P")
     spill_to_flags(kernel, ssa)
-    spill_cnt = rewrite_registers(kernel, "R") - reg_cap
+    global reg_cnt
+    reg_cnt = rewrite_registers(kernel, "R")
     for x in [inst.dest for inst in kernel]:
       assert x is None or x.phys is not None and x.spill or x.phys < 270, "WHAT"
-    if spill_cnt > 0: print(colored(f"spilled {spill_cnt}", "red"))
     spill_to_local(kernel, schedule_spills(kernel), ssa)
     attr["SHI_REGISTERS"] = {k: rewrite_registers(kernel, k) for k in "RPB"}["R"] + 3 # two internal registers on sm >= 8x, and RZ
     for x in [s for inst in kernel for s in [inst.pred, inst.dest, *inst.srcs] if isinstance(s, Register)]:
@@ -635,7 +638,11 @@ def spill_to_flags(kernel:List[Instruction], ssa:Allocator):
   for reg in flag_regs: kernel[1:1] = [Instruction("MOV", reg, ["RZ"])]
 
 # TODO: casts only var lat for double width
-common_var_lat = {"DADD", "DMUL", "DFMA", "DSETP", "MUFU", "I2F", "F2I", "F2F", "LDG", "LDL", "LDS"}
+ext_out_op = {"DADD", "DMUL", "DFMA"}
+ext_out_mod = {"WIDE": 2, "64": 2, "U64": 2, "S64": 2, "F64": 2, "RCP64H": 2, "128": 4}
+def out_width(inst:Instruction): return max([ext_out_mod.get(m, 1) for m in inst.mods] + [2 if inst.op in ext_out_op else 1])
+
+common_var_lat = ext_out_op | {"DSETP", "MUFU", "I2F", "F2I", "F2F", "LDG", "LDL", "LDS"}
 write_var_lat = common_var_lat | {"S2R"}
 read_var_lat = common_var_lat | {"STG", "STL", "STS"}
 smem_ops = {"LDS", "STS"}
@@ -657,26 +664,24 @@ lat_groups = (({"S2R"},  LatSpec("s2r", 2, 0, 1, False, False)), (shift_ops, Lat
 op_lats = {op: spec for ops, spec in lat_groups for op in ops}
 mem_deps = {"LDL": ("STL",), "STL": ("STL", "LDL"), "LDS": ("STS",), "STS": ("STS", "LDS"), "LDG": ("STG", "LDG"), "STG": ("STG", "LDG")}
 
-def regs(vals):
-  return [v.base().offset(i).identity() for v in vals if isinstance(v, Register) and v.idx != -1 for i in range(v.size)]
+def regs(vals): return [v.base().offset(i).identity() for v in vals if isinstance(v, Register) and v.idx != -1 for i in range(v.size)]
 
 def graph_kernel(kernel:List[Instruction]):
   def link(parent, child, lat):
     children[parent].append(child)
     parents[child].append((parent, lat))
-
+    
   children, parents, writes, reads = [defaultdict(list) for _ in range(4)]
   mem_acc = {op: defaultdict(list) for op in mem_deps}
   for i, inst in enumerate(kernel):
     dest, srcs = regs([inst.dest]), regs([inst.pred, *inst.srcs])
     mem_src = next((s.render() for s in inst.srcs if isinstance(s, Register) and s.mem_type is not None), None)
-    for reg in itertools.chain(srcs, dest):
+    for reg in srcs:
       for parent in reversed(writes[reg]):
         spec_p, spec_c = op_lats[parent.op], op_lats[inst.op]
         pipe = max(spec_p.lat, 7 if "WIDE" in parent.mods else 0)
         lat = pipe - spec_c.rlat*(not isinstance(parent.dest, Register) or parent.dest.type != "P")
         link(parent, inst, max(lat, spec_p.tput if spec_p.res == spec_c.res else 1))
-        if not parent.pred: break
     for parent in [p for d in dest for p in reads[d]]:
       link(parent, inst, 0)
     for parent in [p for dep in mem_deps.get(inst.op, tuple()) for p in mem_acc[dep][mem_src]]:
@@ -689,7 +694,7 @@ def graph_kernel(kernel:List[Instruction]):
     if (accs := mem_acc.get(inst.op)) is not None: accs[mem_src].append(inst)
   return children, parents
 
-def schedule_kernel(kernel:List[Instruction], optim_rp=False):
+def schedule_kernel(kernel:List[Instruction], ordered=False):
   """SU scheduling with RP-reduction and clustering heuristic. Paper: https://arxiv.org/pdf/2303.06855"""
   @lru_cache(None)
   def max_pressure(inst): return (inst.dest.size if inst.dest is not None else 0) + max([max_pressure(c) for c in children[inst]] + [0])
@@ -699,29 +704,21 @@ def schedule_kernel(kernel:List[Instruction], optim_rp=False):
   max_rp = {inst: max_pressure(inst) for inst in kernel[::-1]}
   idx = {v:k for k,v in enumerate(kernel)}
   clock, sched = 0, []
-  ready, prio = [kernel[-1]], []
-  live = set()
+  ready = [kernel[-1]]
   while ready:
-    ready.sort(key=lambda x: (optim_rp*(max_rp[x] - (x.dest.size if x.dest else 0)), eta.get(x, clock + 1), -idx[x]))
-    prio.append(ready.pop(0))
-    while prio:
-      inst = prio.pop(0)
-      if not inst.label:
-        inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)
-        inst.ctrl.yield_ = inst.ctrl.stall >= 4
-        clock += inst.ctrl.stall
-      sched.insert(0, inst)
-      live |= set(regs(inst.srcs))
+    ready.sort(key=lambda x: (-idx[x] if ordered else 0, max_rp[x] - (x.dest.size if x.dest else 0), eta.get(x, clock + 1), idx[x]))
+    inst = ready.pop(0)
+    if not inst.label:
+      inst.ctrl.stall = min(max(eta.get(inst, 0) - clock, 1), 15)
+      inst.ctrl.yield_ = inst.ctrl.stall >= 4
+      clock += inst.ctrl.stall
+    sched.insert(0, inst)
 
-      for p,lat in parents[inst]:
-        if not inst.label and not p.label:
-          eta[p] = max(eta.get(p, 0), clock + lat)
-        children[p].remove(inst)
-        if not children[p]:
-          delta = inst.dest.size if isinstance(inst.dest, Register) and inst.dest.identity() in live else 0
-          unique = list({s.base().identity(): s for s in p.srcs if isinstance(s, Register) and s.idx != -1}.values())
-          delta -= sum(s.size for s in unique)
-          (prio if delta >= 0 else ready).append(p)
+    for p,lat in parents[inst]:
+      if not inst.label and not p.label:
+        eta[p] = max(eta.get(p, 0), clock + lat)
+      children[p].remove(inst)
+      if not children[p]: ready.append(p)
   assert len(sched) == len(kernel), f"{len(kernel) - len(sched)} unscheduled instructions!"
   return sched
 
