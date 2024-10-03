@@ -26,6 +26,7 @@ def get_reg_cnt(): return reg_cnt
 class SASSOps(Enum): # NOTE: for secondary graph rewrite: match subgraphs to SASS ops
   IABS = auto(); FMA = auto(); IMAD_HI = auto(); SHR_LO = auto(); SHR_HI = auto(); SHL_HI = auto(); WIDE = auto(); DMAX = auto() # noqa: E702
   SET_BITS = auto(); NOT = auto(); RECIP_APPROX = auto(); RECIP_HI = auto(); EXP2_APPROX = auto(); SQRT_APPROX = auto() # noqa: E702
+  LEA = auto(); LEA_HI = auto() # noqa: E702
 
 ext_to_word_dt = {dtypes.int64:dtypes.int32, dtypes.uint64:dtypes.uint32, dtypes.float64:dtypes.float32}
 inf = {2: 0x7c00, 4: 0x7f800000, 8: 0x7ff0000000000000}
@@ -71,6 +72,20 @@ def idiv(x:UOp, y:UOp) -> UOp:
   exp = (bits & inf[bits.dtype.itemsize]).alu(BinaryOps.SHR, bits.const_like(52)) - (2**10 - 1)
   mask = bits.const_like(1).alu(BinaryOps.SHL, -exp + 52) - 1
   return exp.lt(0).where(x.const_like(0), bits.alu(SASSOps.SET_BITS, bits.const_like(0), mask).bitcast(fdt).cast(x.dtype))
+
+def idiv_const(x:UOp, c:UOp) -> UOp:
+  """Integer division by a constant using multiplication by a magic number. Paper: https://gmplib.org/~tege/divcnst-pldi94.pdf"""
+  prec = 31
+  l = sh_post = math.ceil(math.log2(abs(c.arg)))
+  m_low = 2**(32 + l) // abs(c.arg)
+  m_high = (2**(32 + l) + 2**(32 + l - prec)) // c.arg
+  while m_low // 2 < m_high // 2 and sh_post > 0:
+    m_low, m_high, sh_post = m_low // 2, m_high // 2, sh_post - 1
+
+  buf = x.alu(SASSOps.IMAD_HI, x.const_like(m_high)) if m_high < 2**31 else (x.alu(SASSOps.IMAD_HI, x.const_like(m_high - 2**32)) + x)
+  sig = x.alu(BinaryOps.SHR, x.const_like(31))
+  q = buf.alu(SASSOps.LEA_HI, sig, x.const_like(32 - sh_post)) if sh_post > 0 else buf + sig
+  return -q if c.arg < 0 else q
 
 def where_ext(p:UOp, x:UOp, y:UOp) -> UOp:
   xv, yv = ext_to_vec(x), ext_to_vec(y)
@@ -123,8 +138,8 @@ numeric = ints + floats
 sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, arg=BinaryOps.MUL, name="root", dtype=ints, src=[UPat.var("x"),UPat.cvar(name="c")]),
    lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHL) if c.arg in shift_consts else None),
-  (UPat(UOps.ALU, arg=BinaryOps.IDIV, name="root", dtype=ints, src=[UPat.var("x"),UPat.cvar(name="c")]),
-   lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHR) if c.arg in shift_consts else None),
+  # (UPat(UOps.ALU, arg=BinaryOps.IDIV, name="root", dtype=ints, src=[UPat.var("x"),UPat.cvar(name="c")]),
+  #  lambda root,x,c: UOp(UOps.ALU, root.dtype, (x, x.const_like(int(math.log2(c.arg)))), BinaryOps.SHR) if c.arg in shift_consts else None),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"),UPat.var("k"))),
     lambda root,x,y,z,k: UOp(root.op, dtypes.uint8, (x,y,z.cast(dtypes.uint8),k)).cast(dtypes.bool)),
   (UPat(UOps.LOAD, name="root", dtype=dtypes.bool, src=(UPat(),UPat())),
@@ -154,8 +169,9 @@ sass_matcher = PatternMatcher([
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=tuple(ext_to_word_dt.keys()), src=(UPat.var("p"),UPat.var("x"),UPat.var("y"))), where_ext),
   (UPat(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.bool, src=(UPat.var("x"),UPat.var("y"),UPat.var("z"))), lambda x,y,z: (x&y)|(-x&z)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPLT, dtype=dtypes.bool, src=(UPat.var("x",dtypes.bool),UPat.var("y",dtypes.bool))), lambda x,y: -x&y),
+  (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.cvar("c"))), idiv_const),
   (UPat(UOps.ALU, arg=BinaryOps.IDIV, src=(UPat.var("x"),UPat.var("y"))), idiv),
-  (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - y*idiv(x,y)),
+  (UPat(UOps.ALU, arg=BinaryOps.MOD, src=(UPat.var("x"),UPat.var("y"))), lambda x,y: x - y*(x // y)),
   (UPat(UOps.ALU, arg=BinaryOps.CMPNE, dtype=dtypes.bool, src=[UPat.var("x"),UPat.cvar("c",dtypes.bool)]),
    lambda x,c: x.alu(SASSOps.NOT) if c.arg else x),
   *[(UPat(UOps.ALU, name="root", arg=iop, dtype=dtypes.bool, src=UPat(dtype=dtypes.bool)),
@@ -294,12 +310,13 @@ inst_for_alu: Dict[Union[Op, SASSOps], Callable] = {
   TernaryOps.WHERE: lambda d,s,dt,u: Instruction("SEL" if dt in ints else "FSEL", d, s[1:] + s[0:1]),
   SASSOps.IABS: lambda d,s,dt,u: Instruction("IABS", d, s),
   SASSOps.FMA: lambda d,s,dt,u: Instruction("IMAD" if dt in ints else dtype_op("FMA", dt), d, s),
-  SASSOps.IMAD_HI: lambda d, s, dt, u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"]),
+  SASSOps.IMAD_HI: lambda d,s,dt,u: Instruction("IMAD", d, fill(s, 3, dt), mods=["HI"] + (["U32"] if u and u.src[0].dtype in usig else [])),
   SASSOps.WIDE: lambda d,s,dt,u: Instruction("IMAD", d, ["PT", *fill(s, 3, dt)], mods=["WIDE"] + (["U32"] if u and u.src[0].dtype in usig else [])),
   SASSOps.DMAX: lambda d,s,dt,u: Instruction("DSETP", d, [d.offset(1), *s, "PT"], mods=["MAX", "AND"]),
   SASSOps.SHR_LO: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["R", "U64"]),
   SASSOps.SHR_HI: lambda d,s,dt,u: Instruction("SHF", d, ["RZ", s[1], s[0].offset(1)], mods=["R", "U32", "HI"]),
   SASSOps.SHL_HI: lambda d,s,dt,u: Instruction("SHF", d, [*s, s[0].offset(1)], mods=["L", "U64", "HI"]),
+  SASSOps.LEA_HI: lambda d,s,dt,u: Instruction("LEA", d, s, mods=["HI", "SX32"]),
   SASSOps.SET_BITS: lambda d,s,dt,u: Instruction("LOP3", d, [*s, lop_code(lambda a,b,c: (c&b)|(~c&a)), "!PT"]),
   SASSOps.RECIP_APPROX: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP"]),
   SASSOps.RECIP_HI: lambda d,s,dt,u: Instruction("MUFU", d, s, mods=["RCP64H"]),
@@ -386,7 +403,7 @@ class SASSRenderer(Renderer):
       return kk(render_mov(ssa(uop), var, uop.dtype))
 
     def fit_consts(op:Any, srcs:Tuple[UOp,...]):
-      allowed = {SASSOps.FMA: (1,2), SASSOps.WIDE: (1,2), TernaryOps.WHERE: (2,)}.get(op, (1,) if len(srcs) > 1 else (0,))
+      allowed = {SASSOps.FMA: (1,2), SASSOps.WIDE: (1,2), TernaryOps.WHERE: (2,), SASSOps.LEA_HI: (2,)}.get(op, (1,) if len(srcs) > 1 else (0,))
       consts = [i for i,s in enumerate(srcs) if isinstance(v:=r[s], str) and "RZ" not in v and "PT" not in v]
       cidx, swap = next(((i, i) for i in consts[::-1] if i in allowed), (consts[0], allowed[0]) if consts and op in commutative else (-1, -1))
       regs = [to_reg(s) for i,s in enumerate(srcs) if i != cidx]
@@ -647,7 +664,7 @@ write_var_lat = common_var_lat | {"S2R"}
 read_var_lat = common_var_lat | {"STG", "STL", "STS"}
 smem_ops = {"LDS", "STS"}
 gmem_ops = {"LDG", "STG", "LDL", "STL", "LDC", "ULDC", "BAR", "DEPBAR"}
-word_ops = {"FADD", "FMUL", "FFMA", "HADD2", "HMUL2", "HFMA2", "IADD3", "IMAD", "LOP3", "MOV", "PRMT", "SEL", "FSEL", "BRA", "EXIT", "NOP"}
+word_ops = {"FADD", "FMUL", "FFMA", "HADD2", "HMUL2", "HFMA2", "IADD3", "IMAD", "LEA", "LOP3", "MOV", "PRMT", "SEL", "FSEL", "BRA", "EXIT", "NOP"}
 ext_ops = {"DADD", "DMUL", "DFMA"}
 shift_ops = {"HMNMX2", "FMNMX", "IMNMX", "SHF"}
 cmp_ops = {"HSETP2", "FSETP", "DSETP", "ISETP", "PLOP3", "DMNMX"}
