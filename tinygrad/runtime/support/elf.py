@@ -1,10 +1,12 @@
 from __future__ import annotations
-from typing import Tuple, List, Any
+from typing import Tuple, List, Any, Optional
 from dataclasses import dataclass
 import tinygrad.runtime.autogen.libc as libc
 
 @dataclass(frozen=True)
 class ElfSection: name:str; header:libc.Elf64_Shdr; content:bytes # noqa: E702
+@dataclass(frozen=True)
+class ElfSegment: header:libc.Elf64_Phdr; sections:List[ElfSection] # noqa: E702
 
 def elf_loader(blob:bytes, force_section_align:int=1) -> Tuple[memoryview, List[ElfSection], Any]:
   def _strtab(blob: bytes, idx: int) -> str: return blob[idx:blob.find(b'\x00', idx)].decode('utf-8')
@@ -36,3 +38,32 @@ def elf_loader(blob:bytes, force_section_align:int=1) -> Tuple[memoryview, List[
     relocs += [(target_image_off + roff, sections[sym.st_shndx].header.sh_addr + sym.st_value, rtype, raddend) for roff, sym, rtype, raddend in rels]
 
   return memoryview(image), sections, relocs
+
+def make_elf(header:libc.Elf64_Ehdr, sections:List[ElfSection], segments:Optional[List[ElfSegment]]=None) -> memoryview:
+  def _pad(n:int, align:int): return b'\0' * ((align - n % align) % align if align != 0 else 0)
+
+  blob = bytearray()
+  for s in sections:
+    blob += _pad(len(blob) + header.e_ehsize, s.header.sh_addralign)
+    s.header.sh_offset = header.e_ehsize + len(blob) if s.header.sh_name != 0 else 0
+    if s.header.sh_type != libc.SHT_NOBITS:
+      blob += s.content
+
+  blob += _pad(len(blob) + header.e_ehsize, 8)
+  header.e_shoff = header.e_ehsize + len(blob)
+  for s in sections:
+    blob += bytearray(s.header)
+
+  if segments:
+    blob += _pad(len(blob) + header.e_ehsize, 8)
+    header.e_phoff = header.e_ehsize + len(blob)
+    for seg in segments:
+      if not seg.sections:
+        seg.header.p_offset = header.e_phoff
+        seg.header.p_filesz = seg.header.p_memsz = header.e_phentsize * header.e_phnum
+      else:
+        seg.header.p_offset = seg.sections[0].header.sh_offset
+        seg.header.p_memsz = (seg.sections[-1].header.sh_offset + seg.sections[-1].header.sh_size - seg.sections[0].header.sh_offset)
+        seg.header.p_filesz = seg.header.p_memsz - sum(s.header.sh_size for s in seg.sections if s.header.sh_type == libc.SHT_NOBITS)
+      blob += bytearray(seg.header)
+  return memoryview(bytearray(header) + blob)
